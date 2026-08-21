@@ -87,7 +87,8 @@ worker.onmessage = (event) => {
     case 'trainProgress': {
       lossHistory.push(msg.loss);
       if (lossHistory.length > 400) lossHistory.shift();
-      el('train-status').textContent = `Step ${Math.round(msg.step).toLocaleString()} — loss ${msg.loss.toFixed(4)}`;
+      const lrText = msg.lr !== undefined ? ` — lr ${msg.lr.toExponential(2)}` : '';
+      el('train-status').textContent = `Step ${Math.round(msg.step).toLocaleString()} — loss ${msg.loss.toFixed(4)}${lrText}`;
       drawLossChart();
       break;
     }
@@ -100,7 +101,10 @@ worker.onmessage = (event) => {
     }
 
     case 'trainSample': {
+      // Overwritten each time, not appended - this is a live "how's it
+      // doing right now" window, not a history.
       const container = el('train-samples');
+      container.innerHTML = '';
       const entry = document.createElement('div');
       entry.className = 'sample';
       const label = document.createElement('div');
@@ -111,10 +115,6 @@ worker.onmessage = (event) => {
       text.textContent = msg.text;
       entry.append(label, text);
       container.appendChild(entry);
-      // Keep the log bounded - training can run for thousands of steps.
-      while (container.children.length > 20) {
-        container.removeChild(container.firstChild);
-      }
       break;
     }
 

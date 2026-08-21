@@ -17,6 +17,24 @@ import init, { WasmLLM } from './pkg/wasm_app.js';
 const SAMPLE_MAX_TOKENS = 80;
 const SAMPLE_TEMPERATURE = 0.8;
 
+// Learning-rate decay: halve the learning rate every LR_DECAY_EVERY steps,
+// down to a floor of LR_DECAY_FLOOR_FRACTION of whatever the "Learning
+// rate" field is set to. A constant learning rate with Adam typically
+// plateaus rather than converging further - it reaches a noise floor and
+// oscillates around it instead of settling into a finer minimum - so this
+// applies automatically, using the field's value as the *starting* rate
+// rather than a fixed rate for the whole run. Step decay (not cosine) is
+// used because training here is open-ended (start/stop by hand, no fixed
+// step budget to plan a cosine schedule around).
+const LR_DECAY_FACTOR = 0.5;
+const LR_DECAY_EVERY = 1000;
+const LR_DECAY_FLOOR_FRACTION = 0.05;
+
+function effectiveLr(baseLr, stepsSoFar) {
+  const decayed = baseLr * LR_DECAY_FACTOR ** Math.floor(stepsSoFar / LR_DECAY_EVERY);
+  return Math.max(decayed, baseLr * LR_DECAY_FLOOR_FRACTION);
+}
+
 let llm = null;
 let training = false;
 let trainParams = { batchSize: 4, lr: 0.01, useGpu: false, sampleEveryN: 0, samplePrompt: '' };
@@ -70,16 +88,20 @@ async function maybeGenerateSample(step) {
 async function trainingLoop() {
   if (!training || !llm) return;
   try {
-    let loss, step;
+    let loss, step, lr;
     if (trainParams.useGpu) {
-      loss = await llm.train_step_gpu(trainParams.batchSize, trainParams.lr, gpuStepCounter++);
+      lr = effectiveLr(trainParams.lr, gpuStepCounter);
+      loss = await llm.train_step_gpu(trainParams.batchSize, lr, gpuStepCounter);
+      gpuStepCounter += 1;
       step = gpuStepCounter;
     } else {
-      loss = llm.train_step(trainParams.batchSize, trainParams.lr);
+      const stepsSoFar = Math.round(llm.step());
+      lr = effectiveLr(trainParams.lr, stepsSoFar);
+      loss = llm.train_step(trainParams.batchSize, lr);
       step = llm.step();
     }
     if (loss !== undefined) {
-      post({ type: 'trainProgress', step, loss });
+      post({ type: 'trainProgress', step, loss, lr });
       await maybeGenerateSample(Math.round(step));
     } else {
       post({ type: 'trainStalled', message: 'Not enough training data yet — add a source with more text.' });
@@ -184,7 +206,12 @@ async function handleMessage(msg) {
           break;
         }
       }
-      gpuStepCounter = 0;
+      // Start from the persisted step count, not 0 - it stays meaningful
+      // across stop/resume (llm.step() reflects real progress even after
+      // a GPU sync, see sync_weights_from_gpu's docs) and keeps the LR
+      // decay schedule continuous instead of restarting at full strength
+      // every time GPU training is (re)started.
+      gpuStepCounter = Math.round(llm.step());
       training = true;
       trainingLoop();
       break;
