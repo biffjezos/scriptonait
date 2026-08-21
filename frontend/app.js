@@ -542,6 +542,125 @@ function updateSizeEstimate() {
   el(id).addEventListener('input', updateSizeEstimate);
 });
 
+// --- Settings suggestion ---------------------------------------------
+
+const GPU_MAX_CONTEXT = 256; // must match llm-gpu's MAX_GPU_WINDOW
+
+// Target ~2.3 parameters per training token: this is small-scale
+// interactive training, where the model sees the corpus many times over
+// many epochs rather than one Chinchilla-style pass, so it's tuned for
+// "enough capacity to actually learn spelling and local structure" rather
+// than one-epoch data efficiency. Clamped regardless of corpus size so a
+// tiny corpus doesn't get an unusably small model and a huge one doesn't
+// get a model too large to train in a browser tab.
+const PARAMS_PER_TOKEN = 2.3;
+const MIN_SUGGESTED_PARAMS = 1_000_000;
+const MAX_SUGGESTED_PARAMS = 40_000_000;
+
+function suggestNumLayers(totalTokens) {
+  if (totalTokens < 500_000) return 4;
+  if (totalTokens < 3_000_000) return 6;
+  if (totalTokens < 15_000_000) return 8;
+  return 10;
+}
+
+function suggestBatchSize(totalTokens) {
+  if (totalTokens < 100_000) return 4;
+  if (totalTokens < 1_000_000) return 8;
+  return 16;
+}
+
+// Picks the smallest-error hidden size (in steps of 32) for the given
+// layer count by search rather than a closed-form solve, since the real
+// parameter formula isn't cleanly invertible (ffnDim rounds up to a
+// multiple of 32). numHeads doesn't affect the parameter count at all
+// (Q/K/V/O are hiddenDim×hiddenDim regardless of how many heads split
+// it), so it's irrelevant here and picked separately below.
+function suggestHiddenDim(numLayers, targetParams) {
+  let best = 64;
+  let bestDiff = Infinity;
+  for (let h = 64; h <= 1536; h += 32) {
+    const { params } = estimateParamsAndMemory({ numLayers, hiddenDim: h, numHeads: 1 });
+    const diff = Math.abs(params - targetParams);
+    if (diff < bestDiff) {
+      bestDiff = diff;
+      best = h;
+    }
+  }
+  return best;
+}
+
+// Closest number of heads to a 64-wide head_dim (a common convention)
+// that still evenly divides hiddenDim with an even head_dim (required for
+// RoPE) — see the create-model-btn handler's own validation of this.
+function suggestNumHeads(hiddenDim) {
+  const target = Math.max(1, Math.round(hiddenDim / 64));
+  for (let delta = 0; delta <= hiddenDim; delta++) {
+    for (const h of [target - delta, target + delta]) {
+      if (h >= 1 && hiddenDim % h === 0 && (hiddenDim / h) % 2 === 0) {
+        return h;
+      }
+    }
+  }
+  return 1;
+}
+
+function suggestSettings(totalTokens) {
+  const targetParams = Math.min(MAX_SUGGESTED_PARAMS, Math.max(MIN_SUGGESTED_PARAMS, totalTokens * PARAMS_PER_TOKEN));
+  const numLayers = suggestNumLayers(totalTokens);
+  const hiddenDim = suggestHiddenDim(numLayers, targetParams);
+  return {
+    numLayers,
+    hiddenDim,
+    numHeads: suggestNumHeads(hiddenDim),
+    // Always the GPU backend's max: longer context helps this kind of
+    // text, and nothing about corpus size argues for giving it up when
+    // the GPU backend can handle the full 256 anyway.
+    contextLen: GPU_MAX_CONTEXT,
+    localWindow: GPU_MAX_CONTEXT,
+    batchSize: suggestBatchSize(totalTokens),
+    lr: 0.003,
+    sampleEveryN: 250,
+  };
+}
+
+el('suggest-settings-btn').addEventListener('click', async () => {
+  el('suggest-settings-btn').disabled = true;
+  try {
+    const sources = await db.listSources();
+    if (sources.length === 0) {
+      el('suggest-settings-status').textContent =
+        'Add at least one source first — there is nothing to size a model against yet.';
+      return;
+    }
+    // Byte count, not character count: the tokenizer is byte-level (one
+    // token per UTF-8 byte), so this is what actually determines training
+    // token count — source.rawText.length would undercount any non-ASCII
+    // text.
+    const encoder = new TextEncoder();
+    const totalTokens = sources.reduce((sum, s) => sum + encoder.encode(s.rawText).length, 0);
+    const suggestion = suggestSettings(totalTokens);
+
+    el('cfg-layers').value = suggestion.numLayers;
+    el('cfg-hidden').value = suggestion.hiddenDim;
+    el('cfg-heads').value = suggestion.numHeads;
+    el('cfg-context').value = suggestion.contextLen;
+    el('cfg-window').value = suggestion.localWindow;
+    el('cfg-batch').value = suggestion.batchSize;
+    el('cfg-lr').value = suggestion.lr;
+    el('train-sample-every').value = suggestion.sampleEveryN;
+    updateSizeEstimate();
+
+    el('suggest-settings-status').textContent =
+      `Suggested for ${sources.length} source${sources.length === 1 ? '' : 's'}, ` +
+      `≈${Math.round(totalTokens).toLocaleString()} training tokens: ${suggestion.numLayers} layers, ` +
+      `${suggestion.hiddenDim} nodes, ${suggestion.numHeads} heads, context/window ${suggestion.contextLen} ` +
+      `(the GPU backend's max), batch size ${suggestion.batchSize}, learning rate ${suggestion.lr}.`;
+  } finally {
+    el('suggest-settings-btn').disabled = false;
+  }
+});
+
 el('create-model-btn').addEventListener('click', () => {
   const cfg = currentConfig();
   if (cfg.hiddenDim % cfg.numHeads !== 0) {
