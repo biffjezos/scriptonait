@@ -12,7 +12,9 @@ import init, { WasmLLM } from './pkg/wasm_app.js';
 
 let llm = null;
 let training = false;
-let trainParams = { batchSize: 4, lr: 0.01 };
+let trainParams = { batchSize: 4, lr: 0.01, useGpu: false };
+let gpuInitialized = false;
+let gpuStepCounter = 0;
 let wasmReady = init().then(() => {
   postMessage({ type: 'ready' });
 });
@@ -43,9 +45,16 @@ function tagPreamble(tags) {
 async function trainingLoop() {
   if (!training || !llm) return;
   try {
-    const loss = llm.train_step(trainParams.batchSize, trainParams.lr);
+    let loss, step;
+    if (trainParams.useGpu) {
+      loss = await llm.train_step_gpu(trainParams.batchSize, trainParams.lr, gpuStepCounter++);
+      step = gpuStepCounter;
+    } else {
+      loss = llm.train_step(trainParams.batchSize, trainParams.lr);
+      step = llm.step();
+    }
     if (loss !== undefined) {
-      post({ type: 'trainProgress', step: llm.step(), loss });
+      post({ type: 'trainProgress', step, loss });
     } else {
       post({ type: 'trainStalled', message: 'Not enough training data yet — add a source with more text.' });
       training = false;
@@ -120,7 +129,18 @@ async function handleMessage(msg) {
     }
 
     case 'startTraining': {
-      trainParams = { batchSize: msg.batchSize, lr: msg.lr };
+      trainParams = { batchSize: msg.batchSize, lr: msg.lr, useGpu: !!msg.useGpu };
+      if (trainParams.useGpu && !gpuInitialized) {
+        try {
+          await llm.init_gpu();
+          gpuInitialized = true;
+          post({ type: 'gpuReady' });
+        } catch (err) {
+          post({ type: 'trainStalled', message: `WebGPU unavailable: ${err} — check "Train on WebGPU" only works after a WebGPU device is available.` });
+          break;
+        }
+      }
+      gpuStepCounter = 0;
       training = true;
       trainingLoop();
       break;
@@ -128,12 +148,25 @@ async function handleMessage(msg) {
 
     case 'stopTraining': {
       training = false;
+      try {
+        if (trainParams.useGpu && llm.gpu_training_dirty()) {
+          await llm.sync_weights_from_gpu();
+        }
+      } catch (err) {
+        post({ type: 'error', context: 'stopTraining', message: String(err) });
+      }
       post({ type: 'trainStopped', step: llm.step() });
       break;
     }
 
     case 'generate': {
       try {
+        // GPU training only updates the GPU-resident weights (see
+        // train_step_gpu's docs) — bring the CPU copy up to date first so
+        // generation (CPU or GPU) reflects the latest training.
+        if (llm.gpu_training_dirty()) {
+          await llm.sync_weights_from_gpu();
+        }
         // Assemble the effective prompt: optional genre/tone tags, an
         // optional story-state reminder (characters/locations seen so
         // far), optional retrieved similar scenes, then the user's own
@@ -164,6 +197,7 @@ async function handleMessage(msg) {
     case 'initGpu': {
       try {
         await llm.init_gpu();
+        gpuInitialized = true;
         post({ type: 'gpuReady' });
       } catch (err) {
         post({ type: 'gpuUnavailable', message: String(err) });
@@ -181,9 +215,26 @@ async function handleMessage(msg) {
       break;
     }
 
+    case 'debugCompareGpuCpuGradient': {
+      try {
+        const maxDiff = await llm.debug_compare_gpu_cpu_gradient(msg.prompt);
+        post({ type: 'debugCompareGradientResult', maxDiff });
+      } catch (err) {
+        post({ type: 'error', context: 'debugCompareGpuCpuGradient', message: String(err) });
+      }
+      break;
+    }
+
     case 'exportWeights': {
-      const bytes = llm.export_weights();
-      post({ type: 'weightsExported', bytes, step: llm.step() }, [bytes.buffer]);
+      try {
+        if (llm.gpu_training_dirty()) {
+          await llm.sync_weights_from_gpu();
+        }
+        const bytes = llm.export_weights();
+        post({ type: 'weightsExported', bytes, step: llm.step() }, [bytes.buffer]);
+      } catch (err) {
+        post({ type: 'error', context: 'exportWeights', message: String(err) });
+      }
       break;
     }
 
