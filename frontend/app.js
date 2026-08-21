@@ -36,6 +36,7 @@ worker.onmessage = (event) => {
       el('generate-panel').hidden = false;
       el('save-panel').hidden = false;
       el('gen-use-gpu').disabled = !msg.gpuSupported;
+      el('train-use-gpu').disabled = !msg.gpuSupported;
       if (!msg.gpuSupported) {
         el('gpu-status').textContent =
           'This attention window is larger than the simple GPU kernel supports — generation will use the CPU path only.';
@@ -91,12 +92,15 @@ worker.onmessage = (event) => {
     case 'gpuReady': {
       el('gpu-status').textContent = 'WebGPU device ready.';
       el('debug-compare-btn').hidden = false;
+      el('debug-compare-gradient-btn').hidden = false;
       break;
     }
 
     case 'gpuUnavailable': {
       el('gen-use-gpu').checked = false;
       el('gen-use-gpu').disabled = true;
+      el('train-use-gpu').checked = false;
+      el('train-use-gpu').disabled = true;
       el('gpu-status').textContent = `WebGPU unavailable: ${msg.message} — using CPU generation instead.`;
       break;
     }
@@ -105,6 +109,13 @@ worker.onmessage = (event) => {
       el('gpu-status').textContent =
         `GPU vs CPU max logit difference: ${msg.maxDiff.toExponential(3)} ` +
         (msg.maxDiff < 0.01 ? '(looks correct)' : '(unexpectedly large — GPU output may be wrong)');
+      break;
+    }
+
+    case 'debugCompareGradientResult': {
+      el('train-status').textContent =
+        `GPU vs CPU max embedding-gradient difference: ${msg.maxDiff.toExponential(3)} ` +
+        (msg.maxDiff < 0.01 ? '(looks correct)' : '(unexpectedly large — GPU training may be wrong)');
       break;
     }
 
@@ -475,6 +486,7 @@ el('start-train-btn').addEventListener('click', () => {
     type: 'startTraining',
     batchSize: parseInt(el('cfg-batch').value, 10),
     lr: parseFloat(el('cfg-lr').value),
+    useGpu: el('train-use-gpu').checked,
   });
 });
 
@@ -554,6 +566,10 @@ el('preview-retrieval-btn').addEventListener('click', () => {
 
 el('debug-compare-btn').addEventListener('click', () => {
   worker.postMessage({ type: 'debugCompareGpuCpu', prompt: el('prompt-input').value || 'hello' });
+});
+
+el('debug-compare-gradient-btn').addEventListener('click', () => {
+  worker.postMessage({ type: 'debugCompareGpuCpuGradient', prompt: el('prompt-input').value || 'hello' });
 });
 
 // --- Save / load -----------------------------------------------------------
