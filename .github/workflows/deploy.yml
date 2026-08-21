@@ -6,11 +6,13 @@ name: Build and deploy to GitHub Pages
 # route to crates.io, npmjs.org, or the wasm32 target installer at all.
 
 on:
+  # Every push runs the `build` job (compile + test), regardless of
+  # branch - that's the fast CI-compile-check signal for a crate
+  # (llm-gpu/wasm-app) this repo's dev sandbox has no way to build
+  # itself. Actual Pages deployment (the `deploy` job) is additionally
+  # gated to dev/main/master only, so a work-in-progress branch gets
+  # build validation without deploying to the live site.
   push:
-    branches:
-      - dev
-      - main
-      - master
   workflow_dispatch:
 
 permissions:
@@ -60,6 +62,7 @@ jobs:
 
   deploy:
     needs: build
+    if: github.ref == 'refs/heads/dev' || github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'
     runs-on: ubuntu-latest
     environment:
       name: github-pages
