@@ -20,6 +20,65 @@ function setWebGpuStatus(text, cls) {
   banner.className = 'webgpu-status' + (cls ? ` ${cls}` : '');
 }
 
+// Independent of the worker's own GpuContext (used for actual
+// training/generation) - requesting an adapter just to read its info/
+// limits doesn't need a device at all, so this can populate immediately
+// on page load regardless of whether a model has been created yet.
+// GpuContext::new() requests `required_limits: adapter.limits()` (the
+// full set, not a reduced one), so what's shown here matches what
+// training actually gets to use.
+async function loadGpuDetails() {
+  if (!webgpuBrowserSupported) return;
+  try {
+    const adapter = await navigator.gpu.requestAdapter();
+    if (!adapter) return;
+    const info = adapter.info ?? (adapter.requestAdapterInfo ? await adapter.requestAdapterInfo() : null);
+    const limits = adapter.limits;
+
+    const rows = [];
+    if (info) {
+      rows.push(['Vendor', info.vendor || 'unknown']);
+      rows.push(['Architecture', info.architecture || 'unknown']);
+      rows.push(['Device', info.device || 'unknown']);
+      rows.push(['Description', info.description || '(none)']);
+    }
+    rows.push(['Type', adapter.isFallbackAdapter ? 'Software (fallback)' : 'Hardware']);
+    // The limits actually relevant to this app's compute shaders - not
+    // the full ~30-entry spec table, just what could plausibly constrain
+    // (or explain slow) training here.
+    rows.push(['Max compute invocations / workgroup', limits.maxComputeInvocationsPerWorkgroup.toLocaleString()]);
+    rows.push([
+      'Max workgroup size (X / Y / Z)',
+      `${limits.maxComputeWorkgroupSizeX} / ${limits.maxComputeWorkgroupSizeY} / ${limits.maxComputeWorkgroupSizeZ}`,
+    ]);
+    rows.push(['Max storage buffer binding', formatBytes(limits.maxStorageBufferBindingSize)]);
+    rows.push(['Max buffer size', formatBytes(limits.maxBufferSize)]);
+    rows.push(['Max compute workgroup storage', formatBytes(limits.maxComputeWorkgroupStorageSize)]);
+
+    const container = el('gpu-details-content');
+    container.innerHTML = '';
+    const table = document.createElement('table');
+    table.className = 'gpu-details-table';
+    for (const [label, value] of rows) {
+      const tr = document.createElement('tr');
+      const th = document.createElement('th');
+      th.textContent = label;
+      const td = document.createElement('td');
+      td.textContent = value;
+      tr.append(th, td);
+      table.appendChild(tr);
+    }
+    container.appendChild(table);
+    el('gpu-details').hidden = false;
+  } catch (err) {
+    // Non-fatal - this is a "nice to have" diagnostic, not required for
+    // the app to function, so a failure here shouldn't surface as an error.
+    console.warn('Could not read GPU adapter details:', err);
+  }
+}
+
+loadGpuDetails();
+
 if (!webgpuBrowserSupported) {
   setWebGpuStatus(
     'WebGPU: not available in this browser (navigator.gpu is undefined) — training and ' +
