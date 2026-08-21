@@ -16,6 +16,15 @@ let training = false;
 
 const webgpuBrowserSupported = 'gpu' in navigator;
 
+// This app's own limit, not a hardware one: llm-gpu's attention kernel
+// uses a fixed-size local array (MAX_WINDOW = 256u in attention.wgsl),
+// and the backward pass needs a dense [heads, context, context] cache
+// per layer sized off it - must match llm_gpu::MAX_GPU_WINDOW exactly.
+// Real GPUs (see the details panel below) support far larger buffers and
+// workgroups than this; it's a simplification in how this app's shaders
+// are written, not something the hardware is short on.
+const GPU_MAX_CONTEXT = 256;
+
 function setWebGpuStatus(text, cls) {
   const banner = el('webgpu-status');
   banner.textContent = text;
@@ -71,6 +80,18 @@ async function loadGpuDetails() {
       table.appendChild(tr);
     }
     container.appendChild(table);
+
+    // Deliberately separate from the table above: everything in it comes
+    // from the hardware/driver; this comes from this app's own shaders,
+    // not your GPU, so labeling it as just another "limit" row would
+    // wrongly suggest the GPU itself is what's capping this.
+    const note = document.createElement('p');
+    note.className = 'gpu-details-note';
+    note.textContent =
+      `This app's own context/attention-window limit: ${GPU_MAX_CONTEXT} tokens — not a hardware limit, ` +
+      `a fixed-size array in this app's attention shader. Your GPU's own limits above are all far higher.`;
+    container.appendChild(note);
+
     el('gpu-details').hidden = false;
   } catch (err) {
     // Non-fatal - this is a "nice to have" diagnostic, not required for
@@ -621,8 +642,6 @@ function updateSizeEstimate() {
 });
 
 // --- Settings suggestion ---------------------------------------------
-
-const GPU_MAX_CONTEXT = 256; // must match llm-gpu's MAX_GPU_WINDOW
 
 // Target ~2.3 parameters per training token: this is small-scale
 // interactive training, where the model sees the corpus many times over
