@@ -47,13 +47,18 @@ function effectiveLr(baseLr, stepsSoFar) {
 const BENCHMARK_WARMUP_RUNS = 1; // discards GpuModel::upload's one-time cost
 const BENCHMARK_TIMED_RUNS = 5;
 const BENCHMARK_PLACEHOLDER_TEXT = 'the quick brown fox jumps over the lazy dog. '.repeat(400);
-// Generous, but bounded: nothing about a single training step should
-// legitimately take this long. If it does, something is actually stuck
-// (memory pressure, a driver/device issue) rather than just slow, and the
-// benchmark should report that clearly and move on instead of hanging
-// forever with no feedback. Note this can only give up on *waiting* for
-// the call - wasm/WebGPU has no cancellation, so the abandoned operation
-// may still be consuming GPU resources in the background afterwards.
+// Bounded so a stuck call fails visibly instead of hanging forever with
+// no feedback - but the warmup step needs a much longer allowance than
+// the timed ones: many drivers compile each shader lazily on its first
+// *dispatch*, not when the pipeline object is created, so the warmup
+// step (the first time all ~20 forward/backward/Adam kernels ever run on
+// a freshly-created device) can absorb a real one-time cold-compile cost
+// that has nothing to do with this shape's steady-state speed - the
+// thing actually being measured by the timed runs after it. Note either
+// timeout can only give up on *waiting* for the call - wasm/WebGPU has no
+// cancellation, so an abandoned operation may still be consuming GPU
+// resources in the background afterwards.
+const BENCHMARK_WARMUP_TIMEOUT_MS = 90_000;
 const BENCHMARK_STEP_TIMEOUT_MS = 20_000;
 
 function withTimeout(promise, ms, label) {
@@ -75,9 +80,9 @@ async function benchmarkOneConfig(cfg, batchSize, lr) {
   }
   tempLlm.upsert_source('__benchmark__', BENCHMARK_PLACEHOLDER_TEXT, false);
   try {
-    await withTimeout(tempLlm.init_gpu(), BENCHMARK_STEP_TIMEOUT_MS, 'GPU init');
+    await withTimeout(tempLlm.init_gpu(), BENCHMARK_WARMUP_TIMEOUT_MS, 'GPU init');
     for (let i = 0; i < BENCHMARK_WARMUP_RUNS; i++) {
-      await withTimeout(tempLlm.train_step_gpu(batchSize, lr, i), BENCHMARK_STEP_TIMEOUT_MS, 'warmup step');
+      await withTimeout(tempLlm.train_step_gpu(batchSize, lr, i), BENCHMARK_WARMUP_TIMEOUT_MS, 'warmup step');
     }
     const durations = [];
     for (let i = 0; i < BENCHMARK_TIMED_RUNS; i++) {
