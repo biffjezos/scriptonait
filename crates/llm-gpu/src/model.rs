@@ -538,26 +538,34 @@ impl GpuModel {
         let vocab = config.vocab_size();
         let ctx_len = config.context_len;
 
-        let embed = upload_f32(device, "embed", &weights.embed, wgpu::BufferUsages::empty());
+        // COPY_SRC on every weight tensor: `read_all_weights` (used by
+        // `sync_weights_from_gpu` to bring GPU-trained weights back to the
+        // CPU) reads these back via a buffer-to-buffer copy, which fails
+        // validation without it - silently, leaving the readback as
+        // all-zeros rather than erroring, so this is easy to miss without
+        // actually running it in a browser (see cross_entropy.wgsl's fix
+        // for the same class of silent-failure bug).
+        let weight_src = wgpu::BufferUsages::COPY_SRC;
+        let embed = upload_f32(device, "embed", &weights.embed, weight_src);
         let layers = weights
             .layers
             .iter()
             .map(|l| GpuLayer {
                 w: GpuLayerTensors {
-                    ple: upload_f32(device, "ple", &l.ple, wgpu::BufferUsages::empty()),
-                    attn_norm_gain: upload_f32(device, "attn_norm_gain", &l.attn_norm_gain, wgpu::BufferUsages::empty()),
-                    wq: upload_f32(device, "wq", &l.wq, wgpu::BufferUsages::empty()),
-                    wk: upload_f32(device, "wk", &l.wk, wgpu::BufferUsages::empty()),
-                    wv: upload_f32(device, "wv", &l.wv, wgpu::BufferUsages::empty()),
-                    wo: upload_f32(device, "wo", &l.wo, wgpu::BufferUsages::empty()),
-                    mlp_norm_gain: upload_f32(device, "mlp_norm_gain", &l.mlp_norm_gain, wgpu::BufferUsages::empty()),
-                    w_gate: upload_f32(device, "w_gate", &l.w_gate, wgpu::BufferUsages::empty()),
-                    w_up: upload_f32(device, "w_up", &l.w_up, wgpu::BufferUsages::empty()),
-                    w_down: upload_f32(device, "w_down", &l.w_down, wgpu::BufferUsages::empty()),
+                    ple: upload_f32(device, "ple", &l.ple, weight_src),
+                    attn_norm_gain: upload_f32(device, "attn_norm_gain", &l.attn_norm_gain, weight_src),
+                    wq: upload_f32(device, "wq", &l.wq, weight_src),
+                    wk: upload_f32(device, "wk", &l.wk, weight_src),
+                    wv: upload_f32(device, "wv", &l.wv, weight_src),
+                    wo: upload_f32(device, "wo", &l.wo, weight_src),
+                    mlp_norm_gain: upload_f32(device, "mlp_norm_gain", &l.mlp_norm_gain, weight_src),
+                    w_gate: upload_f32(device, "w_gate", &l.w_gate, weight_src),
+                    w_up: upload_f32(device, "w_up", &l.w_up, weight_src),
+                    w_down: upload_f32(device, "w_down", &l.w_down, weight_src),
                 },
             })
             .collect::<Vec<_>>();
-        let final_norm_gain = upload_f32(device, "final_norm_gain", &weights.final_norm_gain, wgpu::BufferUsages::empty());
+        let final_norm_gain = upload_f32(device, "final_norm_gain", &weights.final_norm_gain, weight_src);
 
         let num_layers = weights.layers.len();
         let mk_layer_tensors = |label: &str| -> Vec<GpuLayerTensors> {
@@ -570,7 +578,9 @@ impl GpuModel {
             layers,
             final_norm_gain,
 
-            grad_embed: storage_f32(device, "grad_embed", vocab * h, false),
+            // readable: true (COPY_SRC) - debug_grad_embed reads this back
+            // directly for the GPU-vs-CPU gradient comparison tool.
+            grad_embed: storage_f32(device, "grad_embed", vocab * h, true),
             grad_layers: mk_layer_tensors("grad"),
             grad_final_norm_gain: storage_f32(device, "grad_final_norm_gain", h, false),
 
@@ -588,7 +598,13 @@ impl GpuModel {
 
             ids: upload_u32(device, "ids", &vec![0u32; ctx_len]),
             targets: upload_u32(device, "targets", &vec![0u32; ctx_len]),
-            hidden: storage_f32(device, "hidden", ctx_len * h, false),
+            // `readable: true` (COPY_SRC) because `forward()` copies this
+            // buffer's contents *out* into each layer's cache (see
+            // `copy_buffer`'s call sites) - without it, `copy_buffer_to_buffer`
+            // fails validation and the whole command buffer is dropped,
+            // silently leaving every h_after_ple/h_after_attn cache (and
+            // h_final) at its zero-initialized state.
+            hidden: storage_f32(device, "hidden", ctx_len * h, true),
             ple_scratch: storage_f32(device, "ple_scratch", ctx_len * h, false),
             attn_out: storage_f32(device, "attn_out", ctx_len * h, false),
             mlp_out: storage_f32(device, "mlp_out", ctx_len * h, false),
