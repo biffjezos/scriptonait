@@ -74,7 +74,7 @@ pub async fn read_f32(device: &wgpu::Device, queue: &wgpu::Queue, buffer: &wgpu:
     slice.map_async(wgpu::MapMode::Read, move |result| {
         let _ = tx.send(result);
     });
-    let _ = device.poll(wgpu::PollType::Wait);
+    let _ = device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None });
     rx.await
         .expect("map_async callback dropped without firing")
         .expect("failed to map GPU buffer for readback");
