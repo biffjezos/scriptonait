@@ -45,13 +45,27 @@ the UI as you adjust settings).
 
 ### Where training happens vs. where WebGPU is used
 
-Training (forward + backward + Adam) runs on `llm-core`'s CPU
-implementation, compiled to wasm — still entirely client-side, just not
-GPU-accelerated. **Generation** runs on WebGPU by default (`llm-gpu`),
-with automatic fallback to the same CPU code if WebGPU isn't available.
+Both training (forward + backward + Adam) and generation can run either on
+`llm-core`'s CPU implementation (compiled to wasm, works everywhere) or on
+`llm-gpu`'s WebGPU backend (`wgpu` + WGSL compute shaders, needs a browser
+with WebGPU) — CPU is always the default and the fallback; WebGPU is an
+opt-in toggle in the Train and Generate panels, and both automatically fall
+back to CPU if the model's attention window/context length is too large for
+the GPU backend's fixed-size kernels (`gpu_supported()`/`MAX_GPU_WINDOW`) or
+if no WebGPU device is available at all.
 
-This split is deliberate, not a shortcut — see "What's tested and what
-isn't" below.
+GPU training and CPU training keep **separate weight copies and separate
+Adam optimizer state** while a session trains on the GPU — `train_step_gpu`
+only updates the GPU-resident weights, so the CPU copy (and anything
+derived from it: CPU generation, "Export weights", checkpoint saves) is
+stale until `sync_weights_from_gpu` runs. The frontend does this
+automatically whenever it's needed (before generating, exporting, or
+stopping GPU training), but it does mean switching from GPU back to CPU
+training resets Adam momentum, same as importing a checkpoint would (the
+two optimizer states aren't compatible with each other).
+
+See "What's tested and what isn't" below for how much confidence to place
+in the WebGPU path specifically.
 
 ## Project layout
 
@@ -61,8 +75,9 @@ crates/
               (forward+backward+Adam), generation. Zero external
               dependencies — builds and its 90 tests run with no network
               access. This is the verified reference implementation.
-  llm-gpu/    WebGPU (wgpu + WGSL) forward-pass backend, mirroring
-              llm-core's forward pass kernel-for-kernel. Forward only.
+  llm-gpu/    WebGPU (wgpu + WGSL) backend, mirroring llm-core's forward
+              pass, backward pass, and Adam optimizer kernel-for-kernel —
+              full training and generation, not forward-only.
   wasm-app/   wasm-bindgen glue exposing both as one `WasmLLM` class.
 frontend/
   index.html, style.css, app.js   Main-thread UI.
@@ -115,8 +130,9 @@ cd frontend && python3 -m http.server 8000
 ```
 
 Open `http://localhost:8000` in a recent Chrome or Edge (WebGPU support;
-generation falls back to CPU-only in browsers without it — training works
-everywhere since it's CPU/wasm regardless). It needs to be served over
+both generation and training fall back to CPU-only in browsers without it,
+or for model shapes too large for the GPU backend — see "Where training
+happens vs. where WebGPU is used" above). It needs to be served over
 HTTP(S) (or localhost), not opened as a `file://` URL — module workers and
 `fetch` won't work otherwise.
 
@@ -140,32 +156,43 @@ That means:
 - **`llm-gpu` (the WGSL/wgpu backend) and `wasm-app` (the wasm-bindgen
   glue) could not be compiled, let alone run, in that sandbox** — no GPU,
   no `wasm32` target, no way to fetch `wgpu`/`wasm-bindgen`/etc. They were
-  written as carefully as I could manage by hand (the GPU kernels are
-  direct, commented translations of the already-verified CPU ops in
-  `llm-core/src/ops.rs`). The GitHub Actions deploy workflow *does* build
-  them (that's the point of it — a runner with normal internet access) and
-  that build has succeeded, so the code is at least known to compile
-  cleanly against real dependencies; what's still unverified is *runtime*
+  written as carefully as I could manage by hand (the GPU kernels — forward
+  *and* backward, including the Adam update — are direct, commented
+  translations of the already-verified CPU ops in `llm-core/src/ops.rs`,
+  cross-checked line-by-line against `llm-core::model::backward`). Every
+  backward kernel is written as a *gather*, never a *scatter* (see
+  `llm-gpu/src/model.rs`'s module docs), specifically so nothing needs
+  atomic float adds — the highest-bug-risk shortcut this crate deliberately
+  avoids. The GitHub Actions deploy workflow *does* build both crates
+  (that's the point of it — a runner with normal internet access) and that
+  build has succeeded, so the code is at least known to compile cleanly
+  against real dependencies; what's still unverified is *runtime*
   correctness (does the WGSL actually compute the right numbers, does it
   run at all on a given GPU/driver) — that needs an actual browser, which
-  is what `debug_compare_gpu_cpu` below is for. Training was deliberately
-  kept off the GPU path specifically to avoid writing backward-pass/
-  gradient-accumulation shaders (the highest-bug-risk code, especially
-  anything needing atomic float adds) with zero ability to test them.
+  is what `debug_compare_gpu_cpu` and `debug_compare_gpu_cpu_gradient`
+  below are for.
 - **The frontend JS** (`app.js`, `worker.js`, `db.js`) was syntax-checked
   with Node and carefully reviewed, but never run in an actual browser.
 
 **First thing to do after building**: open the browser console, create a
 small model, and click "Compare GPU vs CPU (debug)" in the Generate panel
-(it appears once a WebGPU device initializes). That calls
-`debug_compare_gpu_cpu`, which runs the same forward pass on both backends
-and reports the largest logit difference — it should be tiny (well under
-`1e-2`, just float rounding). If it's not, or if the WebGPU path doesn't
-work at all, that's expected risk materializing, not a mystery: the bug is
-almost certainly in `crates/llm-gpu` (compare its WGSL/Rust against the
-matching function in `llm-core/src/ops.rs`, which you can trust). Please
-report back what you find — a follow-up session with real WebGPU/wasm32
-access should be able to fix it quickly once the actual failure is known.
+and "Compare GPU vs CPU gradient (debug)" in the Train panel (both appear
+once a WebGPU device initializes). The first calls `debug_compare_gpu_cpu`,
+comparing one forward pass's logits between backends; the second calls
+`debug_compare_gpu_cpu_gradient`, which runs forward + cross-entropy +
+backward on both backends (without touching any real weights) and compares
+their embedding-table gradients — since that gradient depends on nearly the
+entire backward pass (every layer's attention/MLP backward, every layer's
+PLE scatter, and the input embedding scatter all feed into it), a small
+diff there is a strong end-to-end signal the WGSL backward kernels are
+correct. Both should report a tiny difference (well under `1e-2`, just
+float rounding). If either doesn't, or if the WebGPU path doesn't work at
+all, that's expected risk materializing, not a mystery: the bug is almost
+certainly in `crates/llm-gpu` (compare its WGSL/Rust against the matching
+function in `llm-core/src/ops.rs` or `model.rs`, which you can trust).
+Please report back what you find — a follow-up session with real
+WebGPU/wasm32 access should be able to fix it quickly once the actual
+failure is known.
 
 ## Using the app
 
@@ -176,7 +203,9 @@ access should be able to fix it quickly once the actual failure is known.
 2. **Pick a model shape** — layers, nodes (hidden size), attention heads,
    context length, attention window. A live parameter-count/memory
    estimate updates as you adjust these. Click "Create model".
-3. **Train** — pick a batch size and learning rate, click "Start
+3. **Train** — pick a batch size and learning rate, optionally check
+   "Train on WebGPU" (falls back to CPU if the model's window is too large
+   for the GPU backend or no WebGPU device is available), click "Start
    training". Loss is plotted live; training runs in a background worker
    so the UI stays responsive.
 4. **Generate** — type a prompt, optionally enable WebGPU acceleration,
@@ -249,8 +278,9 @@ else in that crate.
 - Grouped-query attention (fewer KV heads than Q heads) to shrink the
   KV-cache once one exists.
 - A KV cache for generation, to drop the O(n²) re-forward cost.
-- GPU backward-pass kernels, once someone can actually test them, so
-  training itself could move to WebGPU too.
+- Raising `MAX_GPU_WINDOW` (currently 256) once someone can verify a larger
+  dense per-layer attention-probs cache still fits comfortably in GPU
+  memory for the context lengths people actually want to train.
 - A real BPE tokenizer if you want a larger effective context per
   character (trades away the byte-level tokenizer's simplicity and small,
   fixed vocab size).
