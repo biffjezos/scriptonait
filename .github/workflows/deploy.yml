@@ -8,10 +8,9 @@ name: Build and deploy to GitHub Pages
 on:
   push:
     branches:
+      - dev
       - main
       - master
-      - dev
-      - claude/llm-webgpu-rust-fzho8f
   workflow_dispatch:
 
 permissions:

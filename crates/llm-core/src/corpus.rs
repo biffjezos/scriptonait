@@ -10,6 +10,7 @@
 use std::collections::HashMap;
 
 use crate::prep::{self, PreparedStats};
+use crate::retrieval::{RetrievalIndex, RetrievedChunk};
 use crate::rng::Rng;
 use crate::screenplay::{self, StoryState};
 use crate::tokenizer;
@@ -28,6 +29,7 @@ pub struct Corpus {
     sources: HashMap<String, Vec<u32>>,
     cleaned_text: HashMap<String, String>,
     per_source_state: HashMap<String, StoryState>,
+    retrieval: RetrievalIndex,
     order: Vec<String>,
     flat_cache: Vec<u32>,
     /// Index into `flat_cache` of each source's first token (its BOS).
@@ -47,6 +49,7 @@ impl Corpus {
             sources: HashMap::new(),
             cleaned_text: HashMap::new(),
             per_source_state: HashMap::new(),
+            retrieval: RetrievalIndex::new(),
             order: Vec::new(),
             flat_cache: Vec::new(),
             boundaries: Vec::new(),
@@ -62,6 +65,7 @@ impl Corpus {
             self.order.push(id.to_string());
         }
         self.per_source_state.insert(id.to_string(), screenplay::extract_story_state(&cleaned));
+        self.retrieval.upsert_document(id, &cleaned);
         self.cleaned_text.insert(id.to_string(), cleaned);
         self.sources.insert(id.to_string(), wrapped);
         self.dirty = true;
@@ -72,6 +76,7 @@ impl Corpus {
         let removed = self.sources.remove(id).is_some();
         if removed {
             self.order.retain(|existing| existing != id);
+            self.retrieval.remove_document(id);
             self.cleaned_text.remove(id);
             self.per_source_state.remove(id);
             self.dirty = true;
@@ -101,6 +106,13 @@ impl Corpus {
 
     pub fn source_ids(&self) -> impl Iterator<Item = &str> {
         self.order.iter().map(String::as_str)
+    }
+
+    /// Up to `k` scenes from the corpus most similar to `query` (TF-IDF
+    /// cosine similarity over `screenplay::split_into_scenes` chunks) —
+    /// useful as few-shot context prepended to a generation prompt.
+    pub fn retrieve(&self, query: &str, k: usize) -> Vec<RetrievedChunk> {
+        self.retrieval.top_k(query, k)
     }
 
     /// Characters/locations/scene-count tracked across every current
@@ -263,6 +275,24 @@ mod tests {
         assert_eq!(c.cleaned_text("a"), Some("  Hello world"));
         c.remove("a");
         assert_eq!(c.cleaned_text("a"), None);
+    }
+
+    #[test]
+    fn retrieve_finds_similar_scenes_and_forgets_removed_sources() {
+        let mut c = Corpus::new();
+        c.upsert(
+            "spy",
+            "INT. SURVEILLANCE VAN - NIGHT\n\nAgents trace a wiretap through satellite relays.",
+            false,
+        );
+        c.upsert("romance", "INT. RESTAURANT - EVENING\n\nTwo friends share a quiet dinner.", false);
+
+        let results = c.retrieve("wiretap surveillance relays", 2);
+        assert!(!results.is_empty());
+        assert_eq!(results[0].source_id, "spy");
+
+        c.remove("spy");
+        assert!(c.retrieve("wiretap surveillance relays", 2).is_empty());
     }
 
     #[test]
