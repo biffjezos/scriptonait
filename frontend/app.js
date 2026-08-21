@@ -10,6 +10,8 @@ let modelCreated = false;
 let modelConfig = null;
 let editingSourceId = null;
 let lossHistory = [];
+let stepMsHistory = [];
+const STEP_MS_WINDOW = 20;
 let training = false;
 
 const webgpuBrowserSupported = 'gpu' in navigator;
@@ -19,6 +21,65 @@ function setWebGpuStatus(text, cls) {
   banner.textContent = text;
   banner.className = 'webgpu-status' + (cls ? ` ${cls}` : '');
 }
+
+// Independent of the worker's own GpuContext (used for actual
+// training/generation) - requesting an adapter just to read its info/
+// limits doesn't need a device at all, so this can populate immediately
+// on page load regardless of whether a model has been created yet.
+// GpuContext::new() requests `required_limits: adapter.limits()` (the
+// full set, not a reduced one), so what's shown here matches what
+// training actually gets to use.
+async function loadGpuDetails() {
+  if (!webgpuBrowserSupported) return;
+  try {
+    const adapter = await navigator.gpu.requestAdapter();
+    if (!adapter) return;
+    const info = adapter.info ?? (adapter.requestAdapterInfo ? await adapter.requestAdapterInfo() : null);
+    const limits = adapter.limits;
+
+    const rows = [];
+    if (info) {
+      rows.push(['Vendor', info.vendor || 'unknown']);
+      rows.push(['Architecture', info.architecture || 'unknown']);
+      rows.push(['Device', info.device || 'unknown']);
+      rows.push(['Description', info.description || '(none)']);
+    }
+    rows.push(['Type', adapter.isFallbackAdapter ? 'Software (fallback)' : 'Hardware']);
+    // The limits actually relevant to this app's compute shaders - not
+    // the full ~30-entry spec table, just what could plausibly constrain
+    // (or explain slow) training here.
+    rows.push(['Max compute invocations / workgroup', limits.maxComputeInvocationsPerWorkgroup.toLocaleString()]);
+    rows.push([
+      'Max workgroup size (X / Y / Z)',
+      `${limits.maxComputeWorkgroupSizeX} / ${limits.maxComputeWorkgroupSizeY} / ${limits.maxComputeWorkgroupSizeZ}`,
+    ]);
+    rows.push(['Max storage buffer binding', formatBytes(limits.maxStorageBufferBindingSize)]);
+    rows.push(['Max buffer size', formatBytes(limits.maxBufferSize)]);
+    rows.push(['Max compute workgroup storage', formatBytes(limits.maxComputeWorkgroupStorageSize)]);
+
+    const container = el('gpu-details-content');
+    container.innerHTML = '';
+    const table = document.createElement('table');
+    table.className = 'gpu-details-table';
+    for (const [label, value] of rows) {
+      const tr = document.createElement('tr');
+      const th = document.createElement('th');
+      th.textContent = label;
+      const td = document.createElement('td');
+      td.textContent = value;
+      tr.append(th, td);
+      table.appendChild(tr);
+    }
+    container.appendChild(table);
+    el('gpu-details').hidden = false;
+  } catch (err) {
+    // Non-fatal - this is a "nice to have" diagnostic, not required for
+    // the app to function, so a failure here shouldn't surface as an error.
+    console.warn('Could not read GPU adapter details:', err);
+  }
+}
+
+loadGpuDetails();
 
 if (!webgpuBrowserSupported) {
   setWebGpuStatus(
@@ -89,6 +150,17 @@ worker.onmessage = (event) => {
       if (lossHistory.length > 400) lossHistory.shift();
       const lrText = msg.lr !== undefined ? ` — lr ${msg.lr.toExponential(2)}` : '';
       el('train-status').textContent = `Step ${Math.round(msg.step).toLocaleString()} — loss ${msg.loss.toFixed(4)}${lrText}`;
+      if (msg.stepMs !== undefined) {
+        stepMsHistory.push(msg.stepMs);
+        if (stepMsHistory.length > STEP_MS_WINDOW) stepMsHistory.shift();
+        const avgMs = stepMsHistory.reduce((a, b) => a + b, 0) / stepMsHistory.length;
+        let perfText = `≈${avgMs.toFixed(0)} ms/step (avg over last ${stepMsHistory.length})`;
+        if (msg.batchSize && modelConfig?.contextLen) {
+          const tokensPerSec = (msg.batchSize * modelConfig.contextLen * 1000) / avgMs;
+          perfText += ` — ≈${Math.round(tokensPerSec).toLocaleString()} tokens/sec`;
+        }
+        el('train-perf').textContent = perfText;
+      }
       drawLossChart();
       break;
     }
@@ -194,6 +266,12 @@ worker.onmessage = (event) => {
       // Handled by a one-off listener registered at the call site (the
       // download and save-checkpoint buttons each need to do something
       // different with the exported bytes) — nothing to do here.
+      break;
+
+    case 'benchmarkProgress':
+    case 'benchmarkResult':
+      // Handled by a one-off listener registered at the suggest-settings
+      // call site — nothing to do here.
       break;
 
     case 'error': {
@@ -624,6 +702,38 @@ function suggestSettings(totalTokens) {
   };
 }
 
+function applySuggestion(suggestion) {
+  el('cfg-layers').value = suggestion.numLayers;
+  el('cfg-hidden').value = suggestion.hiddenDim;
+  el('cfg-heads').value = suggestion.numHeads;
+  el('cfg-context').value = suggestion.contextLen;
+  el('cfg-window').value = suggestion.localWindow;
+  el('cfg-batch').value = suggestion.batchSize;
+  el('cfg-lr').value = suggestion.lr;
+  el('train-sample-every').value = suggestion.sampleEveryN;
+  updateSizeEstimate();
+}
+
+// A handful of depth/width tradeoffs that all target the same parameter
+// budget (half the baseline layer count, the baseline itself, and double
+// it — each re-solved for hidden size via suggestHiddenDim) - benchmarked
+// for real below rather than guessed at, since raw compute scales with
+// hidden size squared but GPU dispatch-call overhead scales with layer
+// count alone, and which one actually dominates depends on the GPU.
+function benchmarkCandidateShapes(baselineLayers, targetParams) {
+  const layerOptions = [...new Set([Math.max(2, Math.round(baselineLayers / 2)), baselineLayers, Math.min(24, baselineLayers * 2)])];
+  return layerOptions.map((numLayers) => {
+    const hiddenDim = suggestHiddenDim(numLayers, targetParams);
+    return {
+      numLayers,
+      hiddenDim,
+      numHeads: suggestNumHeads(hiddenDim),
+      contextLen: GPU_MAX_CONTEXT,
+      localWindow: GPU_MAX_CONTEXT,
+    };
+  });
+}
+
 el('suggest-settings-btn').addEventListener('click', async () => {
   el('suggest-settings-btn').disabled = true;
   try {
@@ -640,22 +750,52 @@ el('suggest-settings-btn').addEventListener('click', async () => {
     const encoder = new TextEncoder();
     const totalTokens = sources.reduce((sum, s) => sum + encoder.encode(s.rawText).length, 0);
     const suggestion = suggestSettings(totalTokens);
+    const sourceWord = `${sources.length} source${sources.length === 1 ? '' : 's'}, ≈${Math.round(totalTokens).toLocaleString()} training tokens`;
 
-    el('cfg-layers').value = suggestion.numLayers;
-    el('cfg-hidden').value = suggestion.hiddenDim;
-    el('cfg-heads').value = suggestion.numHeads;
-    el('cfg-context').value = suggestion.contextLen;
-    el('cfg-window').value = suggestion.localWindow;
-    el('cfg-batch').value = suggestion.batchSize;
-    el('cfg-lr').value = suggestion.lr;
-    el('train-sample-every').value = suggestion.sampleEveryN;
-    updateSizeEstimate();
+    if (!webgpuBrowserSupported) {
+      applySuggestion(suggestion);
+      el('suggest-settings-status').textContent =
+        `Suggested for ${sourceWord}: ${suggestion.numLayers} layers, ${suggestion.hiddenDim} nodes, ` +
+        `${suggestion.numHeads} heads, batch size ${suggestion.batchSize}, learning rate ${suggestion.lr} ` +
+        `(no WebGPU in this browser, so the shape wasn't benchmarked — sized by corpus alone).`;
+      return;
+    }
 
+    const targetParams = Math.min(MAX_SUGGESTED_PARAMS, Math.max(MIN_SUGGESTED_PARAMS, totalTokens * PARAMS_PER_TOKEN));
+    const candidates = benchmarkCandidateShapes(suggestion.numLayers, targetParams);
+    el('suggest-settings-status').textContent = `Benchmarking ${candidates.length} model shapes on your GPU for this corpus…`;
+
+    const results = await new Promise((resolve) => {
+      const handler = (event) => {
+        if (event.data.type === 'benchmarkProgress') {
+          const c = event.data.config;
+          el('suggest-settings-status').textContent =
+            `Benchmarking shape ${event.data.index + 1} of ${event.data.total} (${c.numLayers} layers, ${c.hiddenDim} nodes)…`;
+        } else if (event.data.type === 'benchmarkResult') {
+          worker.removeEventListener('message', handler);
+          resolve(event.data.results);
+        }
+      };
+      worker.addEventListener('message', handler);
+      worker.postMessage({ type: 'benchmarkConfigs', configs: candidates, batchSize: suggestion.batchSize, lr: suggestion.lr });
+    });
+
+    const timed = results.filter((r) => r.medianStepMs !== undefined);
+    if (timed.length === 0) {
+      applySuggestion(suggestion);
+      el('suggest-settings-status').textContent =
+        `Suggested for ${sourceWord}: ${suggestion.numLayers} layers, ${suggestion.hiddenDim} nodes ` +
+        `(couldn't benchmark on GPU: ${results[0]?.error || 'unknown error'} — sized by corpus alone).`;
+      return;
+    }
+    const best = timed.reduce((a, b) => (b.medianStepMs < a.medianStepMs ? b : a));
+    applySuggestion({ ...suggestion, numLayers: best.config.numLayers, hiddenDim: best.config.hiddenDim, numHeads: best.config.numHeads });
+
+    const summary = timed.map((r) => `${r.config.numLayers}L/${r.config.hiddenDim}H: ${r.medianStepMs.toFixed(0)}ms/step`).join(', ');
     el('suggest-settings-status').textContent =
-      `Suggested for ${sources.length} source${sources.length === 1 ? '' : 's'}, ` +
-      `≈${Math.round(totalTokens).toLocaleString()} training tokens: ${suggestion.numLayers} layers, ` +
-      `${suggestion.hiddenDim} nodes, ${suggestion.numHeads} heads, context/window ${suggestion.contextLen} ` +
-      `(the GPU backend's max), batch size ${suggestion.batchSize}, learning rate ${suggestion.lr}.`;
+      `Fastest of ${timed.length} shapes benchmarked on your GPU for ${sourceWord}: ` +
+      `${best.config.numLayers} layers, ${best.config.hiddenDim} nodes, ${best.config.numHeads} heads ` +
+      `(${best.medianStepMs.toFixed(0)}ms/step). Tried: ${summary}.`;
   } finally {
     el('suggest-settings-btn').disabled = false;
   }
@@ -688,6 +828,8 @@ el('start-train-btn').addEventListener('click', () => {
   training = true;
   setTrainingButtons(true);
   el('train-samples').innerHTML = '';
+  stepMsHistory = [];
+  el('train-perf').textContent = '';
   worker.postMessage({
     type: 'startTraining',
     batchSize: parseInt(el('cfg-batch').value, 10),
