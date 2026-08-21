@@ -125,6 +125,15 @@
       <label class="checkbox-label">
         <input type="checkbox" id="train-use-gpu" checked disabled /> Train on WebGPU (falls back to CPU if unavailable)
       </label>
+      <label class="checkbox-label">
+        <input type="checkbox" id="train-sample-toggle" /> Generate a sample every
+      </label>
+      <label>Steps
+        <input type="number" id="train-sample-every" value="200" min="1" max="100000" />
+      </label>
+      <label>Sample prompt (optional)
+        <input type="text" id="train-sample-prompt" placeholder="Start a scene or sentence..." />
+      </label>
     </div>
     <div class="row">
       <button id="start-train-btn" type="button">Start training</button>
@@ -133,6 +142,7 @@
     </div>
     <p id="train-status" class="hint"></p>
     <canvas id="loss-chart" width="640" height="140"></canvas>
+    <div id="train-samples" class="train-samples"></div>
   </section>
 
   <section id="generate-panel" class="panel" hidden>

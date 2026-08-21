@@ -347,6 +347,36 @@ button.secondary,
   margin-top: 0.75rem;
 }
 
+.train-samples {
+  display: flex;
+  flex-direction: column-reverse;
+  gap: 0.5rem;
+  margin-top: 0.75rem;
+  max-height: 20rem;
+  overflow-y: auto;
+}
+
+.train-samples .sample {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 0.5rem 0.75rem;
+}
+
+.train-samples .sample .step-label {
+  font-family: var(--mono);
+  font-size: 0.75rem;
+  color: var(--text-dim);
+  margin-bottom: 0.25rem;
+}
+
+.train-samples .sample .text {
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-family: var(--mono);
+  font-size: 0.85rem;
+}
+
 .generate-output {
   white-space: pre-wrap;
   word-break: break-word;

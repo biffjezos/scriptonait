@@ -10,9 +10,16 @@
 
 import init, { WasmLLM } from './pkg/wasm_app.js';
 
+// Fixed settings for periodic in-training samples - deliberately not
+// exposed in the UI, since these are meant as a lightweight qualitative
+// progress check, not a replacement for the full Generate panel (which
+// already has its own temperature/length/GPU controls).
+const SAMPLE_MAX_TOKENS = 80;
+const SAMPLE_TEMPERATURE = 0.8;
+
 let llm = null;
 let training = false;
-let trainParams = { batchSize: 4, lr: 0.01, useGpu: false };
+let trainParams = { batchSize: 4, lr: 0.01, useGpu: false, sampleEveryN: 0, samplePrompt: '' };
 let gpuInitialized = false;
 let gpuStepCounter = 0;
 let wasmReady = init().then(() => {
@@ -42,6 +49,24 @@ function tagPreamble(tags) {
   return parts.length ? `${parts.join(' ')}\n` : '';
 }
 
+// Pauses training for one generation at the current (in-progress) weights,
+// so the loss chart isn't the only signal of how training is going. GPU
+// training only updates the GPU-resident weights (see train_step_gpu's
+// docs), so this syncs first if needed - same as generate/export already
+// do - meaning a sample always reflects the very latest training step.
+async function maybeGenerateSample(step) {
+  if (!trainParams.sampleEveryN || step <= 0 || step % trainParams.sampleEveryN !== 0) return;
+  try {
+    if (llm.gpu_training_dirty()) {
+      await llm.sync_weights_from_gpu();
+    }
+    const text = llm.generate(trainParams.samplePrompt || '', SAMPLE_MAX_TOKENS, SAMPLE_TEMPERATURE, Date.now());
+    post({ type: 'trainSample', step, text });
+  } catch (err) {
+    post({ type: 'error', context: 'trainSample', message: String(err) });
+  }
+}
+
 async function trainingLoop() {
   if (!training || !llm) return;
   try {
@@ -55,6 +80,7 @@ async function trainingLoop() {
     }
     if (loss !== undefined) {
       post({ type: 'trainProgress', step, loss });
+      await maybeGenerateSample(Math.round(step));
     } else {
       post({ type: 'trainStalled', message: 'Not enough training data yet — add a source with more text.' });
       training = false;
@@ -141,7 +167,13 @@ async function handleMessage(msg) {
           message: "This model's context/attention window is too large for the GPU backend — training on CPU instead.",
         });
       }
-      trainParams = { batchSize: msg.batchSize, lr: msg.lr, useGpu };
+      trainParams = {
+        batchSize: msg.batchSize,
+        lr: msg.lr,
+        useGpu,
+        sampleEveryN: msg.sampleEveryN || 0,
+        samplePrompt: msg.samplePrompt || '',
+      };
       if (trainParams.useGpu && !gpuInitialized) {
         try {
           await llm.init_gpu();

@@ -99,6 +99,25 @@ worker.onmessage = (event) => {
       break;
     }
 
+    case 'trainSample': {
+      const container = el('train-samples');
+      const entry = document.createElement('div');
+      entry.className = 'sample';
+      const label = document.createElement('div');
+      label.className = 'step-label';
+      label.textContent = `Step ${Math.round(msg.step).toLocaleString()}`;
+      const text = document.createElement('div');
+      text.className = 'text';
+      text.textContent = msg.text;
+      entry.append(label, text);
+      container.appendChild(entry);
+      // Keep the log bounded - training can run for thousands of steps.
+      while (container.children.length > 20) {
+        container.removeChild(container.firstChild);
+      }
+      break;
+    }
+
     case 'trainFallback': {
       // Non-fatal: the worker downgraded this run to CPU (e.g. GPU was
       // requested for a config the GPU backend can't handle) - training
@@ -549,11 +568,14 @@ el('create-model-btn').addEventListener('click', () => {
 el('start-train-btn').addEventListener('click', () => {
   training = true;
   setTrainingButtons(true);
+  el('train-samples').innerHTML = '';
   worker.postMessage({
     type: 'startTraining',
     batchSize: parseInt(el('cfg-batch').value, 10),
     lr: parseFloat(el('cfg-lr').value),
     useGpu: el('train-use-gpu').checked,
+    sampleEveryN: el('train-sample-toggle').checked ? parseInt(el('train-sample-every').value, 10) : 0,
+    samplePrompt: el('train-sample-prompt').value,
   });
 });
 
