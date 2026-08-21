@@ -35,6 +35,49 @@ function effectiveLr(baseLr, stepsSoFar) {
   return Math.max(decayed, baseLr * LR_DECAY_FLOOR_FRACTION);
 }
 
+// --- GPU config benchmarking ------------------------------------------
+//
+// Times real train_step_gpu calls for a handful of candidate model
+// shapes on a throwaway WasmLLM instance, so "which shape trains fastest
+// on this GPU" is measured instead of guessed. Uses a synthetic
+// placeholder source rather than the real corpus: step timing only
+// depends on tensor shapes, not the numbers flowing through them, and a
+// throwaway benchmark instance doesn't need real training data - just
+// enough of it for sample_batch to succeed.
+const BENCHMARK_WARMUP_RUNS = 1; // discards GpuModel::upload's one-time cost
+const BENCHMARK_TIMED_RUNS = 5;
+const BENCHMARK_PLACEHOLDER_TEXT = 'the quick brown fox jumps over the lazy dog. '.repeat(400);
+
+async function benchmarkOneConfig(cfg, batchSize, lr) {
+  let tempLlm;
+  try {
+    tempLlm = new WasmLLM(cfg.numLayers, cfg.hiddenDim, cfg.numHeads, cfg.contextLen, cfg.localWindow, Date.now());
+  } catch (err) {
+    return { config: cfg, error: String(err) };
+  }
+  if (!tempLlm.gpu_supported()) {
+    return { config: cfg, error: "This config's context/window exceeds the GPU backend's limit" };
+  }
+  tempLlm.upsert_source('__benchmark__', BENCHMARK_PLACEHOLDER_TEXT, false);
+  try {
+    await tempLlm.init_gpu();
+    for (let i = 0; i < BENCHMARK_WARMUP_RUNS; i++) {
+      await tempLlm.train_step_gpu(batchSize, lr, i);
+    }
+    const durations = [];
+    for (let i = 0; i < BENCHMARK_TIMED_RUNS; i++) {
+      const t0 = performance.now();
+      await tempLlm.train_step_gpu(batchSize, lr, BENCHMARK_WARMUP_RUNS + i);
+      durations.push(performance.now() - t0);
+    }
+    durations.sort((a, b) => a - b);
+    const medianStepMs = durations[Math.floor(durations.length / 2)];
+    return { config: cfg, medianStepMs };
+  } catch (err) {
+    return { config: cfg, error: String(err) };
+  }
+}
+
 let llm = null;
 let training = false;
 let trainParams = { batchSize: 4, lr: 0.01, useGpu: false, sampleEveryN: 0, samplePrompt: '' };
@@ -89,6 +132,10 @@ async function trainingLoop() {
   if (!training || !llm) return;
   try {
     let loss, step, lr;
+    // Timed around just the actual training call, not the periodic
+    // sample generation below - that's a deliberate pause, not part of
+    // real per-step throughput.
+    const t0 = performance.now();
     if (trainParams.useGpu) {
       lr = effectiveLr(trainParams.lr, gpuStepCounter);
       loss = await llm.train_step_gpu(trainParams.batchSize, lr, gpuStepCounter);
@@ -100,8 +147,9 @@ async function trainingLoop() {
       loss = llm.train_step(trainParams.batchSize, lr);
       step = llm.step();
     }
+    const stepMs = performance.now() - t0;
     if (loss !== undefined) {
-      post({ type: 'trainProgress', step, loss, lr });
+      post({ type: 'trainProgress', step, loss, lr, stepMs, batchSize: trainParams.batchSize });
       await maybeGenerateSample(Math.round(step));
     } else {
       post({ type: 'trainStalled', message: 'Not enough training data yet — add a source with more text.' });
@@ -173,6 +221,19 @@ async function handleMessage(msg) {
       } catch (err) {
         post({ type: 'error', context: 'previewRetrieval', message: String(err) });
       }
+      break;
+    }
+
+    case 'benchmarkConfigs': {
+      // Uses its own throwaway WasmLLM instance(s) per candidate - doesn't
+      // touch the main `llm`/training state at all, so this is safe to run
+      // whether or not a real model exists yet.
+      const results = [];
+      for (let i = 0; i < msg.configs.length; i++) {
+        post({ type: 'benchmarkProgress', index: i, total: msg.configs.length, config: msg.configs[i] });
+        results.push(await benchmarkOneConfig(msg.configs[i], msg.batchSize, msg.lr));
+      }
+      post({ type: 'benchmarkResult', results });
       break;
     }
 
