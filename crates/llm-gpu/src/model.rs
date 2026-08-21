@@ -812,6 +812,36 @@ impl GpuModel {
         dispatch_embedding_scatter_add(ctx, &self.d_hidden, &self.ids, &self.grad_embed, t_len, h, vocab);
     }
 
+    /// Dev/sanity-check tool: runs forward, cross-entropy, and backward
+    /// for one sequence (no batching, no Adam step — this never touches
+    /// the weights) and reads back the embedding-table gradient. The
+    /// embedding gradient depends on nearly the entire backward pass
+    /// (the output head, every layer's attention/MLP backward, every
+    /// layer's PLE scatter, and the input embedding scatter all feed
+    /// into it), so comparing this one buffer against
+    /// `llm_core::model::backward(...).embed` for the same weights/
+    /// tokens/targets is a strong end-to-end check of this crate's
+    /// backward pass — see `wasm-app`'s `debug_compare_gpu_cpu_gradient`,
+    /// which does exactly that comparison.
+    pub async fn debug_grad_embed(&self, ctx: &GpuContext, tokens: &[u32], targets: &[u32]) -> Result<Vec<f32>, String> {
+        let t_len = tokens.len();
+        if t_len == 0 || t_len != self.config.context_len {
+            return Err(format!("tokens.len()={t_len} must equal this model's context_len ({})", self.config.context_len));
+        }
+        let h = self.config.hidden_dim;
+        let vocab = self.config.vocab_size();
+
+        let lens = self.tensor_lens();
+        self.zero_all(ctx, &self.grad_buffers(), &lens);
+
+        self.forward(ctx, tokens);
+        write_u32(&ctx.queue, &self.targets, targets);
+        dispatch_cross_entropy(ctx, &self.logits, &self.targets, &self.d_logits, &self.loss_per_row, t_len);
+        self.backward(ctx, tokens);
+
+        Ok(read_f32(&ctx.device, &ctx.queue, &self.grad_embed, vocab * h).await)
+    }
+
     /// Samples nothing itself (the caller already sampled `batch` via
     /// `llm_core::corpus::Corpus::sample_batch`) — runs forward, cross
     /// entropy, backward, and one Adam step for the whole batch. Returns
@@ -868,6 +898,22 @@ impl GpuModel {
         }
 
         Ok(total_loss / batch.batch_size as f32)
+    }
+
+    /// Reads every weight tensor back from the GPU, concatenated in the
+    /// same fixed order `llm_core::model::ModelWeights::to_bytes` uses —
+    /// pass the result through that same byte layout (little-endian f32)
+    /// to `ModelWeights::from_bytes` to get an owned CPU copy. Used to
+    /// sync weights this backend trained back to the canonical CPU copy
+    /// (see `wasm-app`'s `sync_weights_from_gpu`), since `train_step`
+    /// only ever updates the GPU-resident copy.
+    pub async fn read_all_weights(&self, ctx: &GpuContext) -> Vec<f32> {
+        let lens = self.tensor_lens();
+        let mut out = Vec::with_capacity(lens.iter().sum());
+        for (buf, &len) in self.weight_buffers().into_iter().zip(&lens) {
+            out.extend(read_f32(&ctx.device, &ctx.queue, buf, len).await);
+        }
+        out
     }
 }
 
