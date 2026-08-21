@@ -21,6 +21,25 @@ function post(msg) {
   postMessage(msg);
 }
 
+function storyState() {
+  return {
+    characters: llm.story_characters(),
+    locations: llm.story_locations(),
+    sceneCount: llm.story_scene_count(),
+  };
+}
+
+// Builds the [GENRE: x] [TONE: y] preamble used both when adding a
+// tagged source and when tagging a generation prompt — see db.js's note
+// on `tags` for why this lives entirely in JS (llm-core just sees text).
+function tagPreamble(tags) {
+  if (!tags) return '';
+  const parts = [];
+  if (tags.genre) parts.push(`[GENRE: ${tags.genre}]`);
+  if (tags.tone) parts.push(`[TONE: ${tags.tone}]`);
+  return parts.length ? `${parts.join(' ')}\n` : '';
+}
+
 async function trainingLoop() {
   if (!training || !llm) return;
   try {
@@ -58,7 +77,13 @@ async function handleMessage(msg) {
     }
 
     case 'upsertSource': {
-      const stats = llm.upsert_source(msg.id, msg.rawText, msg.isHtml);
+      // tags (genre/tone) get prepended as a short preamble so the model
+      // can learn to associate them with what follows - see corpus.rs's
+      // boundary-aligned sampling, which is what makes a preamble like
+      // this actually learnable rather than buried mid-window most of
+      // the time.
+      const text = tagPreamble(msg.tags) + msg.rawText;
+      const stats = llm.upsert_source(msg.id, text, msg.isHtml);
       post({
         type: 'sourceStats',
         id: msg.id,
@@ -67,13 +92,30 @@ async function handleMessage(msg) {
         tokenCount: stats.token_count,
         numSources: llm.num_sources(),
         totalTokens: llm.total_tokens(),
+        storyState: storyState(),
       });
       break;
     }
 
     case 'removeSource': {
       llm.remove_source(msg.id);
-      post({ type: 'sourceRemoved', id: msg.id, numSources: llm.num_sources(), totalTokens: llm.total_tokens() });
+      post({
+        type: 'sourceRemoved',
+        id: msg.id,
+        numSources: llm.num_sources(),
+        totalTokens: llm.total_tokens(),
+        storyState: storyState(),
+      });
+      break;
+    }
+
+    case 'previewRetrieval': {
+      try {
+        const chunks = llm.retrieve_context(msg.query, msg.k ?? 3);
+        post({ type: 'retrievalPreview', chunks });
+      } catch (err) {
+        post({ type: 'error', context: 'previewRetrieval', message: String(err) });
+      }
       break;
     }
 
@@ -92,10 +134,27 @@ async function handleMessage(msg) {
 
     case 'generate': {
       try {
+        // Assemble the effective prompt: optional genre/tone tags, an
+        // optional story-state reminder (characters/locations seen so
+        // far), optional retrieved similar scenes, then the user's own
+        // prompt text - in that order, so the user's words are always
+        // what's freshest/closest to the generation point.
+        let effectivePrompt = tagPreamble(msg.tags);
+        if (msg.useStoryState) {
+          effectivePrompt += llm.story_state_preamble();
+        }
+        if (msg.useRetrieval) {
+          effectivePrompt += llm.retrieve_context_text(msg.prompt, msg.retrievalK ?? 3);
+        }
+        effectivePrompt += msg.prompt;
+
         const text = msg.useGpu
-          ? await llm.generate_gpu(msg.prompt, msg.maxNewTokens, msg.temperature, msg.seed ?? Date.now())
-          : llm.generate(msg.prompt, msg.maxNewTokens, msg.temperature, msg.seed ?? Date.now());
-        post({ type: 'generateResult', text, usedGpu: msg.useGpu });
+          ? await llm.generate_gpu(effectivePrompt, msg.maxNewTokens, msg.temperature, msg.seed ?? Date.now())
+          : llm.generate(effectivePrompt, msg.maxNewTokens, msg.temperature, msg.seed ?? Date.now());
+
+        const qaNotes = llm.qa_check(text, msg.targetWordCount ?? 0);
+
+        post({ type: 'generateResult', text, usedGpu: msg.useGpu, effectivePrompt, qaNotes });
       } catch (err) {
         post({ type: 'error', context: 'generate', message: String(err) });
       }

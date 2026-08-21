@@ -45,12 +45,17 @@ function newId() {
 
 // --- Sources -----------------------------------------------------------
 // A source: { id, title, kind: 'url'|'file'|'paste', rawText, sourceUrl,
-//             createdAt, updatedAt }
+//             tags: { genre, tone }, createdAt, updatedAt }
+//
+// `tags` are plain metadata the frontend prepends as a short "[GENRE:
+// x] [TONE: y]" preamble when feeding this source's text to the model
+// (see app.js's buildTaggedText) — llm-core itself has no concept of
+// tags, they're just ordinary text from its point of view.
 
-export async function addSource({ title, kind, rawText, sourceUrl = null }) {
+export async function addSource({ title, kind, rawText, sourceUrl = null, tags = {} }) {
   const store = await tx(SOURCES_STORE, 'readwrite');
   const now = Date.now();
-  const record = { id: newId(), title, kind, rawText, sourceUrl, createdAt: now, updatedAt: now };
+  const record = { id: newId(), title, kind, rawText, sourceUrl, tags, createdAt: now, updatedAt: now };
   await wrapRequest(store.add(record));
   return record;
 }

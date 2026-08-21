@@ -47,12 +47,37 @@
           <button id="add-paste-btn" type="button">Add pasted text</button>
         </div>
       </div>
+
+      <div class="input-group">
+        <label>Tags for sources added next (optional)</label>
+        <div class="row">
+          <input type="text" id="source-genre-tag" placeholder="Genre, e.g. sci-fi" />
+          <input type="text" id="source-tone-tag" placeholder="Tone, e.g. dark" />
+        </div>
+        <p class="hint">
+          Prepended to a source's text as "[GENRE: ...] [TONE: ...]" so the model can learn to
+          associate the tag with what follows. Applies to URL/file/paste adds below; edit a
+          source afterward to change its tags.
+        </p>
+      </div>
     </div>
 
     <div id="sources-list" class="sources-list">
       <p class="empty-hint">No sources yet — add one above to start building your training corpus.</p>
     </div>
     <p id="corpus-stats" class="corpus-stats"></p>
+
+    <div id="story-state-panel" class="story-state" hidden>
+      <h3>Story state so far</h3>
+      <p class="hint">
+        Heuristically extracted from scene headings (INT./EXT. ...) and ALL-CAPS character
+        cues — a plain text-pattern scan, not the model itself, so it can misfire on unusual
+        formatting. See it as a hint, not ground truth.
+      </p>
+      <p><strong>Characters:</strong> <span id="story-characters">—</span></p>
+      <p><strong>Locations:</strong> <span id="story-locations">—</span></p>
+      <p><strong>Scenes detected:</strong> <span id="story-scene-count">—</span></p>
+    </div>
   </section>
 
   <section id="settings-panel" class="panel">
@@ -113,16 +138,38 @@
       <label>Temperature
         <input type="number" id="gen-temp" value="0.8" min="0" max="2" step="0.05" />
       </label>
+      <label>Genre tag (optional)
+        <input type="text" id="gen-genre-tag" placeholder="e.g. sci-fi" />
+      </label>
+      <label>Tone tag (optional)
+        <input type="text" id="gen-tone-tag" placeholder="e.g. dark" />
+      </label>
+      <label>Target word count (optional)
+        <input type="number" id="gen-target-words" min="0" placeholder="0 = no target" />
+      </label>
       <label class="checkbox-label">
         <input type="checkbox" id="gen-use-gpu" /> Use WebGPU acceleration
+      </label>
+      <label class="checkbox-label">
+        <input type="checkbox" id="gen-use-story-state" /> Remind the model of characters/locations so far
+      </label>
+      <label class="checkbox-label">
+        <input type="checkbox" id="gen-use-retrieval" /> Use similar scenes from your sources as context
       </label>
     </div>
     <div class="row">
       <button id="generate-btn" type="button">Generate</button>
+      <button id="preview-retrieval-btn" type="button" class="secondary">Preview retrieved context</button>
       <button id="debug-compare-btn" type="button" hidden>Compare GPU vs CPU (debug)</button>
     </div>
     <p id="gpu-status" class="hint"></p>
+    <div id="retrieval-preview" class="retrieval-preview" hidden></div>
     <pre id="generate-output" class="generate-output"></pre>
+    <div id="qa-notes" class="qa-notes"></div>
+    <details id="effective-prompt-details" hidden>
+      <summary>Full prompt sent to the model (tags/story-state/retrieval + your prompt)</summary>
+      <pre id="effective-prompt" class="generate-output"></pre>
+    </details>
   </section>
 
   <section id="save-panel" class="panel" hidden>

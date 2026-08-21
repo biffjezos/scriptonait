@@ -59,7 +59,7 @@ isn't" below.
 crates/
   llm-core/   Tokenizer, text prep, corpus/batch sampling, model
               (forward+backward+Adam), generation. Zero external
-              dependencies — builds and its 56 tests run with no network
+              dependencies — builds and its 90 tests run with no network
               access. This is the verified reference implementation.
   llm-gpu/    WebGPU (wgpu + WGSL) forward-pass backend, mirroring
               llm-core's forward pass kernel-for-kernel. Forward only.
@@ -81,7 +81,24 @@ which weren't available in this project's development sandbox (more
 below), so keeping them out of the shared workspace keeps `cargo test` at
 the repo root fully offline-buildable.
 
-## Build
+## Deploy (GitHub Pages, recommended)
+
+`.github/workflows/deploy.yml` builds and deploys this automatically —
+this is the intended way to get a working, live copy, since it runs on a
+GitHub Actions runner with normal internet access (unlike this project's
+dev sandbox; see "What's tested and what isn't" below). It installs the
+Rust `wasm32` target and `wasm-pack`, runs `llm-core`'s test suite as a
+gate, builds `crates/wasm-app` to `frontend/pkg`, and publishes
+`frontend/` to Pages.
+
+It triggers on push to `dev`, `main`, or `master`, plus manual dispatch
+from the Actions tab. One manual one-time step is required and can't be
+done through the GitHub API this was built with: repo **Settings → Pages
+→ Build and deployment → Source → "GitHub Actions"**. After that, every
+push to one of those branches deploys automatically to
+`https://<owner>.github.io/<repo>/`.
+
+## Build locally
 
 You'll need:
 
@@ -113,7 +130,7 @@ That means:
 - **`llm-core` (tokenizer, text prep, corpus, model, training, generation)
   is real, verified work**: zero external dependencies (own tiny PRNG
   instead of pulling in `rand`, no `serde`), so it built and ran fully
-  offline. Its 56 tests include full gradient checks (analytic vs.
+  offline. Its 90 tests include full gradient checks (analytic vs.
   numerical differentiation) for every op — RMSNorm, the linear layers,
   RoPE, sliding-window attention, SwiGLU, cross-entropy — plus a full-model
   gradient check across embeddings, PLE tables, attention/MLP weights, and
@@ -125,11 +142,16 @@ That means:
   no `wasm32` target, no way to fetch `wgpu`/`wasm-bindgen`/etc. They were
   written as carefully as I could manage by hand (the GPU kernels are
   direct, commented translations of the already-verified CPU ops in
-  `llm-core/src/ops.rs`), but they are genuinely unverified. Training was
-  deliberately kept off the GPU path specifically to avoid writing
-  backward-pass/gradient-accumulation shaders (the highest-bug-risk code,
-  especially anything needing atomic float adds) with zero ability to test
-  them.
+  `llm-core/src/ops.rs`). The GitHub Actions deploy workflow *does* build
+  them (that's the point of it — a runner with normal internet access) and
+  that build has succeeded, so the code is at least known to compile
+  cleanly against real dependencies; what's still unverified is *runtime*
+  correctness (does the WGSL actually compute the right numbers, does it
+  run at all on a given GPU/driver) — that needs an actual browser, which
+  is what `debug_compare_gpu_cpu` below is for. Training was deliberately
+  kept off the GPU path specifically to avoid writing backward-pass/
+  gradient-accumulation shaders (the highest-bug-risk code, especially
+  anything needing atomic float adds) with zero ability to test them.
 - **The frontend JS** (`app.js`, `worker.js`, `db.js`) was syntax-checked
   with Node and carefully reviewed, but never run in an actual browser.
 
@@ -158,9 +180,49 @@ access should be able to fix it quickly once the actual failure is known.
    training". Loss is plotted live; training runs in a background worker
    so the UI stays responsive.
 4. **Generate** — type a prompt, optionally enable WebGPU acceleration,
-   click "Generate".
+   optionally tag it with a genre/tone and/or a target word count, and
+   optionally have the model reminded of characters/locations so far or
+   given similar scenes from your sources as context (see "Story-aware
+   features" below). Click "Generate"; a QA pass runs automatically and
+   any notes appear under the output.
 5. **Save/load** — checkpoint weights to IndexedDB (with a name, for
    later reloading), or download/import raw weight bytes as a file.
+
+### Story-aware features (non-neural scaffolding)
+
+A few features sit *around* the model rather than inside it — plain
+heuristics and orchestration, not anything learned or trained. They're
+cheap, don't need a bigger model, and were prioritized over deeper
+architecture changes precisely because they're low-risk:
+
+- **Story state** (`crates/llm-core/src/screenplay.rs`): a plain
+  line-shape scan (no ML) over your sources for scene headings
+  (`INT./EXT. ...`) and ALL-CAPS character cues, aggregated into a running
+  character/location list shown in the Sources panel. This is genuinely
+  "free" auto-tagging — it's what answers "who are the characters in my
+  corpus" without training a classifier for it. It's a heuristic, not a
+  parser: unusual formatting can fool it (that's noted in the UI too).
+- **Control tags**: optional genre/tone text prepended to a source's text
+  (`[GENRE: sci-fi] [TONE: dark]`) or to a generation prompt. For a tag to
+  actually influence training rather than getting buried mid-window,
+  `Corpus::sample_batch` deliberately samples 40% of training windows
+  starting exactly at a source boundary (see its doc comment) — a
+  preamble only teaches the model anything if the model consistently sees
+  it positioned at the start.
+- **Retrieval** (`crates/llm-core/src/retrieval.rs`): TF-IDF + cosine
+  similarity over your sources' scenes, no embedding model needed at this
+  scale. "Use similar scenes from your sources as context" in the
+  Generate panel prepends the best-matching scenes to the prompt; "Preview
+  retrieved context" shows what would be retrieved without generating.
+- **QA notes** (`crates/llm-core/src/qa.rs`): a rule-based pass over
+  freshly generated text — unbalanced parentheses, degenerate
+  line-repetition loops (a common small-model failure mode), characters
+  introduced that don't appear in any source yet, and a rough
+  length-vs-target check. Not a quality judgement, just things worth a
+  glance.
+
+These are all covered by `llm-core`'s offline test suite like everything
+else in that crate.
 
 ### Known limitations
 

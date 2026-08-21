@@ -127,6 +127,79 @@ impl WasmLLM {
         self.0.borrow().corpus.total_tokens() as f64
     }
 
+    // --- Story state (heuristic, non-neural — see llm-core::screenplay) --
+
+    pub fn story_characters(&self) -> Vec<String> {
+        self.0.borrow().corpus.story_state().characters
+    }
+
+    pub fn story_locations(&self) -> Vec<String> {
+        self.0.borrow().corpus.story_state().locations
+    }
+
+    pub fn story_scene_count(&self) -> u32 {
+        self.0.borrow().corpus.story_state().scene_count as u32
+    }
+
+    /// A short "Characters so far: ...\nLocations so far: ...\n" block,
+    /// ready to prepend to a generation prompt as a plain-text reminder
+    /// of what's already established across the training sources.
+    pub fn story_state_preamble(&self) -> String {
+        self.0.borrow().corpus.story_state().as_prompt_preamble()
+    }
+
+    // --- Retrieval (TF-IDF over the corpus's own scenes) ------------------
+
+    /// Up to `k` scenes similar to `query`, each formatted as
+    /// `"[from: <source id> | score: <0-1>]\n<scene text>"` — meant for
+    /// display (e.g. a "context used" panel), not directly for the prompt.
+    pub fn retrieve_context(&self, query: String, k: u32) -> Vec<String> {
+        self.0
+            .borrow()
+            .corpus
+            .retrieve(&query, k as usize)
+            .into_iter()
+            .map(|c| format!("[from: {} | score: {:.2}]\n{}", c.source_id, c.score, c.text))
+            .collect()
+    }
+
+    /// Same retrieval, pre-formatted as one block ready to prepend
+    /// directly to a generation prompt. Empty string if nothing matched.
+    pub fn retrieve_context_text(&self, query: String, k: u32) -> String {
+        let chunks = self.0.borrow().corpus.retrieve(&query, k as usize);
+        if chunks.is_empty() {
+            return String::new();
+        }
+        let mut out = String::from("Similar scenes from your sources:\n\n");
+        for c in &chunks {
+            out.push_str(&c.text);
+            out.push_str("\n\n");
+        }
+        out.push_str("---\n\n");
+        out
+    }
+
+    // --- QA (heuristic checks on generated text) ---------------------------
+
+    /// Runs `llm_core::qa::check_generated` against `text`, returning each
+    /// note as `"[INFO] ..."`/`"[WARNING] ..."`. `target_word_count = 0`
+    /// means "no target" (skips the length check).
+    pub fn qa_check(&self, text: String, target_word_count: u32) -> Vec<String> {
+        let inner = self.0.borrow();
+        let known_state = inner.corpus.story_state();
+        let target = if target_word_count == 0 { None } else { Some(target_word_count as usize) };
+        llm_core::qa::check_generated(&text, &known_state, target)
+            .into_iter()
+            .map(|note| {
+                let prefix = match note.severity {
+                    llm_core::qa::Severity::Info => "INFO",
+                    llm_core::qa::Severity::Warning => "WARNING",
+                };
+                format!("[{prefix}] {}", note.message)
+            })
+            .collect()
+    }
+
     // --- Training --------------------------------------------------------
 
     /// Samples one batch and runs a full training step. Returns the
