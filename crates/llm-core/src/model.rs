@@ -177,6 +177,39 @@ impl ModelWeights {
             t.iter_mut().for_each(|v| *v *= factor);
         }
     }
+
+    /// Flattens every tensor (in the same fixed order `tensors()` always
+    /// uses) to little-endian f32 bytes — the on-disk/IndexedDB weight
+    /// format. Carries no shape/config header: the caller already knows
+    /// the `ModelConfig` (it's saved alongside, e.g. in IndexedDB) and
+    /// passes it back into `from_bytes`.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(self.param_count() * 4);
+        for t in self.tensors() {
+            for v in t.iter() {
+                out.extend_from_slice(&v.to_le_bytes());
+            }
+        }
+        out
+    }
+
+    /// Inverse of `to_bytes`, validated against `config`'s expected shapes.
+    pub fn from_bytes(bytes: &[u8], config: &ModelConfig) -> Result<Self, String> {
+        let mut w = Self::zeros(config);
+        let expected = w.param_count() * 4;
+        if bytes.len() != expected {
+            return Err(format!("expected {expected} bytes for this config, got {}", bytes.len()));
+        }
+        let mut offset = 0usize;
+        for t in w.tensors_mut() {
+            for v in t.iter_mut() {
+                let chunk: [u8; 4] = bytes[offset..offset + 4].try_into().unwrap();
+                *v = f32::from_le_bytes(chunk);
+                offset += 4;
+            }
+        }
+        Ok(w)
+    }
 }
 
 /// Adam optimizer state, shaped like the model.
@@ -542,6 +575,27 @@ mod tests {
                 diff / scale < 5e-2,
                 "{name}[{idx}]: analytic={analytic} numeric={numeric_grad}"
             );
+        }
+    }
+
+    #[test]
+    fn weight_bytes_round_trip() {
+        let config = small_config();
+        let w = ModelWeights::init(&config, 99);
+        let bytes = w.to_bytes();
+        assert_eq!(bytes.len(), w.param_count() * 4);
+        let w2 = ModelWeights::from_bytes(&bytes, &config).unwrap();
+        assert_eq!(w.embed, w2.embed);
+        assert_eq!(w.layers[0].wq, w2.layers[0].wq);
+        assert_eq!(w.final_norm_gain, w2.final_norm_gain);
+    }
+
+    #[test]
+    fn from_bytes_rejects_wrong_length() {
+        let config = small_config();
+        match ModelWeights::from_bytes(&[0u8; 3], &config) {
+            Err(err) => assert!(err.contains("expected")),
+            Ok(_) => panic!("expected an error for a truncated byte buffer"),
         }
     }
 

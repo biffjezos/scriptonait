@@ -16,6 +16,7 @@ crate-type = ["rlib"]
 llm-core = { path = "../llm-core" }
 wgpu = "0.19"
 bytemuck = { version = "1", features = ["derive"] }
+futures-channel = "0.3"
 
 # Only used by the native dev/test binary (`examples/gpu_smoke_test.rs`) to
 # block on GPU futures; the wasm32 build (wasm-app) drives the same async

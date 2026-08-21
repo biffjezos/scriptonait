@@ -48,7 +48,12 @@ pub fn generate(
     tokenizer::decode(&tokens)
 }
 
-fn sample(logits: &[f32], temperature: f32, rng: &mut Rng) -> u32 {
+/// Samples a token id from one row of logits (temperature `<= 0.0` means
+/// greedy argmax). Public so callers driving their own token-by-token loop
+/// — e.g. wasm-app's WebGPU-accelerated generation path, which needs to
+/// interleave GPU forward passes with sampling — can reuse the exact same,
+/// already-tested sampling logic instead of re-implementing it.
+pub fn sample(logits: &[f32], temperature: f32, rng: &mut Rng) -> u32 {
     if temperature <= 0.0 {
         return ops::argmax(logits) as u32;
     }
