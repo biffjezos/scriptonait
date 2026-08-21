@@ -11,12 +11,27 @@ use std::collections::HashMap;
 
 use crate::prep::{self, PreparedStats};
 use crate::rng::Rng;
+use crate::screenplay::{self, StoryState};
 use crate::tokenizer;
+
+/// Fraction of sampled training windows that start exactly at a source's
+/// beginning (its BOS token) instead of a uniformly random offset. A
+/// control-tag preamble (see the frontend) or the story-state-derived
+/// framing only means anything to the model if it's consistently seen at
+/// the *start* of a window; pure uniform-random sampling would place it
+/// there only by chance, roughly `context_len` times less often than
+/// mid-window. The rest of the batch still samples uniformly so the model
+/// keeps seeing ordinary mid-document continuations too.
+const BOUNDARY_ALIGNED_SAMPLE_RATE: f32 = 0.4;
 
 pub struct Corpus {
     sources: HashMap<String, Vec<u32>>,
+    cleaned_text: HashMap<String, String>,
+    per_source_state: HashMap<String, StoryState>,
     order: Vec<String>,
     flat_cache: Vec<u32>,
+    /// Index into `flat_cache` of each source's first token (its BOS).
+    boundaries: Vec<usize>,
     dirty: bool,
 }
 
@@ -30,19 +45,24 @@ impl Corpus {
     pub fn new() -> Self {
         Self {
             sources: HashMap::new(),
+            cleaned_text: HashMap::new(),
+            per_source_state: HashMap::new(),
             order: Vec::new(),
             flat_cache: Vec::new(),
+            boundaries: Vec::new(),
             dirty: true,
         }
     }
 
     /// Clean, tokenize, and store (or replace) one source's text.
     pub fn upsert(&mut self, id: &str, raw_text: &str, is_html: bool) -> PreparedStats {
-        let (_, tokens, stats) = prep::prepare(raw_text, is_html);
+        let (cleaned, tokens, stats) = prep::prepare(raw_text, is_html);
         let wrapped = tokenizer::wrap_with_boundaries(&tokens);
         if !self.sources.contains_key(id) {
             self.order.push(id.to_string());
         }
+        self.per_source_state.insert(id.to_string(), screenplay::extract_story_state(&cleaned));
+        self.cleaned_text.insert(id.to_string(), cleaned);
         self.sources.insert(id.to_string(), wrapped);
         self.dirty = true;
         stats
@@ -52,6 +72,8 @@ impl Corpus {
         let removed = self.sources.remove(id).is_some();
         if removed {
             self.order.retain(|existing| existing != id);
+            self.cleaned_text.remove(id);
+            self.per_source_state.remove(id);
             self.dirty = true;
         }
         removed
@@ -70,13 +92,39 @@ impl Corpus {
         self.sources.get(id).map(|v| v.len())
     }
 
+    /// The cleaned (HTML-stripped if applicable, whitespace-normalized)
+    /// text for a source, as used for both training and heuristic
+    /// screenplay-structure extraction.
+    pub fn cleaned_text(&self, id: &str) -> Option<&str> {
+        self.cleaned_text.get(id).map(String::as_str)
+    }
+
+    pub fn source_ids(&self) -> impl Iterator<Item = &str> {
+        self.order.iter().map(String::as_str)
+    }
+
+    /// Characters/locations/scene-count tracked across every current
+    /// source, in first-seen (insertion) order. See `screenplay.rs` for
+    /// how this heuristic extraction works and its known limitations.
+    pub fn story_state(&self) -> StoryState {
+        let mut merged = StoryState::default();
+        for id in &self.order {
+            if let Some(state) = self.per_source_state.get(id) {
+                merged.merge(state);
+            }
+        }
+        merged
+    }
+
     fn rebuild_flat_if_needed(&mut self) {
         if !self.dirty {
             return;
         }
         self.flat_cache.clear();
+        self.boundaries.clear();
         for id in &self.order {
             if let Some(tokens) = self.sources.get(id) {
+                self.boundaries.push(self.flat_cache.len());
                 self.flat_cache.extend_from_slice(tokens);
             }
         }
@@ -92,7 +140,10 @@ impl Corpus {
     /// Sample a batch of `(input, target)` windows for next-token
     /// prediction. `inputs`/`targets` are flattened row-major
     /// `[batch_size * context_len]` arrays; `targets[i]` is `inputs[i]`
-    /// shifted one token to the right.
+    /// shifted one token to the right. A fraction of windows
+    /// (`BOUNDARY_ALIGNED_SAMPLE_RATE`) start exactly at a source
+    /// boundary rather than a uniformly random offset — see that
+    /// constant's doc comment for why.
     pub fn sample_batch(
         &mut self,
         batch_size: usize,
@@ -104,10 +155,16 @@ impl Corpus {
             return None;
         }
         let max_start = self.flat_cache.len() - context_len - 1;
+        let boundary_starts: Vec<usize> = self.boundaries.iter().copied().filter(|&b| b <= max_start).collect();
+
         let mut inputs = Vec::with_capacity(batch_size * context_len);
         let mut targets = Vec::with_capacity(batch_size * context_len);
         for _ in 0..batch_size {
-            let start = rng.gen_range(max_start + 1);
+            let start = if !boundary_starts.is_empty() && rng.next_f32() < BOUNDARY_ALIGNED_SAMPLE_RATE {
+                boundary_starts[rng.gen_range(boundary_starts.len())]
+            } else {
+                rng.gen_range(max_start + 1)
+            };
             inputs.extend_from_slice(&self.flat_cache[start..start + context_len]);
             targets.extend_from_slice(&self.flat_cache[start + 1..start + 1 + context_len]);
         }
@@ -179,5 +236,55 @@ mod tests {
         c.upsert("a", "the quick brown fox jumps over the lazy dog", false);
         c.remove("a");
         assert!(!c.can_sample(4));
+    }
+
+    #[test]
+    fn story_state_aggregates_across_sources_and_updates_on_remove() {
+        let mut c = Corpus::new();
+        c.upsert("a", "INT. KITCHEN - DAY\n\nJANE\nHi.", false);
+        c.upsert("b", "EXT. GARDEN - NIGHT\n\nJOHN\nBye.", false);
+        let state = c.story_state();
+        assert_eq!(state.characters, vec!["JANE".to_string(), "JOHN".to_string()]);
+        assert_eq!(state.scene_count, 2);
+
+        c.remove("a");
+        let state = c.story_state();
+        assert_eq!(state.characters, vec!["JOHN".to_string()]);
+        assert_eq!(state.scene_count, 1);
+    }
+
+    #[test]
+    fn cleaned_text_is_available_and_cleared_on_remove() {
+        let mut c = Corpus::new();
+        // Leading indentation is deliberately preserved (screenplay
+        // formatting relies on it - see prep.rs); internal whitespace runs
+        // and trailing whitespace still get cleaned up.
+        c.upsert("a", "  Hello   world  ", false);
+        assert_eq!(c.cleaned_text("a"), Some("  Hello world"));
+        c.remove("a");
+        assert_eq!(c.cleaned_text("a"), None);
+    }
+
+    #[test]
+    fn sampling_sometimes_lands_exactly_on_a_source_boundary() {
+        let mut c = Corpus::new();
+        let text = "the quick brown fox jumps over the lazy dog ".repeat(20);
+        c.upsert("a", &text, false);
+        c.upsert("b", &text, false);
+        let mut rng = Rng::seed_from_u64(7);
+        let mut boundary_hits = 0;
+        let trials = 500;
+        for _ in 0..trials {
+            let batch = c.sample_batch(1, 16, &mut rng).unwrap();
+            if batch.inputs[0] == tokenizer::BOS {
+                boundary_hits += 1;
+            }
+        }
+        // Should land on a boundary roughly BOUNDARY_ALIGNED_SAMPLE_RATE of
+        // the time (40%) - well above what a uniformly random start over a
+        // corpus this size would produce by chance (a fraction of a
+        // percent), and comfortably below 100%.
+        let rate = boundary_hits as f64 / trials as f64;
+        assert!(rate > 0.2 && rate < 0.6, "boundary-aligned rate was {rate}");
     }
 }

@@ -5,6 +5,7 @@ pub mod model;
 pub mod ops;
 pub mod prep;
 pub mod rng;
+pub mod screenplay;
 pub mod tokenizer;
 pub mod train;
 
