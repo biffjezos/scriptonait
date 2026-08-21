@@ -916,6 +916,15 @@ impl GpuModel {
         Ok(total_loss / batch.batch_size as f32)
     }
 
+    /// Number of `train_step` calls this model has completed (the same
+    /// counter used for Adam's bias correction) — used to carry a
+    /// meaningful step count over to the CPU trainer when syncing weights
+    /// back (see `wasm-app`'s `sync_weights_from_gpu`), since `Trainer`
+    /// has no other way to know how much GPU-side training happened.
+    pub fn adam_step(&self) -> u32 {
+        self.adam_step.get()
+    }
+
     /// Reads every weight tensor back from the GPU, concatenated in the
     /// same fixed order `llm_core::model::ModelWeights::to_bytes` uses —
     /// pass the result through that same byte layout (little-endian f32)

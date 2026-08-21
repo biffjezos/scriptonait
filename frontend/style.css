@@ -348,12 +348,7 @@ button.secondary,
 }
 
 .train-samples {
-  display: flex;
-  flex-direction: column-reverse;
-  gap: 0.5rem;
   margin-top: 0.75rem;
-  max-height: 20rem;
-  overflow-y: auto;
 }
 
 .train-samples .sample {
