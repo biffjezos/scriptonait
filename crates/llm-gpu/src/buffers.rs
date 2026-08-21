@@ -55,7 +55,7 @@ pub fn write_u32(queue: &wgpu::Queue, buffer: &wgpu::Buffer, data: &[u32]) {
 /// Copies `buffer`'s first `len` f32s back to the host. Async because
 /// `wgpu`'s buffer mapping is inherently async (mandatory on the web,
 /// where the browser's WebGPU implementation is a JS Promise underneath);
-/// natively this resolves as soon as `device.poll(Maintain::Wait)` returns.
+/// natively this resolves as soon as `device.poll(PollType::Wait)` returns.
 pub async fn read_f32(device: &wgpu::Device, queue: &wgpu::Queue, buffer: &wgpu::Buffer, len: usize) -> Vec<f32> {
     let byte_len = (len * std::mem::size_of::<f32>()) as u64;
     let staging = device.create_buffer(&wgpu::BufferDescriptor {
@@ -74,12 +74,12 @@ pub async fn read_f32(device: &wgpu::Device, queue: &wgpu::Queue, buffer: &wgpu:
     slice.map_async(wgpu::MapMode::Read, move |result| {
         let _ = tx.send(result);
     });
-    device.poll(wgpu::Maintain::Wait);
+    let _ = device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None });
     rx.await
         .expect("map_async callback dropped without firing")
         .expect("failed to map GPU buffer for readback");
 
-    let data = slice.get_mapped_range();
+    let data = slice.get_mapped_range().expect("buffer was just confirmed mapped above");
     let result: Vec<f32> = bytemuck::cast_slice(&data).to_vec();
     drop(data);
     staging.unmap();

@@ -8,7 +8,7 @@
 use llm_core::config::ModelConfig;
 use llm_core::model::ModelWeights;
 
-use crate::buffers::{read_f32, storage_f32, uniform, upload_f32, upload_u32, write_u32, write_uniform};
+use crate::buffers::{read_f32, storage_f32, uniform, upload_f32, upload_u32, write_u32};
 use crate::context::{GpuContext, MAX_GPU_WINDOW};
 
 fn ceil_div(a: usize, b: usize) -> u32 {

@@ -47,6 +47,7 @@ worker.onmessage = (event) => {
     case 'sourceStats':
     case 'sourceRemoved': {
       refreshCorpusStatsFromWorker(msg);
+      updateStoryStatePanel(msg.storyState);
       break;
     }
 
@@ -75,6 +76,15 @@ worker.onmessage = (event) => {
     case 'generateResult': {
       el('generate-output').textContent = msg.text;
       el('generate-btn').disabled = false;
+      renderQaNotes(msg.qaNotes || []);
+      el('effective-prompt').textContent = msg.effectivePrompt || '';
+      el('effective-prompt-details').hidden = !msg.effectivePrompt;
+      break;
+    }
+
+    case 'retrievalPreview': {
+      renderRetrievalPreview(msg.chunks || []);
+      el('preview-retrieval-btn').disabled = false;
       break;
     }
 
@@ -112,7 +122,10 @@ worker.onmessage = (event) => {
     case 'error': {
       console.error(`[worker:${msg.context}]`, msg.message);
       alert(`${msg.context}: ${msg.message}`);
+      // Reset whichever button might have triggered this (harmless if it
+      // wasn't the one that failed).
       el('generate-btn').disabled = false;
+      el('preview-retrieval-btn').disabled = false;
       break;
     }
 
@@ -132,20 +145,75 @@ function setTrainingButtons(isTraining) {
   el('stop-train-btn').disabled = !isTraining;
 }
 
+function updateStoryStatePanel(storyState) {
+  if (!storyState) return;
+  const panel = el('story-state-panel');
+  const hasAnything = storyState.characters.length > 0 || storyState.locations.length > 0;
+  panel.hidden = !hasAnything;
+  if (!hasAnything) return;
+  el('story-characters').textContent = storyState.characters.length ? storyState.characters.join(', ') : '—';
+  el('story-locations').textContent = storyState.locations.length ? storyState.locations.join(', ') : '—';
+  el('story-scene-count').textContent = String(storyState.sceneCount);
+}
+
+function renderQaNotes(notes) {
+  const container = el('qa-notes');
+  container.innerHTML = '';
+  for (const note of notes) {
+    const div = document.createElement('div');
+    const isWarning = note.startsWith('[WARNING]');
+    div.className = `note${isWarning ? ' warning' : ''}`;
+    div.textContent = note;
+    container.appendChild(div);
+  }
+}
+
+function renderRetrievalPreview(chunks) {
+  const container = el('retrieval-preview');
+  container.innerHTML = '';
+  container.hidden = chunks.length === 0;
+  for (const chunk of chunks) {
+    const div = document.createElement('div');
+    div.className = 'chunk';
+    div.textContent = chunk;
+    container.appendChild(div);
+  }
+}
+
 // --- Sources ---------------------------------------------------------------
 
 async function pushAllSourcesToWorker() {
   const sources = await db.listSources();
   for (const src of sources) {
-    worker.postMessage({ type: 'upsertSource', id: src.id, rawText: src.rawText, isHtml: src.kind === 'url' });
+    worker.postMessage({
+      type: 'upsertSource',
+      id: src.id,
+      rawText: src.rawText,
+      isHtml: src.kind === 'url',
+      tags: src.tags,
+    });
   }
+}
+
+function currentSourceTags() {
+  return {
+    genre: el('source-genre-tag').value.trim(),
+    tone: el('source-tone-tag').value.trim(),
+  };
 }
 
 async function addSourceRecord({ title, kind, rawText, sourceUrl = null }) {
   if (!rawText || !rawText.trim()) return;
-  const record = await db.addSource({ title, kind, rawText, sourceUrl });
+  const tags = currentSourceTags();
+  const record = await db.addSource({ title, kind, rawText, sourceUrl, tags });
   if (modelCreated) {
-    worker.postMessage({ type: 'upsertSource', id: record.id, rawText: record.rawText, isHtml: kind === 'url' });
+    worker.postMessage({
+      type: 'upsertSource',
+      id: record.id,
+      rawText: record.rawText,
+      isHtml: kind === 'url',
+      tags: record.tags,
+    });
   }
   await refreshSourcesList();
 }
@@ -190,7 +258,11 @@ function renderSourceRow(src) {
   title.append(badge, src.title);
   const stats = document.createElement('div');
   stats.className = 'stats';
-  stats.textContent = `${src.rawText.length.toLocaleString()} characters`;
+  const tagBits = [];
+  if (src.tags?.genre) tagBits.push(`genre: ${src.tags.genre}`);
+  if (src.tags?.tone) tagBits.push(`tone: ${src.tags.tone}`);
+  const tagText = tagBits.length ? ` — ${tagBits.join(', ')}` : '';
+  stats.textContent = `${src.rawText.length.toLocaleString()} characters${tagText}`;
   meta.append(title, stats);
 
   const actions = document.createElement('div');
@@ -234,6 +306,19 @@ function renderSourceEditor(src) {
   ta.rows = 6;
   ta.value = src.rawText;
 
+  const tagRow = document.createElement('div');
+  tagRow.className = 'row';
+  tagRow.style.margin = '0.4rem 0';
+  const genreInput = document.createElement('input');
+  genreInput.type = 'text';
+  genreInput.placeholder = 'Genre';
+  genreInput.value = src.tags?.genre || '';
+  const toneInput = document.createElement('input');
+  toneInput.type = 'text';
+  toneInput.placeholder = 'Tone';
+  toneInput.value = src.tags?.tone || '';
+  tagRow.append(genreInput, toneInput);
+
   const btnRow = document.createElement('div');
   btnRow.className = 'row';
   btnRow.style.marginTop = '0.4rem';
@@ -241,10 +326,17 @@ function renderSourceEditor(src) {
   saveBtn.type = 'button';
   saveBtn.textContent = 'Save';
   saveBtn.addEventListener('click', async () => {
-    const updated = await db.updateSource(src.id, { title: titleInput.value.trim() || src.title, rawText: ta.value });
+    const tags = { genre: genreInput.value.trim(), tone: toneInput.value.trim() };
+    const updated = await db.updateSource(src.id, { title: titleInput.value.trim() || src.title, rawText: ta.value, tags });
     editingSourceId = null;
     if (modelCreated) {
-      worker.postMessage({ type: 'upsertSource', id: updated.id, rawText: updated.rawText, isHtml: updated.kind === 'url' });
+      worker.postMessage({
+        type: 'upsertSource',
+        id: updated.id,
+        rawText: updated.rawText,
+        isHtml: updated.kind === 'url',
+        tags: updated.tags,
+      });
     }
     await refreshSourcesList();
   });
@@ -258,7 +350,7 @@ function renderSourceEditor(src) {
   });
   btnRow.append(saveBtn, cancelBtn);
 
-  wrap.append(titleInput, ta, btnRow);
+  wrap.append(titleInput, ta, tagRow, btnRow);
   item.append(wrap);
   return item;
 }
@@ -422,18 +514,42 @@ el('gen-use-gpu').addEventListener('change', () => {
   }
 });
 
+function currentGenerationTags() {
+  return {
+    genre: el('gen-genre-tag').value.trim(),
+    tone: el('gen-tone-tag').value.trim(),
+  };
+}
+
 el('generate-btn').addEventListener('click', () => {
   const prompt = el('prompt-input').value;
   el('generate-btn').disabled = true;
   el('generate-output').textContent = '';
+  renderQaNotes([]);
+  el('effective-prompt-details').hidden = true;
   worker.postMessage({
     type: 'generate',
     prompt,
     maxNewTokens: parseInt(el('gen-max-tokens').value, 10),
     temperature: parseFloat(el('gen-temp').value),
     useGpu: el('gen-use-gpu').checked,
+    tags: currentGenerationTags(),
+    useStoryState: el('gen-use-story-state').checked,
+    useRetrieval: el('gen-use-retrieval').checked,
+    retrievalK: 3,
+    targetWordCount: parseInt(el('gen-target-words').value, 10) || 0,
     seed: Date.now(),
   });
+});
+
+el('preview-retrieval-btn').addEventListener('click', () => {
+  const query = el('prompt-input').value;
+  if (!query.trim()) {
+    alert('Type a prompt first — retrieval searches your sources for scenes similar to it.');
+    return;
+  }
+  el('preview-retrieval-btn').disabled = true;
+  worker.postMessage({ type: 'previewRetrieval', query, k: 3 });
 });
 
 el('debug-compare-btn').addEventListener('click', () => {

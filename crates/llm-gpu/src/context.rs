@@ -39,7 +39,9 @@ fn make_pipeline(device: &wgpu::Device, label: &str, source: &str) -> wgpu::Comp
         // sync with every .wgsl file by hand.
         layout: None,
         module: &module,
-        entry_point: "main",
+        entry_point: Some("main"),
+        compilation_options: wgpu::PipelineCompilationOptions::default(),
+        cache: None,
     })
 }
 
@@ -49,29 +51,37 @@ impl GpuContext {
     /// `cargo check`-level type-checking in this sandbox, since there's no
     /// GPU here to actually run against) and compiles every kernel once.
     pub async fn new() -> Result<Self, String> {
-        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::default());
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
         let adapter = instance
             .request_adapter(&wgpu::RequestAdapterOptions {
                 power_preference: wgpu::PowerPreference::LowPower,
                 compatible_surface: None,
                 force_fallback_adapter: false,
+                ..Default::default()
             })
             .await
-            .ok_or("No WebGPU adapter available in this browser")?;
+            .map_err(|e| format!("No WebGPU adapter available in this browser: {e}"))?;
 
-        // Plain `Limits::default()`, not `downlevel_webgl2_defaults()`: the
-        // latter is a baseline for the WebGL2 fallback, which has no
-        // compute shaders at all, so it's the wrong thing to intersect
-        // with for a compute-only app like this one.
+        // `adapter.limits()`, not `Limits::default()` or any other
+        // Rust-side constant: those are fixed sets of limit fields baked
+        // into whatever wgpu version this was built against, and browsers
+        // lag/differ on which limit keys their `requestDevice` actually
+        // recognizes — requesting one wgpu knows about but a given
+        // browser doesn't (e.g. `maxInterStageShaderComponents` on some
+        // Chrome builds) makes the whole call fail with an
+        // "OperationError: ... not recognized", even though every other
+        // field would've been fine. Echoing back exactly what the adapter
+        // itself just reported is guaranteed to only use keys that
+        // browser already understands (it's where they came from) and
+        // guaranteed compute-shader-capable (real WebGPU adapters report
+        // real compute limits, unlike the WebGL2 downlevel defaults).
         let (device, queue) = adapter
-            .request_device(
-                &wgpu::DeviceDescriptor {
-                    label: Some("scriptonait-llm-device"),
-                    required_features: wgpu::Features::empty(),
-                    required_limits: wgpu::Limits::default(),
-                },
-                None,
-            )
+            .request_device(&wgpu::DeviceDescriptor {
+                label: Some("scriptonait-llm-device"),
+                required_features: wgpu::Features::empty(),
+                required_limits: adapter.limits(),
+                ..Default::default()
+            })
             .await
             .map_err(|e| format!("Failed to get WebGPU device: {e}"))?;
 
