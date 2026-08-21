@@ -39,7 +39,9 @@ fn make_pipeline(device: &wgpu::Device, label: &str, source: &str) -> wgpu::Comp
         // sync with every .wgsl file by hand.
         layout: None,
         module: &module,
-        entry_point: "main",
+        entry_point: Some("main"),
+        compilation_options: wgpu::PipelineCompilationOptions::default(),
+        cache: None,
     })
 }
 
@@ -49,15 +51,16 @@ impl GpuContext {
     /// `cargo check`-level type-checking in this sandbox, since there's no
     /// GPU here to actually run against) and compiles every kernel once.
     pub async fn new() -> Result<Self, String> {
-        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::default());
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
         let adapter = instance
             .request_adapter(&wgpu::RequestAdapterOptions {
                 power_preference: wgpu::PowerPreference::LowPower,
                 compatible_surface: None,
                 force_fallback_adapter: false,
+                ..Default::default()
             })
             .await
-            .ok_or("No WebGPU adapter available in this browser")?;
+            .map_err(|e| format!("No WebGPU adapter available in this browser: {e}"))?;
 
         // `adapter.limits()`, not `Limits::default()` or any other
         // Rust-side constant: those are fixed sets of limit fields baked
