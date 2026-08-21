@@ -19,6 +19,20 @@ pub struct Pipelines {
     pub rope: wgpu::ComputePipeline,
     pub attention: wgpu::ComputePipeline,
     pub swiglu: wgpu::ComputePipeline,
+    // Training-only (backward pass + optimizer) kernels.
+    pub linear_bwd_dx: wgpu::ComputePipeline,
+    pub linear_bwd_dw: wgpu::ComputePipeline,
+    pub rmsnorm_bwd_dx: wgpu::ComputePipeline,
+    pub rmsnorm_bwd_dgain: wgpu::ComputePipeline,
+    pub swiglu_bwd: wgpu::ComputePipeline,
+    pub attention_bwd_dscore: wgpu::ComputePipeline,
+    pub attention_bwd_dq: wgpu::ComputePipeline,
+    pub attention_bwd_dkdv: wgpu::ComputePipeline,
+    pub embedding_scatter_add: wgpu::ComputePipeline,
+    pub cross_entropy: wgpu::ComputePipeline,
+    pub zero: wgpu::ComputePipeline,
+    pub scale_inplace: wgpu::ComputePipeline,
+    pub adam_update: wgpu::ComputePipeline,
 }
 
 pub struct GpuContext {
@@ -97,6 +111,39 @@ impl GpuContext {
             rope: make_pipeline(&device, "rope", include_str!("shaders/rope.wgsl")),
             attention: make_pipeline(&device, "attention", include_str!("shaders/attention.wgsl")),
             swiglu: make_pipeline(&device, "swiglu", include_str!("shaders/swiglu.wgsl")),
+            linear_bwd_dx: make_pipeline(&device, "linear_bwd_dx", include_str!("shaders/linear_bwd_dx.wgsl")),
+            linear_bwd_dw: make_pipeline(&device, "linear_bwd_dw", include_str!("shaders/linear_bwd_dw.wgsl")),
+            rmsnorm_bwd_dx: make_pipeline(&device, "rmsnorm_bwd_dx", include_str!("shaders/rmsnorm_bwd_dx.wgsl")),
+            rmsnorm_bwd_dgain: make_pipeline(
+                &device,
+                "rmsnorm_bwd_dgain",
+                include_str!("shaders/rmsnorm_bwd_dgain.wgsl"),
+            ),
+            swiglu_bwd: make_pipeline(&device, "swiglu_bwd", include_str!("shaders/swiglu_bwd.wgsl")),
+            attention_bwd_dscore: make_pipeline(
+                &device,
+                "attention_bwd_dscore",
+                include_str!("shaders/attention_bwd_dscore.wgsl"),
+            ),
+            attention_bwd_dq: make_pipeline(
+                &device,
+                "attention_bwd_dq",
+                include_str!("shaders/attention_bwd_dq.wgsl"),
+            ),
+            attention_bwd_dkdv: make_pipeline(
+                &device,
+                "attention_bwd_dkdv",
+                include_str!("shaders/attention_bwd_dkdv.wgsl"),
+            ),
+            embedding_scatter_add: make_pipeline(
+                &device,
+                "embedding_scatter_add",
+                include_str!("shaders/embedding_scatter_add.wgsl"),
+            ),
+            cross_entropy: make_pipeline(&device, "cross_entropy", include_str!("shaders/cross_entropy.wgsl")),
+            zero: make_pipeline(&device, "zero", include_str!("shaders/zero.wgsl")),
+            scale_inplace: make_pipeline(&device, "scale_inplace", include_str!("shaders/scale_inplace.wgsl")),
+            adam_update: make_pipeline(&device, "adam_update", include_str!("shaders/adam_update.wgsl")),
         };
 
         Ok(Self { device, queue, pipelines })
