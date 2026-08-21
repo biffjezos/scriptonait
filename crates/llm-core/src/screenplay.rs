@@ -9,8 +9,27 @@
 //! happens to contain a short ALL-CAPS line — treat its output as a
 //! useful hint, not ground truth.
 
-const SLUGLINE_PREFIXES: &[&str] =
-    &["INT./EXT.", "EXT./INT.", "INT/EXT.", "EXT/INT.", "INT.", "EXT.", "EST.", "I/E."];
+// Dotted forms first: `.find()` below returns the first match, and a bare
+// form (e.g. "EXT") is a prefix of its own dotted form ("EXT."), so the
+// dotted, more-specific variants have to be checked first or they'd never
+// be reached. The bare forms exist because plenty of real shooting
+// scripts (especially older or TV/documentary ones) drop the period.
+const SLUGLINE_PREFIXES: &[&str] = &[
+    "INT./EXT.",
+    "EXT./INT.",
+    "INT/EXT.",
+    "EXT/INT.",
+    "INT.",
+    "EXT.",
+    "EST.",
+    "I/E.",
+    "INT/EXT",
+    "EXT/INT",
+    "INT",
+    "EXT",
+    "EST",
+    "I/E",
+];
 
 const TRANSITION_WORDS: &[&str] = &[
     "CUT TO",
@@ -28,6 +47,7 @@ const TRANSITION_WORDS: &[&str] = &[
     "V.O.",
     "O.S.",
     "CONT'D",
+    "CONTINUED",
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -44,20 +64,51 @@ fn strip_parenthetical(s: &str) -> &str {
     }
 }
 
+/// Finds the matching slugline prefix, requiring a non-alphanumeric (or
+/// end-of-string) character right after it — without this, a bare prefix
+/// like "EXT" would also match the start of "EXTRA" or "EXTERIOR".
+fn matches_slugline_prefix(upper: &str) -> Option<&'static str> {
+    SLUGLINE_PREFIXES
+        .iter()
+        .find(|p| upper.starts_with(**p) && upper[p.len()..].chars().next().map_or(true, |c| !c.is_ascii_alphanumeric()))
+        .copied()
+}
+
 /// Whether `line` looks like a scene slugline (`INT.`/`EXT.`/... prefix).
 pub fn is_scene_heading(line: &str) -> bool {
     let trimmed = line.trim();
     let upper = trimmed.to_ascii_uppercase();
-    SLUGLINE_PREFIXES.iter().any(|p| upper.starts_with(p))
+    matches_slugline_prefix(&upper).is_some()
 }
 
 pub fn parse_scene_heading(line: &str) -> Option<SceneHeading> {
     let trimmed = line.trim();
     let upper = trimmed.to_ascii_uppercase();
-    let prefix = SLUGLINE_PREFIXES.iter().find(|p| upper.starts_with(**p))?;
+    let prefix = matches_slugline_prefix(&upper)?;
     let rest = &trimmed[prefix.len()..];
     let (location, time) = split_location_time(rest.trim_start());
     Some(SceneHeading { raw: trimmed.to_string(), location: location.trim().to_string(), time })
+}
+
+/// Whether a single word looks like a shot/section/date code rather than
+/// part of a person's name: either all digits ("2001"), or a short (1-3
+/// letter) prefix glued directly to digits with nothing else ("A1", "A12",
+/// "B3") - the standard shorthand shooting scripts use for take/section
+/// numbers.
+fn looks_like_code_word(word: &str) -> bool {
+    let mut chars = word.chars().peekable();
+    let mut letters = 0;
+    while let Some(&c) = chars.peek() {
+        if c.is_ascii_uppercase() {
+            letters += 1;
+            chars.next();
+        } else {
+            break;
+        }
+    }
+    let rest: String = chars.collect();
+    (letters == 0 && !word.is_empty() && word.chars().all(|c| c.is_ascii_digit()))
+        || ((1..=3).contains(&letters) && !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit()))
 }
 
 fn split_location_time(rest: &str) -> (&str, Option<String>) {
@@ -83,6 +134,22 @@ pub fn is_character_cue(line: &str) -> bool {
     }
     let name_part = strip_parenthetical(trimmed).trim();
     if name_part.is_empty() {
+        return false;
+    }
+    // "X - Y" is the slugline location/time separator (split_location_time
+    // uses the same three dashes) - a real character name is never a
+    // hyphen-flanked-by-spaces pair of phrases, so this catches heading-like
+    // section/segment titles that don't have an INT./EXT. prefix to match
+    // (e.g. a documentary's "VIEWS OF AFRICAN DRYLANDS - DROUGHT").
+    if [" - ", " \u{2013} ", " \u{2014} "].iter().any(|sep| name_part.contains(sep)) {
+        return false;
+    }
+    // Real character names are essentially always 1-3 words, and never
+    // contain a bare code-like word ("2001", "A1", "A12") - this catches
+    // multi-word shot/segment descriptions and date/section markers that
+    // the hyphen check above doesn't (they don't all use " - ").
+    let words: Vec<&str> = name_part.split_whitespace().collect();
+    if words.is_empty() || words.len() > 3 || words.iter().any(|w| looks_like_code_word(w)) {
         return false;
     }
     let looks_like_shouting_caps = name_part
@@ -234,6 +301,16 @@ suddenly fixed, leaving only seven flowing columns.";
     }
 
     #[test]
+    fn detects_bare_prefixes_without_a_period() {
+        assert!(is_scene_heading("EXT THE STREAM - THE OTHERS"));
+        assert!(is_scene_heading("INT KITCHEN"));
+        // A word boundary is required: "EXTRA"/"INTERIOR" must not match
+        // the bare "EXT"/"INT" prefixes just because they start with them.
+        assert!(!is_scene_heading("EXTRA CREDIT SCENE"));
+        assert!(!is_scene_heading("INTERIOR DESIGN MAGAZINE"));
+    }
+
+    #[test]
     fn parses_location_and_time() {
         let h = parse_scene_heading("INT. KITCHEN - DAY").unwrap();
         assert_eq!(h.location, "KITCHEN");
@@ -259,7 +336,34 @@ suddenly fixed, leaving only seven flowing columns.";
     fn rejects_transitions_and_scene_headings_as_cues() {
         assert_eq!(character_name("CUT TO:"), None);
         assert_eq!(character_name("FADE OUT"), None);
+        assert_eq!(character_name("CONTINUED"), None);
         assert_eq!(character_name("INT. KITCHEN - DAY"), None);
+    }
+
+    #[test]
+    fn rejects_heading_style_segment_titles_without_a_slugline_prefix() {
+        // Real shooting-script false positives reported from a nature
+        // documentary: all-caps segment titles that use the same
+        // " - " location/time separator sluglines use, but without an
+        // INT./EXT. prefix to catch them as a heading in the first place.
+        assert_eq!(character_name("VIEWS OF AFRICAN DRYLANDS - DROUGHT"), None);
+        assert_eq!(character_name("EXT PARCHED COUNTRYSIDE - THE LION"), None);
+    }
+
+    #[test]
+    fn rejects_bare_section_codes_and_multi_word_shot_descriptions() {
+        // More false positives from the same documentary: bare take/section
+        // codes (no hyphen, so the check above doesn't catch them) and
+        // longer shot descriptions that happen to be followed by real
+        // narration prose, which the dialogue-lookahead check alone can't
+        // tell apart from a genuine character cue.
+        assert_eq!(character_name("A12"), None);
+        assert_eq!(character_name("A1"), None);
+        assert_eq!(character_name("YEAR 2001"), None);
+        assert_eq!(character_name("EARTH FROM 200 MILES UP NARRATOR"), None);
+        // Still accepts ordinary short names.
+        assert_eq!(character_name("JANE"), Some("JANE".to_string()));
+        assert_eq!(character_name("DR SMITH"), Some("DR SMITH".to_string()));
     }
 
     #[test]
@@ -297,6 +401,38 @@ It's cold.";
         assert_eq!(state.scene_count, 2);
         assert_eq!(state.characters, vec!["JANE".to_string(), "JOHN".to_string()]);
         assert_eq!(state.locations, vec!["KITCHEN".to_string(), "GARDEN".to_string()]);
+    }
+
+    #[test]
+    fn nature_documentary_excerpt_yields_no_characters() {
+        let script = "\
+TITLE PART I
+
+AFRICA
+
+A1
+
+VIEWS OF AFRICAN DRYLANDS - DROUGHT
+
+The sun beats down on a cracked, endless plain.
+
+A2
+
+CONTINUED
+
+EXT THE STREAM - THE OTHERS
+
+A few animals gather at what remains of the water.
+
+A3
+
+EXT AFRICAN PLAIN - HERBIVORES
+
+Herds move slowly across the grassland.";
+        let state = extract_story_state(script);
+        assert!(state.characters.is_empty(), "expected no characters, got {:?}", state.characters);
+        // The bare EXT prefix (no period) is still recognized as a heading.
+        assert_eq!(state.scene_count, 2);
     }
 
     #[test]
