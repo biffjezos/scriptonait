@@ -38,6 +38,11 @@ struct Inner {
     gpu_ctx: Option<Rc<llm_gpu::GpuContext>>,
     gpu_model: Option<Rc<llm_gpu::GpuModel>>,
     gpu_model_step: u64,
+    /// True once `train_step_gpu` has run since the last
+    /// `sync_weights_from_gpu` — the CPU `trainer.weights` (and anything
+    /// derived from it: `generate`, `export_weights`) is stale while this
+    /// is set.
+    gpu_dirty: bool,
 }
 
 #[wasm_bindgen]
@@ -79,6 +84,7 @@ impl WasmLLM {
             gpu_ctx: None,
             gpu_model: None,
             gpu_model_step: u64::MAX,
+            gpu_dirty: false,
         }))))
     }
 
@@ -215,6 +221,70 @@ impl WasmLLM {
         self.0.borrow().trainer.step as f64
     }
 
+    // --- Training (WebGPU — accelerated, needs a browser with WebGPU) ----
+
+    /// Same as `train_step`, but samples the batch and runs the full
+    /// forward + backward + Adam step entirely on the GPU (see
+    /// `llm_gpu::GpuModel::train_step`). Repeated calls keep training the
+    /// same GPU-resident weights — the CPU `trainer.weights` (and anything
+    /// derived from it: `generate`, `export_weights`) is **not** updated
+    /// until `sync_weights_from_gpu` is called. Requires `init_gpu()` to
+    /// have succeeded and `gpu_supported()` to be true; `seed` should vary
+    /// call to call (e.g. the loop counter) so each step samples a
+    /// different batch. Returns `None` if there isn't enough training data
+    /// yet, same as `train_step`.
+    pub async fn train_step_gpu(&self, batch_size: u32, lr: f32, seed: f64) -> Result<Option<f32>, JsValue> {
+        let batch = {
+            let mut inner = self.0.borrow_mut();
+            let context_len = inner.trainer.config.context_len;
+            let mut rng = llm_core::rng::Rng::seed_from_u64(seed as u64);
+            inner.corpus.sample_batch(batch_size as usize, context_len, &mut rng)
+        };
+        let Some(batch) = batch else {
+            return Ok(None);
+        };
+
+        let (ctx, model, _config) = self.ensure_gpu_model().await?;
+        let loss = model.train_step(&ctx, &batch, lr).await.map_err(js_err)?;
+        self.0.borrow_mut().gpu_dirty = true;
+        Ok(Some(loss))
+    }
+
+    /// Whether `train_step_gpu` has trained the GPU-resident weights since
+    /// the last `sync_weights_from_gpu` — the UI should sync (or warn)
+    /// before generating or saving while this is true.
+    pub fn gpu_training_dirty(&self) -> bool {
+        self.0.borrow().gpu_dirty
+    }
+
+    /// Reads the GPU-trained weights back and makes them canonical (same
+    /// as `import_weights`, this also resets Adam momentum and the step
+    /// counter: the GPU keeps its own Adam state internally, separate from
+    /// the CPU trainer's, so continuing to mix the two after a sync would
+    /// be more likely to hurt than help). Call this after one or more
+    /// `train_step_gpu` calls and before `generate`, `export_weights`, or
+    /// switching back to CPU `train_step`.
+    pub async fn sync_weights_from_gpu(&self) -> Result<(), JsValue> {
+        let (ctx, model, config) = self.ensure_gpu_model().await?;
+        let flat = model.read_all_weights(&ctx).await;
+        let mut bytes = Vec::with_capacity(flat.len() * 4);
+        for v in &flat {
+            bytes.extend_from_slice(&v.to_le_bytes());
+        }
+        let weights = ModelWeights::from_bytes(&bytes, &config).map_err(js_err)?;
+
+        let mut inner = self.0.borrow_mut();
+        let mut fresh = Trainer::new(config, 0);
+        fresh.weights = weights;
+        inner.trainer = fresh;
+        // The GPU model we just read from already holds exactly these
+        // weights — mark it in sync with the (now step-0) trainer so the
+        // next `ensure_gpu_model` call doesn't re-upload it pointlessly.
+        inner.gpu_model_step = inner.trainer.step;
+        inner.gpu_dirty = false;
+        Ok(())
+    }
+
     // --- Generation (CPU — always available) -----------------------------
 
     /// `temperature <= 0.0` means greedy (deterministic) decoding.
@@ -309,6 +379,49 @@ impl WasmLLM {
         let max_diff = gpu_logits
             .iter()
             .zip(cpu_last)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        Ok(max_diff as f64)
+    }
+
+    /// Dev/sanity-check tool for the GPU **training** path (backward pass
+    /// + Adam), separate from `debug_compare_gpu_cpu` which only checks
+    /// forward-pass logits. Cyclically repeats `prompt`'s bytes to fill
+    /// exactly `context_len + 1` tokens, then runs
+    /// `llm_gpu::GpuModel::debug_grad_embed` (forward + cross-entropy +
+    /// backward for that one sequence, no Adam step, current weights
+    /// untouched) against the same computation on the CPU reference
+    /// (`llm_core::model::forward`/`backward`, gradient-checked in its own
+    /// test suite) and returns the largest absolute difference between
+    /// their embedding-table gradients. The embedding gradient depends on
+    /// nearly the entire backward pass — every layer's attention/MLP
+    /// backward, every layer's PLE scatter, and the input embedding
+    /// scatter all feed into it — so a tiny value here (float rounding
+    /// only, well under 1e-2) is a strong end-to-end check that this
+    /// crate's WGSL backward kernels are correct; a large one means there
+    /// is a real bug and GPU training shouldn't be trusted yet.
+    pub async fn debug_compare_gpu_cpu_gradient(&self, prompt: String) -> Result<f64, JsValue> {
+        let (ctx, model, config) = self.ensure_gpu_model().await?;
+        let weights = self.0.borrow().trainer.weights.clone();
+
+        let mut tokens = llm_core::tokenizer::encode(&prompt);
+        if tokens.is_empty() {
+            tokens.push(0);
+        }
+        let context_len = config.context_len;
+        let padded: Vec<u32> = (0..context_len + 1).map(|i| tokens[i % tokens.len()]).collect();
+        let input = &padded[..context_len];
+        let target = &padded[1..context_len + 1];
+
+        let gpu_grad = model.debug_grad_embed(&ctx, input, target).await.map_err(js_err)?;
+
+        let (logits, cache) = llm_core::model::forward(&weights, &config, input);
+        let (_, d_logits) = llm_core::ops::cross_entropy(&logits, target, context_len, config.vocab_size());
+        let cpu_grads = llm_core::model::backward(&weights, &config, &cache, &d_logits);
+
+        let max_diff = gpu_grad
+            .iter()
+            .zip(cpu_grads.embed.iter())
             .map(|(a, b)| (a - b).abs())
             .fold(0.0f32, f32::max);
         Ok(max_diff as f64)
