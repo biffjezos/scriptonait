@@ -493,6 +493,12 @@ pub struct GpuModel {
     act: wgpu::Buffer,
     logits: wgpu::Buffer,
     loss_per_row: wgpu::Buffer,
+    // Accumulates loss_per_row across a whole batch on the GPU (via the
+    // same add_inplace kernel gradient accumulation already uses), so
+    // train_step reads the loss back to the host exactly once per step
+    // instead of once per sequence in the batch - see train_step's docs
+    // for why that per-sequence readback was a real bottleneck.
+    loss_accum: wgpu::Buffer,
     layer_caches: Vec<GpuLayerCache>,
     h_final: wgpu::Buffer,
     final_normed: wgpu::Buffer,
@@ -611,6 +617,7 @@ impl GpuModel {
             act: storage_f32(device, "act", ctx_len * ffn, false),
             logits: storage_f32(device, "logits", ctx_len * vocab, true),
             loss_per_row: storage_f32(device, "loss_per_row", ctx_len, true),
+            loss_accum: storage_f32(device, "loss_accum", ctx_len, true),
             layer_caches: (0..num_layers).map(|_| GpuLayerCache::new(device, ctx_len, heads, h, ffn)).collect(),
             h_final: storage_f32(device, "h_final", ctx_len * h, false),
             final_normed: storage_f32(device, "final_normed", ctx_len * h, false),
@@ -862,6 +869,18 @@ impl GpuModel {
     /// `llm_core::corpus::Corpus::sample_batch`) — runs forward, cross
     /// entropy, backward, and one Adam step for the whole batch. Returns
     /// the batch's mean loss. Mirrors `llm_core::train::Trainer::train_step`.
+    ///
+    /// Reads a value back from the GPU to the host exactly once per call
+    /// (the final loss, at the very end) rather than once per sequence in
+    /// the batch. Each such readback is a real host-device
+    /// synchronization point (map a staging buffer, wait for the GPU to
+    /// finish everything queued so far, copy the data back) - doing that
+    /// `batch_size` times per step, once per sequence, was measured to
+    /// dominate step time completely (tens of seconds per step on modest
+    /// hardware, even after shader-compile warmup). `loss_per_row` is
+    /// instead accumulated into `loss_accum` on the GPU via the same
+    /// add_inplace kernel gradient accumulation already uses, and only
+    /// `loss_accum` gets read back, once, after the batch loop.
     pub async fn train_step(&self, ctx: &GpuContext, batch: &Batch, lr: f32) -> Result<f32, String> {
         if batch.context_len != self.config.context_len {
             return Err(format!(
@@ -873,8 +892,8 @@ impl GpuModel {
 
         let lens = self.tensor_lens();
         self.zero_all(ctx, &self.grad_accum_buffers(), &lens);
+        dispatch_zero(ctx, &self.loss_accum, t_len);
 
-        let mut total_loss = 0.0f32;
         for b in 0..batch.batch_size {
             let start = b * t_len;
             let input = &batch.inputs[start..start + t_len];
@@ -885,8 +904,7 @@ impl GpuModel {
             self.forward(ctx, input);
             write_u32(&ctx.queue, &self.targets, target);
             dispatch_cross_entropy(ctx, &self.logits, &self.targets, &self.d_logits, &self.loss_per_row, t_len);
-            let row_losses = read_f32(&ctx.device, &ctx.queue, &self.loss_per_row, t_len).await;
-            total_loss += row_losses.iter().sum::<f32>() / t_len as f32;
+            dispatch_add_inplace(ctx, &self.loss_accum, &self.loss_per_row, t_len);
 
             self.backward(ctx, input);
 
@@ -913,7 +931,14 @@ impl GpuModel {
             dispatch_adam(ctx, weight_bufs[i], grad_bufs[i], m_bufs[i], v_bufs[i], lr, bias1, bias2, lens[i]);
         }
 
-        Ok(total_loss / batch.batch_size as f32)
+        // sum(loss_accum) / (t_len * batch_size) is exactly the same
+        // quantity the old per-sequence version computed (mean over
+        // tokens, then mean over the batch) - just reordered, since
+        // addition is commutative/associative and every sequence has the
+        // same t_len.
+        let accum = read_f32(&ctx.device, &ctx.queue, &self.loss_accum, t_len).await;
+        let total_loss: f32 = accum.iter().sum();
+        Ok(total_loss / (t_len * batch.batch_size) as f32)
     }
 
     /// Number of `train_step` calls this model has completed (the same
