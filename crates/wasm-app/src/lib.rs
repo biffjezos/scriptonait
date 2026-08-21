@@ -284,14 +284,21 @@ impl WasmLLM {
     pub async fn sync_weights_from_gpu(&self) -> Result<(), JsValue> {
         let (ctx, model, config) = self.ensure_gpu_model().await?;
         let weights = read_gpu_weights(&ctx, &model, &config).await?;
+        let step = model.adam_step() as u64;
 
         let mut inner = self.0.borrow_mut();
         let mut fresh = Trainer::new(config, 0);
         fresh.weights = weights;
+        // `Trainer::new` always starts a fresh instance at step 0 — carry
+        // over the GPU model's own step count instead, so this doesn't
+        // look like training reverted to scratch (`step` is otherwise the
+        // only user-visible signal that GPU training actually did
+        // anything, since the weights themselves aren't directly inspectable).
+        fresh.step = step;
         inner.trainer = fresh;
         // The GPU model we just read from already holds exactly these
-        // weights — mark it in sync with the (now step-0) trainer so the
-        // next `ensure_gpu_model` call doesn't re-upload it pointlessly.
+        // weights — mark it in sync with the trainer so the next
+        // `ensure_gpu_model` call doesn't re-upload it pointlessly.
         inner.gpu_model_step = inner.trainer.step;
         inner.gpu_dirty = false;
         Ok(())
