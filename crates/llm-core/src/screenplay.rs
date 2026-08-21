@@ -115,11 +115,25 @@ fn push_unique(list: &mut Vec<String>, value: String) {
     }
 }
 
+/// Whether `line` reads as ordinary dialogue/prose rather than another
+/// all-caps cue, heading, or section marker.
+fn looks_like_dialogue(line: &str) -> bool {
+    let trimmed = line.trim();
+    !trimmed.is_empty() && !is_scene_heading(trimmed) && trimmed.chars().any(|c| c.is_ascii_lowercase())
+}
+
 /// Scans `text` line by line, collecting scene headings and character
-/// cues in first-seen order.
+/// cues in first-seen order. A candidate cue only counts as a character
+/// if the next non-empty line looks like dialogue (contains a lowercase
+/// letter) rather than another all-caps line — real character cues are
+/// always followed by their dialogue, whereas non-screenplay all-caps
+/// text (shooting-script section/shot codes like `A1`, `SECTION TIMING`,
+/// timing tables) tends to run in consecutive all-caps lines with nothing
+/// in between, which would otherwise all get swept up as "characters".
 pub fn extract_story_state(text: &str) -> StoryState {
     let mut state = StoryState::default();
-    for line in text.lines() {
+    let lines: Vec<&str> = text.lines().collect();
+    for (i, &line) in lines.iter().enumerate() {
         if let Some(heading) = parse_scene_heading(line) {
             state.scene_count += 1;
             if !heading.location.is_empty() {
@@ -127,9 +141,12 @@ pub fn extract_story_state(text: &str) -> StoryState {
             }
             continue;
         }
-        if let Some(name) = character_name(line) {
-            push_unique(&mut state.characters, name);
+        let Some(name) = character_name(line) else { continue };
+        let next_line = lines[i + 1..].iter().find(|l| !l.trim().is_empty());
+        if !next_line.is_some_and(|l| looks_like_dialogue(l)) {
+            continue;
         }
+        push_unique(&mut state.characters, name);
     }
     state
 }
@@ -280,6 +297,41 @@ It's cold.";
         assert_eq!(state.scene_count, 2);
         assert_eq!(state.characters, vec!["JANE".to_string(), "JOHN".to_string()]);
         assert_eq!(state.locations, vec!["KITCHEN".to_string(), "GARDEN".to_string()]);
+    }
+
+    #[test]
+    fn rejects_shooting_script_section_codes_not_followed_by_dialogue() {
+        let script = "\
+TITLE PART I
+
+AFRICA
+
+A1
+
+VIEWS OF AFRICAN DRYLANDS - DROUGHT
+
+A2
+
+CONTINUED";
+        let state = extract_story_state(script);
+        assert!(state.characters.is_empty(), "expected no characters, got {:?}", state.characters);
+    }
+
+    #[test]
+    fn accepts_cue_followed_by_dialogue_rejects_cue_followed_by_another_cue() {
+        let script = "\
+JANE
+Hello there.
+
+BOB
+
+ALICE
+Hi Bob.";
+        let state = extract_story_state(script);
+        // BOB is immediately followed by another all-caps line (ALICE), so
+        // it reads as two consecutive section-style markers rather than a
+        // character cue followed by dialogue, and is rejected.
+        assert_eq!(state.characters, vec!["JANE".to_string(), "ALICE".to_string()]);
     }
 
     #[test]

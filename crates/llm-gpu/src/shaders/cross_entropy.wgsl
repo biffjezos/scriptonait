@@ -35,14 +35,18 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     for (var v: u32 = 0u; v < VOCAB; v = v + 1u) {
         sum = sum + exp(logits[base + v] - maxv);
     }
-    let target = targets[t];
-    loss_out[t] = log(sum) + maxv - logits[base + target];
+    // `target` is a reserved word in WGSL (reserved for future use, even
+    // though not currently a keyword) - using it as an identifier fails
+    // shader compilation entirely, silently invalidating this pipeline
+    // and every dispatch that uses it. Call it `tgt` instead.
+    let tgt = targets[t];
+    loss_out[t] = log(sum) + maxv - logits[base + tgt];
 
     let inv_t = 1.0 / f32(p.t_len);
     for (var v: u32 = 0u; v < VOCAB; v = v + 1u) {
         let prob = exp(logits[base + v] - maxv) / sum;
         var target_ind: f32 = 0.0;
-        if (v == target) {
+        if (v == tgt) {
             target_ind = 1.0;
         }
         d_logits[base + v] = (prob - target_ind) * inv_t;

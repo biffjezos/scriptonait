@@ -32,6 +32,23 @@ fn js_err(msg: impl std::fmt::Display) -> JsValue {
     JsValue::from_str(&msg.to_string())
 }
 
+/// Reads the GPU-resident weights back and reconstructs them as an owned
+/// `ModelWeights` — used both to sync the CPU copy after GPU training and
+/// by the debug comparison tools below, so they always compare against
+/// whatever the GPU actually currently holds rather than the CPU
+/// `trainer.weights` (which can be stale after `train_step_gpu`, since
+/// that only updates the GPU-resident copy — comparing against a stale
+/// CPU copy would report a large, misleading "diff" that reflects two
+/// different models, not a kernel bug).
+async fn read_gpu_weights(ctx: &llm_gpu::GpuContext, model: &llm_gpu::GpuModel, config: &ModelConfig) -> Result<ModelWeights, JsValue> {
+    let flat = model.read_all_weights(ctx).await;
+    let mut bytes = Vec::with_capacity(flat.len() * 4);
+    for v in &flat {
+        bytes.extend_from_slice(&v.to_le_bytes());
+    }
+    ModelWeights::from_bytes(&bytes, config).map_err(js_err)
+}
+
 struct Inner {
     trainer: Trainer,
     corpus: Corpus,
@@ -266,12 +283,7 @@ impl WasmLLM {
     /// switching back to CPU `train_step`.
     pub async fn sync_weights_from_gpu(&self) -> Result<(), JsValue> {
         let (ctx, model, config) = self.ensure_gpu_model().await?;
-        let flat = model.read_all_weights(&ctx).await;
-        let mut bytes = Vec::with_capacity(flat.len() * 4);
-        for v in &flat {
-            bytes.extend_from_slice(&v.to_le_bytes());
-        }
-        let weights = ModelWeights::from_bytes(&bytes, &config).map_err(js_err)?;
+        let weights = read_gpu_weights(&ctx, &model, &config).await?;
 
         let mut inner = self.0.borrow_mut();
         let mut fresh = Trainer::new(config, 0);
@@ -351,15 +363,20 @@ impl WasmLLM {
     /// GPU (llm-gpu, untested in this project's dev sandbox — see its
     /// crate docs) and the CPU (llm-core, gradient-checked in its test
     /// suite) backends over `prompt`, and returns the largest absolute
-    /// difference between their final-token logits. This should come out
-    /// tiny (float rounding only, well under 1e-2); a large value means
-    /// there's a real bug in the WGSL kernels and the GPU backend
-    /// shouldn't be trusted yet. Log this from the browser console after
-    /// building — it's the main way to validate llm-gpu since it was
-    /// written without the ability to run WebGPU at all.
+    /// difference between their final-token logits. The CPU side uses
+    /// whatever weights the GPU currently holds (read back via
+    /// `read_gpu_weights`), not the possibly-stale `trainer.weights` —
+    /// after `train_step_gpu` the two can diverge (see its docs), and
+    /// comparing against a stale copy would report a large "diff" that's
+    /// really just two different models, not a kernel bug. This should
+    /// come out tiny (float rounding only, well under 1e-2); a large
+    /// value means there's a real bug in the WGSL kernels and the GPU
+    /// backend shouldn't be trusted yet. Log this from the browser
+    /// console after building — it's the main way to validate llm-gpu
+    /// since it was written without the ability to run WebGPU at all.
     pub async fn debug_compare_gpu_cpu(&self, prompt: String) -> Result<f64, JsValue> {
         let (ctx, model, config) = self.ensure_gpu_model().await?;
-        let weights = self.0.borrow().trainer.weights.clone();
+        let weights = read_gpu_weights(&ctx, &model, &config).await?;
 
         let mut tokens = llm_core::tokenizer::encode(&prompt);
         if tokens.is_empty() {
@@ -392,17 +409,20 @@ impl WasmLLM {
     /// backward for that one sequence, no Adam step, current weights
     /// untouched) against the same computation on the CPU reference
     /// (`llm_core::model::forward`/`backward`, gradient-checked in its own
-    /// test suite) and returns the largest absolute difference between
-    /// their embedding-table gradients. The embedding gradient depends on
-    /// nearly the entire backward pass — every layer's attention/MLP
-    /// backward, every layer's PLE scatter, and the input embedding
-    /// scatter all feed into it — so a tiny value here (float rounding
-    /// only, well under 1e-2) is a strong end-to-end check that this
-    /// crate's WGSL backward kernels are correct; a large one means there
-    /// is a real bug and GPU training shouldn't be trusted yet.
+    /// test suite), using whatever weights the GPU currently holds for
+    /// both sides (see `debug_compare_gpu_cpu`'s docs on why — this stays
+    /// a valid comparison even mid-GPU-training, before any sync back to
+    /// the CPU copy) — and returns the largest absolute difference
+    /// between their embedding-table gradients. The embedding gradient
+    /// depends on nearly the entire backward pass — every layer's
+    /// attention/MLP backward, every layer's PLE scatter, and the input
+    /// embedding scatter all feed into it — so a tiny value here (float
+    /// rounding only, well under 1e-2) is a strong end-to-end check that
+    /// this crate's WGSL backward kernels are correct; a large one means
+    /// there is a real bug and GPU training shouldn't be trusted yet.
     pub async fn debug_compare_gpu_cpu_gradient(&self, prompt: String) -> Result<f64, JsValue> {
         let (ctx, model, config) = self.ensure_gpu_model().await?;
-        let weights = self.0.borrow().trainer.weights.clone();
+        let weights = read_gpu_weights(&ctx, &model, &config).await?;
 
         let mut tokens = llm_core::tokenizer::encode(&prompt);
         if tokens.is_empty() {
