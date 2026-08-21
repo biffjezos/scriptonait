@@ -13,7 +13,7 @@
     A small transformer, trained from scratch on your own film scripts, stories, or books —
     entirely in your browser, generation accelerated by WebGPU.
   </p>
-  <p id="support-warning" class="warning" hidden></p>
+  <p id="webgpu-status" class="webgpu-status"></p>
 </header>
 
 <main>
@@ -120,7 +120,7 @@
         <input type="number" id="cfg-lr" value="0.01" min="0.0001" max="1" step="0.001" />
       </label>
       <label class="checkbox-label">
-        <input type="checkbox" id="train-use-gpu" disabled /> Train on WebGPU (experimental — falls back to CPU if unavailable)
+        <input type="checkbox" id="train-use-gpu" checked disabled /> Train on WebGPU (falls back to CPU if unavailable)
       </label>
     </div>
     <div class="row">
@@ -152,7 +152,7 @@
         <input type="number" id="gen-target-words" min="0" placeholder="0 = no target" />
       </label>
       <label class="checkbox-label">
-        <input type="checkbox" id="gen-use-gpu" /> Use WebGPU acceleration
+        <input type="checkbox" id="gen-use-gpu" checked disabled /> Use WebGPU acceleration
       </label>
       <label class="checkbox-label">
         <input type="checkbox" id="gen-use-story-state" /> Remind the model of characters/locations so far

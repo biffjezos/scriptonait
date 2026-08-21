@@ -12,11 +12,22 @@ let editingSourceId = null;
 let lossHistory = [];
 let training = false;
 
-if (!('gpu' in navigator)) {
-  el('support-warning').hidden = false;
-  el('support-warning').textContent =
-    'This browser has no WebGPU support (navigator.gpu is undefined) — generation will still ' +
-    'work, just on the slower CPU path. Try a recent Chrome or Edge for WebGPU acceleration.';
+const webgpuBrowserSupported = 'gpu' in navigator;
+
+function setWebGpuStatus(text, cls) {
+  const banner = el('webgpu-status');
+  banner.textContent = text;
+  banner.className = 'webgpu-status' + (cls ? ` ${cls}` : '');
+}
+
+if (!webgpuBrowserSupported) {
+  setWebGpuStatus(
+    'WebGPU: not available in this browser (navigator.gpu is undefined) — training and ' +
+      'generation will use CPU (slower, but works everywhere). Try a recent Chrome or Edge for GPU acceleration.',
+    'fallback'
+  );
+} else {
+  setWebGpuStatus('WebGPU: available — will be used automatically once a model is created.', '');
 }
 
 // --- Worker <-> UI wiring --------------------------------------------------
@@ -35,11 +46,23 @@ worker.onmessage = (event) => {
       el('train-panel').hidden = false;
       el('generate-panel').hidden = false;
       el('save-panel').hidden = false;
-      el('gen-use-gpu').disabled = !msg.gpuSupported;
-      el('train-use-gpu').disabled = !msg.gpuSupported;
+      const gpuUsable = msg.gpuSupported && webgpuBrowserSupported;
+      el('gen-use-gpu').disabled = !gpuUsable;
+      el('train-use-gpu').disabled = !gpuUsable;
       if (!msg.gpuSupported) {
         el('gpu-status').textContent =
           'This attention window is larger than the simple GPU kernel supports — generation will use the CPU path only.';
+        setWebGpuStatus(
+          "WebGPU: this model's context/attention window is too large for the GPU backend — using CPU for this model.",
+          'fallback'
+        );
+      } else if (webgpuBrowserSupported) {
+        // Default to GPU: request a device right away rather than waiting
+        // for the user to toggle a checkbox, so "Use WebGPU acceleration"/
+        // "Train on WebGPU" being checked by default actually works the
+        // first time someone clicks Generate/Start training.
+        setWebGpuStatus('WebGPU: initializing device…', '');
+        worker.postMessage({ type: 'initGpu' });
       }
       pushAllSourcesToWorker();
       break;
@@ -90,6 +113,11 @@ worker.onmessage = (event) => {
     }
 
     case 'gpuReady': {
+      setWebGpuStatus('WebGPU: enabled — training and generation run on the GPU.', 'enabled');
+      el('gen-use-gpu').disabled = false;
+      el('gen-use-gpu').checked = true;
+      el('train-use-gpu').disabled = false;
+      el('train-use-gpu').checked = true;
       el('gpu-status').textContent = 'WebGPU device ready.';
       el('debug-compare-btn').hidden = false;
       el('debug-compare-gradient-btn').hidden = false;
@@ -97,6 +125,7 @@ worker.onmessage = (event) => {
     }
 
     case 'gpuUnavailable': {
+      setWebGpuStatus(`WebGPU: unavailable (${msg.message}) — using CPU.`, 'fallback');
       el('gen-use-gpu').checked = false;
       el('gen-use-gpu').disabled = true;
       el('train-use-gpu').checked = false;
@@ -521,6 +550,7 @@ function drawLossChart() {
 
 el('gen-use-gpu').addEventListener('change', () => {
   if (el('gen-use-gpu').checked) {
+    setWebGpuStatus('WebGPU: initializing device…', '');
     el('gpu-status').textContent = 'Initializing WebGPU…';
     worker.postMessage({ type: 'initGpu' });
   }
