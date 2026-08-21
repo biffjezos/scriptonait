@@ -1,0 +1,6 @@
+/target
+crates/*/target
+Cargo.lock
+node_modules/
+frontend/pkg/
+.DS_Store

@@ -1,0 +1,15 @@
+[package]
+name = "llm-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+crate-type = ["rlib"]
+
+[dependencies]
+# Deliberately zero dependencies: the tokenizer, text prep, corpus, model,
+# CPU backend and training loop compile and test with only the Rust
+# standard library, so this crate never needs network/registry access to
+# build or verify. The WebGPU backend lives in the separate `llm-gpu`
+# crate (see its README) precisely so it doesn't drag wgpu into this one.

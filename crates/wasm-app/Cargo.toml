@@ -1,0 +1,32 @@
+# Standalone crate (deliberately not a member of the root workspace — see
+# the root Cargo.toml comment): this is the only crate that gets compiled
+# to wasm32, via `wasm-pack build` (see README.md at the repo root for the
+# full build command). Needs network access to fetch wasm-bindgen & co,
+# and the wasm32-unknown-unknown target, neither of which is available in
+# every sandbox this repo might be developed in — hence keeping it out of
+# the default `cargo test` workspace so that stays offline-buildable.
+[workspace]
+
+[package]
+name = "wasm-app"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+llm-core = { path = "../llm-core" }
+llm-gpu = { path = "../llm-gpu" }
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
+console_error_panic_hook = "0.1"
+
+[dependencies.web-sys]
+version = "0.3"
+features = ["console"]
+
+[package.metadata.wasm-pack.profile.release]
+wasm-opt = ["-Oz"]
