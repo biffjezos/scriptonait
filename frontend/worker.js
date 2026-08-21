@@ -129,7 +129,19 @@ async function handleMessage(msg) {
     }
 
     case 'startTraining': {
-      trainParams = { batchSize: msg.batchSize, lr: msg.lr, useGpu: !!msg.useGpu };
+      // Re-verify against the actual model config rather than trusting
+      // the requested flag as-is: a stale/mismatched checkbox state (or
+      // any other caller) asking for GPU on a config the GPU backend
+      // can't handle (context/window > MAX_GPU_WINDOW) should fall back
+      // to CPU automatically instead of failing silently mid-training.
+      const useGpu = !!msg.useGpu && llm.gpu_supported();
+      if (msg.useGpu && !useGpu) {
+        post({
+          type: 'trainFallback',
+          message: "This model's context/attention window is too large for the GPU backend — training on CPU instead.",
+        });
+      }
+      trainParams = { batchSize: msg.batchSize, lr: msg.lr, useGpu };
       if (trainParams.useGpu && !gpuInitialized) {
         try {
           await llm.init_gpu();
@@ -181,13 +193,14 @@ async function handleMessage(msg) {
         }
         effectivePrompt += msg.prompt;
 
-        const text = msg.useGpu
+        const useGpu = !!msg.useGpu && llm.gpu_supported();
+        const text = useGpu
           ? await llm.generate_gpu(effectivePrompt, msg.maxNewTokens, msg.temperature, msg.seed ?? Date.now())
           : llm.generate(effectivePrompt, msg.maxNewTokens, msg.temperature, msg.seed ?? Date.now());
 
         const qaNotes = llm.qa_check(text, msg.targetWordCount ?? 0);
 
-        post({ type: 'generateResult', text, usedGpu: msg.useGpu, effectivePrompt, qaNotes });
+        post({ type: 'generateResult', text, usedGpu: useGpu, effectivePrompt, qaNotes });
       } catch (err) {
         post({ type: 'error', context: 'generate', message: String(err) });
       }

@@ -49,6 +49,15 @@ worker.onmessage = (event) => {
       const gpuUsable = msg.gpuSupported && webgpuBrowserSupported;
       el('gen-use-gpu').disabled = !gpuUsable;
       el('train-use-gpu').disabled = !gpuUsable;
+      if (!gpuUsable) {
+        // Both checkboxes start checked in the HTML (GPU is the default
+        // preference) - disabling alone leaves a disabled checkbox still
+        // reporting .checked === true, which would silently send
+        // useGpu: true to the worker for a config the GPU backend can't
+        // actually handle. Force them off too.
+        el('gen-use-gpu').checked = false;
+        el('train-use-gpu').checked = false;
+      }
       if (!msg.gpuSupported) {
         el('gpu-status').textContent =
           'This attention window is larger than the simple GPU kernel supports — generation will use the CPU path only.';
@@ -87,6 +96,15 @@ worker.onmessage = (event) => {
       training = false;
       setTrainingButtons(false);
       el('train-status').textContent = msg.message;
+      break;
+    }
+
+    case 'trainFallback': {
+      // Non-fatal: the worker downgraded this run to CPU (e.g. GPU was
+      // requested for a config the GPU backend can't handle) - training
+      // still proceeds normally right after this, just not on GPU.
+      el('train-status').textContent = msg.message;
+      el('train-use-gpu').checked = false;
       break;
     }
 
@@ -185,16 +203,36 @@ function setTrainingButtons(isTraining) {
   el('stop-train-btn').disabled = !isTraining;
 }
 
+const STORY_STATE_DISMISSED_KEY = 'scriptonait.storyStateDismissed';
+
+function isStoryStateDismissed() {
+  try {
+    return localStorage.getItem(STORY_STATE_DISMISSED_KEY) === '1';
+  } catch {
+    return false;
+  }
+}
+
 function updateStoryStatePanel(storyState) {
   if (!storyState) return;
   const panel = el('story-state-panel');
   const hasAnything = storyState.characters.length > 0 || storyState.locations.length > 0;
-  panel.hidden = !hasAnything;
+  panel.hidden = !hasAnything || isStoryStateDismissed();
   if (!hasAnything) return;
   el('story-characters').textContent = storyState.characters.length ? storyState.characters.join(', ') : '—';
   el('story-locations').textContent = storyState.locations.length ? storyState.locations.join(', ') : '—';
   el('story-scene-count').textContent = String(storyState.sceneCount);
 }
+
+el('dismiss-story-state-btn').addEventListener('click', () => {
+  el('story-state-panel').hidden = true;
+  try {
+    localStorage.setItem(STORY_STATE_DISMISSED_KEY, '1');
+  } catch {
+    // Storage unavailable (private mode, quota) - the panel still stays
+    // hidden for this page load, it just won't persist across reloads.
+  }
+});
 
 function renderQaNotes(notes) {
   const container = el('qa-notes');

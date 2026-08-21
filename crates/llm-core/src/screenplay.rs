@@ -90,6 +90,27 @@ pub fn parse_scene_heading(line: &str) -> Option<SceneHeading> {
     Some(SceneHeading { raw: trimmed.to_string(), location: location.trim().to_string(), time })
 }
 
+/// Whether a single word looks like a shot/section/date code rather than
+/// part of a person's name: either all digits ("2001"), or a short (1-3
+/// letter) prefix glued directly to digits with nothing else ("A1", "A12",
+/// "B3") - the standard shorthand shooting scripts use for take/section
+/// numbers.
+fn looks_like_code_word(word: &str) -> bool {
+    let mut chars = word.chars().peekable();
+    let mut letters = 0;
+    while let Some(&c) = chars.peek() {
+        if c.is_ascii_uppercase() {
+            letters += 1;
+            chars.next();
+        } else {
+            break;
+        }
+    }
+    let rest: String = chars.collect();
+    (letters == 0 && !word.is_empty() && word.chars().all(|c| c.is_ascii_digit()))
+        || ((1..=3).contains(&letters) && !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit()))
+}
+
 fn split_location_time(rest: &str) -> (&str, Option<String>) {
     for sep in [" - ", " \u{2013} ", " \u{2014} "] {
         if let Some(idx) = rest.find(sep) {
@@ -121,6 +142,14 @@ pub fn is_character_cue(line: &str) -> bool {
     // section/segment titles that don't have an INT./EXT. prefix to match
     // (e.g. a documentary's "VIEWS OF AFRICAN DRYLANDS - DROUGHT").
     if [" - ", " \u{2013} ", " \u{2014} "].iter().any(|sep| name_part.contains(sep)) {
+        return false;
+    }
+    // Real character names are essentially always 1-3 words, and never
+    // contain a bare code-like word ("2001", "A1", "A12") - this catches
+    // multi-word shot/segment descriptions and date/section markers that
+    // the hyphen check above doesn't (they don't all use " - ").
+    let words: Vec<&str> = name_part.split_whitespace().collect();
+    if words.is_empty() || words.len() > 3 || words.iter().any(|w| looks_like_code_word(w)) {
         return false;
     }
     let looks_like_shouting_caps = name_part
@@ -319,6 +348,22 @@ suddenly fixed, leaving only seven flowing columns.";
         // INT./EXT. prefix to catch them as a heading in the first place.
         assert_eq!(character_name("VIEWS OF AFRICAN DRYLANDS - DROUGHT"), None);
         assert_eq!(character_name("EXT PARCHED COUNTRYSIDE - THE LION"), None);
+    }
+
+    #[test]
+    fn rejects_bare_section_codes_and_multi_word_shot_descriptions() {
+        // More false positives from the same documentary: bare take/section
+        // codes (no hyphen, so the check above doesn't catch them) and
+        // longer shot descriptions that happen to be followed by real
+        // narration prose, which the dialogue-lookahead check alone can't
+        // tell apart from a genuine character cue.
+        assert_eq!(character_name("A12"), None);
+        assert_eq!(character_name("A1"), None);
+        assert_eq!(character_name("YEAR 2001"), None);
+        assert_eq!(character_name("EARTH FROM 200 MILES UP NARRATOR"), None);
+        // Still accepts ordinary short names.
+        assert_eq!(character_name("JANE"), Some("JANE".to_string()));
+        assert_eq!(character_name("DR SMITH"), Some("DR SMITH".to_string()));
     }
 
     #[test]
