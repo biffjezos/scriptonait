@@ -117,6 +117,14 @@ h1 {
   color: var(--text);
 }
 
+.gpu-details-note {
+  margin-top: 0.6rem;
+  padding: 0.5rem 0.7rem;
+  border: 1px dashed var(--border);
+  border-radius: 6px;
+  font-size: 0.8rem;
+}
+
 main {
   max-width: 760px;
   margin: 0 auto;
