@@ -79,7 +79,21 @@ worker.onmessage = (event) => {
   if (handler) handler(event.data);
 };
 
-worker.onerror = (event) => showError(event.message || 'the worker failed');
+worker.onerror = (event) =>
+  showError(
+    `${event.message || 'the worker failed'} (${event.filename || 'worker'}:${event.lineno || '?'})`,
+  );
+
+// Anything that escapes a handler lands here rather than only in the
+// console. An error nobody sees is a page that "does nothing"; an error
+// with a stack frame on it is a bug report.
+window.addEventListener('error', (event) => {
+  showError(event.error || new Error(`${event.message} (${event.filename}:${event.lineno})`));
+});
+window.addEventListener('unhandledrejection', (event) => {
+  const reason = event.reason;
+  showError(reason instanceof Error ? reason : new Error(String(reason)));
+});
 
 // --- Small helpers -----------------------------------------------------
 
@@ -182,12 +196,74 @@ let model = null;
 let generating = false;
 let training = false;
 
-const MODEL_URL = './model/scriptonait.ckpt';
-
 function setModelStatus(state, text) {
   const el = $('model-status');
   el.className = `model-status ${state}`;
   $('model-status-text').textContent = text;
+}
+
+/// Say, in one sentence, what to do next.
+///
+/// The page has three things you can do and they have an order, but
+/// which one applies depends on what you've already got. Rather than
+/// making that a puzzle, this states it, and disables the buttons that
+/// can't work yet.
+function updateGuidance() {
+  const step = $('next-step');
+  const words = sources.reduce((sum, s) => sum + (s.rawText || '').length, 0);
+  const enoughText = words > 4000;
+
+  $('train-btn').disabled = training || sources.length === 0;
+  $('generate-btn').disabled = generating || !model;
+
+  $('train-btn').textContent = model
+    ? (model.pretrained ? 'Keep training on my writing' : 'Keep training this model')
+    : 'Train a model on my writing';
+
+  const explains = $('train-explains');
+  if (!model) {
+    explains.textContent =
+      'This makes a new model from scratch and teaches it your text. It runs here, ' +
+      'on your CPU, and it is slow: expect nonsense for the first while, and hours ' +
+      'before it reads like writing. You can stop and resume at any time.';
+  } else if (model.pretrained) {
+    explains.textContent =
+      'This nudges the model you loaded toward your text. Much faster than starting ' +
+      'from nothing, because it already knows English.';
+  } else {
+    explains.textContent =
+      'Carry on training the model you made. Progress is kept, so short runs add up.';
+  }
+
+  if (training) {
+    step.textContent = 'Training. You can stop it whenever you like — progress is kept.';
+  } else if (generating) {
+    step.textContent = 'Writing.';
+  } else if (!model && sources.length === 0) {
+    step.textContent = 'Start at step 1: add some of your own writing for the model to learn from.';
+  } else if (!model && !enoughText) {
+    step.textContent =
+      `You have ${formatCount(words)} characters. That's little to learn from — add more in ` +
+      'step 1, then press "Train a model on my writing".';
+  } else if (!model) {
+    step.textContent = 'Next: press "Train a model on my writing" in step 2.';
+  } else if (model.step < 500) {
+    step.textContent =
+      'You have a model, but it has barely trained yet — it will write nonsense. ' +
+      'Keep training it in step 2, or try step 3 to see where it is.';
+  } else {
+    step.textContent = 'Ready. Type what you want in step 3 and press "Write it".';
+  }
+}
+
+/// Hand the model everything already in the list.
+///
+/// Called whenever a model appears, because sources can be added before
+/// one exists — that's the normal order now — and the model starts empty.
+async function syncAllSources() {
+  for (const source of sources) {
+    await syncSource(source);
+  }
 }
 
 function renderModel(info) {
@@ -199,12 +275,19 @@ function renderModel(info) {
   const params = formatCount(info.params);
   // The device is stated, never chosen. It's a fact about the machine,
   // and the first question anyone asks about speed.
-  const where = info.usingGpu ? `running on ${info.device}` : 'running on the CPU (no WebGPU here)';
+  // wgpu reports things like " (BrowserWebGpu, Other)" — already
+  // parenthesised, sometimes with an empty name in front. Unwrap one
+  // enclosing pair rather than stripping brackets blindly, which left
+  // the parentheses unbalanced.
+  const device = (info.device || '').trim().replace(/^\((.*)\)$/, '$1').trim();
+  const where = info.usingGpu
+    ? `writing on your GPU${device ? ` (${device})` : ''}`
+    : 'writing on the CPU — this browser has no WebGPU';
   setModelStatus(
     'ready',
-    info.pretrained
-      ? `Ready — ${params} parameters, trained for ${formatCount(info.step)} steps, ${where}.`
-      : `Untrained model created (${params} parameters), ${where}. It will write nonsense until you fine-tune it.`,
+    info.step > 0
+      ? `Your model: ${params} parameters, trained ${formatCount(info.step)} steps, ${where}.`
+      : `Your model: ${params} parameters, not trained yet, ${where}.`,
   );
   $('model-details').innerHTML = `
     <dl>
@@ -217,72 +300,7 @@ function renderModel(info) {
       <div><dt>Training steps</dt><dd>${formatCount(info.step)}</dd></div>
       <div><dt>Generating on</dt><dd>${escapeHtml(info.device || 'CPU')}</dd></div>
     </dl>`;
-  $('corpus-stats').textContent = info.sources
-    ? `${info.sources} source${info.sources === 1 ? '' : 's'}, ${formatCount(info.corpusTokens)} tokens`
-    : 'No sources added yet.';
-}
-
-/// Download the shipped checkpoint, reporting progress as it streams.
-async function downloadModel(url) {
-  const response = await fetch(url, { cache: 'no-cache' });
-  if (!response.ok) {
-    throw new Error(`no model published at ${url} (HTTP ${response.status})`);
-  }
-  const total = Number(response.headers.get('content-length')) || 0;
-  const reader = response.body && response.body.getReader ? response.body.getReader() : null;
-  if (!reader) {
-    return new Uint8Array(await response.arrayBuffer());
-  }
-  const chunks = [];
-  let received = 0;
-  for (;;) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    chunks.push(value);
-    received += value.length;
-    const fraction = total > 0 ? received / total : 0;
-    $('model-progress').hidden = false;
-    setProgress('model-progress-bar', fraction);
-    setModelStatus(
-      'loading',
-      `Downloading the model — ${(received / 1e6).toFixed(1)}` +
-        `${total > 0 ? ` of ${(total / 1e6).toFixed(1)}` : ''} MB`,
-    );
-    setTitleProgress('Loading', fraction);
-  }
-  const bytes = new Uint8Array(received);
-  let at = 0;
-  for (const chunk of chunks) {
-    bytes.set(chunk, at);
-    at += chunk.length;
-  }
-  return bytes;
-}
-
-/// Download the shipped checkpoint. Only ever called from a click.
-async function loadModel() {
-  try {
-    const bytes = await downloadModel(MODEL_URL);
-    // Transferred, not copied: the checkpoint is tens of MB.
-    const info = await call('load-model', { bytes: bytes.buffer }, [bytes.buffer]);
-    renderModel(info);
-  } catch (error) {
-    // Only claim there's no model if there still isn't one. A slow 404
-    // here used to land *after* the user had loaded a model file by
-    // hand and overwrite "Ready" with "no model published" — the page
-    // then looked broken while holding a perfectly good model.
-    if (!model) {
-      setModelStatus(
-        'absent',
-        `${error.message}. You can still add your own material below, load a ` +
-          'model file, or create an untrained one under "The model".',
-      );
-      $('model-panel').open = true;
-    }
-  } finally {
-    $('model-progress').hidden = true;
-    if (!generating && !training) setTitleProgress(null);
-  }
+  updateGuidance();
 }
 
 // --- Prompt understanding ---------------------------------------------
@@ -409,12 +427,6 @@ $('generate-btn').addEventListener('click', async () => {
 
 $('stop-btn').addEventListener('click', () => call('stop'));
 
-$('load-model-btn').addEventListener('click', async () => {
-  $('load-model-btn').disabled = true;
-  await loadModel();
-  $('load-model-btn').disabled = false;
-});
-
 function renderNotes(notes) {
   const box = $('qa-notes');
   if (!notes || notes.length === 0) {
@@ -518,8 +530,8 @@ function renderSources() {
       button.addEventListener('click', () => removeSource(button.dataset.id));
     }
   }
-  $('train-btn').disabled = !model || sources.length === 0;
   updateSourceSummary(sources);
+  updateGuidance();
 }
 
 async function removeSource(id) {
@@ -547,7 +559,8 @@ async function refreshSources() {
   if (Array.isArray(stored)) {
     const have = new Set(sources.map((source) => source.id));
     const restored = stored.filter(
-      (source) => typeof source.rawText === 'string' && !have.has(source.id),
+      (source) =>
+        source && source.id && typeof source.rawText === 'string' && !have.has(source.id),
     );
     sources = [...restored, ...sources];
   }
@@ -572,7 +585,15 @@ function updateSourceSummary(list, note = '') {
 /// Hand one source to the model. Best effort: with no model loaded this
 /// is expected to fail, and failing must not stop anything.
 async function syncSource(source) {
-  if (typeof source.rawText !== 'string' || source.rawText.length === 0) {
+  // No model means nothing to hand it to. This used to be attempted
+  // anyway, so adding thirty files with no model logged thirty
+  // "no model loaded yet" errors — noise that buried the real ones.
+  if (!model) return false;
+  // A record with no id or no text can't be handed over: wasm-bindgen
+  // reads `.length` off whatever it gets for a string parameter, and a
+  // missing one throws from inside generated glue. Records like this
+  // exist in databases written by earlier versions of this page.
+  if (!source.id || typeof source.rawText !== 'string' || source.rawText.length === 0) {
     return false;
   }
   try {
@@ -726,28 +747,59 @@ $('train-btn').addEventListener('click', async () => {
   $('train-stats').textContent = 'Starting…';
 
   try {
+    // One button, two jobs. With no model, make one first — nobody
+    // should have to know that "create an untrained model" is a separate
+    // step from "train it", because it never isn't.
+    if (!model) {
+      $('train-stats').textContent = 'Making a new model…';
+      renderModel(
+        await call('create-model', {
+          layers: Number($('cfg-layers').value),
+          hidden: Number($('cfg-hidden').value),
+          heads: Number($('cfg-heads').value),
+          kvHeads: Number($('cfg-kv-heads').value),
+          contextLen: Number($('cfg-context').value),
+          window: Number($('cfg-window').value),
+          seed: Math.floor(Math.random() * 1e9),
+        }),
+      );
+      await syncAllSources();
+    }
+
+    const fromScratch = model && !model.pretrained;
+    const chosenRate = Number($('train-lr').value);
     const result = await call('train', {
       batchSize: Number($('train-batch').value),
-      learningRate: Number($('train-lr').value),
+      // 0 means "pick one": a new model needs a rate large enough to
+      // learn a language from nothing; a working one needs a small
+      // enough rate not to forget it.
+      learningRate: chosenRate > 0 ? chosenRate : (fromScratch ? 3e-4 : 5e-5),
       maxSteps: Number($('train-steps').value),
       effort: Number($('train-effort').value),
     }, [], 0);
+
     if (result.stopReason === 'no-data') {
-      showError('there isn\'t enough source text yet to fill even one context window — add more.');
+      showError(
+        'There isn\'t enough text yet to fill even one training window. Add more in step 1 — ' +
+          'a few pages at minimum.',
+      );
     } else {
       setProgress('train-progress-bar', 1);
+      const loss = typeof result.loss === 'number' ? result.loss.toFixed(3) : '—';
       $('train-stats').textContent =
-        `${result.steps} steps in ${formatDuration(result.elapsedSeconds)} · final loss ${(result.loss ?? NaN).toFixed(3)}`;
-      notify('Fine-tuning finished', `${result.steps} steps, loss ${(result.loss ?? NaN).toFixed(3)}.`);
+        `${result.steps} steps in ${formatDuration(result.elapsedSeconds)} · loss ${loss}` +
+        ' · press Train again to continue';
+      notify('Training finished', `${result.steps} steps, loss ${loss}.`);
     }
     if (result.model) renderModel(result.model);
   } catch (error) {
-    showError(error.message);
+    showError(error);
   } finally {
     training = false;
     $('train-btn').disabled = false;
     $('train-stop-btn').hidden = true;
     setTitleProgress(null);
+    updateGuidance();
   }
 });
 
@@ -800,6 +852,8 @@ $('import-input').addEventListener('change', async (event) => {
   try {
     const buffer = await file.arrayBuffer();
     renderModel(await call('import-checkpoint', { bytes: buffer }, [buffer]));
+    await syncAllSources();
+    await refreshStoryState();
   } catch (error) {
     showError(`that file didn't load: ${error.message}`);
     setModelStatus('absent', 'No model loaded.');
@@ -807,44 +861,20 @@ $('import-input').addEventListener('change', async (event) => {
   event.target.value = '';
 });
 
-$('create-model-btn').addEventListener('click', async () => {
-  clearError();
-  setModelStatus('loading', 'Creating an untrained model…');
-  try {
-    renderModel(
-      await call('create-model', {
-        layers: Number($('cfg-layers').value),
-        hidden: Number($('cfg-hidden').value),
-        heads: Number($('cfg-heads').value),
-        kvHeads: Number($('cfg-kv-heads').value),
-        contextLen: Number($('cfg-context').value),
-        window: Number($('cfg-window').value),
-        seed: Math.floor(Math.random() * 1e9),
-      }),
-    );
-    // A fresh model has an empty corpus; re-feed what's loaded.
-    for (const source of sources) {
-      await syncSource(source);
-    }
-    renderSources();
-    await refreshStoryState();
-  } catch (error) {
-    showError(error.message);
-    setModelStatus('absent', 'No model loaded.');
-  }
-});
 
 // --- Start -------------------------------------------------------------
 
 (async function start() {
+  // Guidance first, before anything that can be slow. Reading saved
+  // sources waits on IndexedDB, and until it answers the page would
+  // otherwise sit there saying nothing at all — which is the state this
+  // whole line of text exists to prevent.
+  renderSources();
+  updateGuidance();
+
   // Nothing is fetched here. The page loads, shows what you already
-  // have, and waits. Downloading an 18 MB file because a page opened is
-  // not a thing this should do to you.
+  // have, and waits. No model is downloaded, ever.
   await refreshSources();
-  setModelStatus(
-    'absent',
-    'No model loaded. Use "Load the writing model" below to download the ' +
-      'one built from public-domain books, or load a model file you already have.',
-  );
-  updateSourceSummary(sources);
+  setModelStatus('absent', 'No model yet — make one in step 2, or open a model file you saved.');
+  updateGuidance();
 })();
