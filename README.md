@@ -1,313 +1,252 @@
 # scriptonait
 
-A small transformer language model, trained from scratch **in your browser**
-on your own film scripts, stories, or books — written in Rust, compiled to
-WebAssembly, with generation accelerated by WebGPU.
+A small transformer that writes screenplays, novels and philosophical
+allegories from a prompt, running in your browser. Written in Rust,
+compiled to WebAssembly ahead of time, pretrained on public-domain text.
 
-There's no pretrained base model and no server: you supply the training
-text (paste it, upload files, or fetch a URL), pick a model size, and train
-it yourself, entirely client-side. It's a small, educational/hobbyist-scale
-model — a few hundred thousand to a few million parameters, not a
-ChatGPT-scale system — good at picking up the local style, structure, and
-vocabulary of whatever you feed it (scene headings, character-cue
-formatting, recurring phrasing), not at long-range plot coherence.
+Type this:
 
-## Architecture
+> Write a 700 word novel about two people in space related to Plato's
+> allegory of the cave
 
-- **Tokenizer**: byte-level (256 byte values + PAD/BOS/EOS = 259 tokens).
-  No BPE training step, never produces an "unknown token", and keeps every
-  embedding table tiny regardless of corpus size or language.
-- **Model**: a small Llama/Gemma-style decoder-only transformer —
-  RMSNorm, rotary position embeddings (RoPE), SwiGLU MLP, weight-tied
-  input/output embedding, no biases.
-- **Per-layer embeddings (PLE)**: alongside the usual shared input
-  embedding, each layer has its own small embedding table, gathered by
-  token id and added straight into that layer's residual stream — a plain
-  vector lookup, no matmul (Gemma 3n's PLE technique). This is what "vector
-  lookups" in the original ask refers to, alongside the standard input
-  embedding.
-- **Sliding-window attention**: attention window is configurable
-  separately from context length (Mistral-style). For long documents
-  (scripts, book chapters) you can push context length up while keeping
-  the window — and so the compute/memory cost — small, since local
-  structure (a scene, a line of dialogue) rarely needs to look back
-  thousands of tokens. The CPU backend stores attention probabilities
-  **banded** (`[heads, T, window]`), so both the time and the memory are
-  genuinely `context_len * local_window`, not `context_len^2`.
-- **Text prep**: HTML is stripped for URL sources; all sources get
-  whitespace-normalized, but — deliberately — *leading indentation is
-  preserved*. Plain-text screenplay exports commonly use indentation as
-  the only signal separating scene headings, character cues, dialogue, and
-  action lines, so a naive "trim every line" pass would destroy exactly
-  the structure worth learning.
+and it writes it — reading the prompt as an instruction (form, length,
+subject, what to echo) rather than as text to continue.
 
-See doc comments in `crates/llm-core/src/config.rs` and `model.rs` for the
-full per-layer layout and parameter-count formula (also surfaced live in
-the UI as you adjust settings).
+## What it actually is, and isn't
 
-### Memory, and why the UI refuses some shapes
+It's a few-million-parameter model trained for hours on a CI runner over
+a few tens of MB of public-domain books and plays. Expect it to hold a
+voice, honour the form you asked for, keep screenplay formatting
+plausible, and land near the length you wanted. Do not expect a coherent
+700-word story with a real arc, characters who stay themselves, or an
+ending that answers its beginning. Nothing trainable inside a GitHub
+Actions budget does that, and no amount of frontend polish changes it.
 
-The dominant memory cost of a training step is not the weights — it's the
-activation cache the backward pass needs, and within that, the attention
-probabilities: `num_layers * num_heads * context_len * local_window`
-floats, live all at once. At the largest shape the UI's inputs allow
-(16 layers, 1024 nodes, 16 heads, 4096-token full attention) that is
-around 5 GB even with banded storage, against 790 MB of weights.
+What it's good for: style, structure, format, and having something on the
+page to push against.
 
-So `ModelConfig::memory_bytes(true)` counts activations
-(`ModelConfig::activation_bytes`), the size estimate under the model
-settings shows the split and flags heavy configs, and
-`ModelConfig::validate` rejects anything over
-`MAX_TRAINING_BYTES` (2 GB) outright — a wasm32 heap cannot hold more, so
-such a config doesn't train slowly, it allocates until the tab dies and
-drags the machine into swap first.
+## How it's put together
 
-### Where training happens vs. where WebGPU is used
-
-Both training (forward + backward + Adam) and generation can run either on
-`llm-core`'s CPU implementation (compiled to wasm, works everywhere) or on
-`llm-gpu`'s WebGPU backend (`wgpu` + WGSL compute shaders, needs a browser
-with WebGPU) — CPU is always the default and the fallback; WebGPU is an
-opt-in toggle in the Train and Generate panels, and both automatically fall
-back to CPU if the model's attention window/context length is too large for
-the GPU backend's fixed-size kernels (`gpu_supported()`/`MAX_GPU_WINDOW`) or
-if no WebGPU device is available at all.
-
-GPU training and CPU training keep **separate weight copies and separate
-Adam optimizer state** while a session trains on the GPU — `train_step_gpu`
-only updates the GPU-resident weights, so the CPU copy (and anything
-derived from it: CPU generation, "Export weights", checkpoint saves) is
-stale until `sync_weights_from_gpu` runs. The frontend does this
-automatically whenever it's needed (before generating, exporting, or
-stopping GPU training), but it does mean switching from GPU back to CPU
-training resets Adam momentum, same as importing a checkpoint would (the
-two optimizer states aren't compatible with each other).
-
-See "What's tested and what isn't" below for how much confidence to place
-in the WebGPU path specifically.
-
-## Project layout
+The short version: **training happens on a server, generation happens in
+your browser, and nothing is compiled while you wait.**
 
 ```
 crates/
-  llm-core/   Tokenizer, text prep, corpus/batch sampling, model
-              (forward+backward+Adam), generation. Zero external
-              dependencies — builds and its 100 tests run with no network
-              access. This is the verified reference implementation.
-  llm-gpu/    WebGPU (wgpu + WGSL) backend, mirroring llm-core's forward
-              pass, backward pass, and Adam optimizer kernel-for-kernel —
-              full training and generation, not forward-only.
-  wasm-app/   wasm-bindgen glue exposing both as one `WasmLLM` class.
+  llm-core/    The whole engine. Tokenizer, text prep, corpus, model
+               (forward, backward, AdamW), generation, instruction
+               parsing, checkpoints. Zero dependencies — 150+ tests,
+               including analytic-vs-numerical gradient checks for every
+               op, run with no network access.
+  llm-data/    Cleans downloaded public-domain text, learns the BPE
+               vocabulary, and writes a pre-tokenized dataset.
+  llm-train/   Native pretraining: threaded, time-budgeted, resumable,
+               and loud about its progress.
+  llm-bench/   Throughput numbers, so performance claims are reproducible.
+  wasm-app/    wasm-bindgen glue: one WasmLLM class over llm-core.
 frontend/
-  index.html, style.css, app.js   Main-thread UI.
-  worker.js                       Owns the wasm module; runs training/
-                                   generation off the main thread.
-  db.js                           IndexedDB wrapper (sources + checkpoints).
-  pkg/                            wasm-pack's build output — generated,
-                                   not checked in (see Build below).
+  index.html, style.css, app.js   The page.
+  worker.js                       Owns the wasm module, off the main thread.
+  db.js                           IndexedDB, for your own sources.
+  pkg/                            wasm-pack output — built by CI, not in git.
+  model/                          The shipped checkpoint — fetched by CI
+                                  from the latest release, not in git.
+corpus/
+  manifest.tsv, fetch.sh          What the model is trained on.
 ```
 
-`llm-core` is the only crate in the root Cargo workspace. `llm-gpu` and
-`wasm-app` are deliberately standalone crates (each has its own
-`[workspace]` marker) — they depend on `wgpu`/`wasm-bindgen` and the
-`wasm32-unknown-unknown` target, which the workspace root doesn't need and
-which weren't available in this project's development sandbox (more
-below), so keeping them out of the shared workspace keeps `cargo test` at
-the repo root fully offline-buildable.
+### The model
 
-## Deploy (GitHub Pages, recommended)
+A Llama-style decoder-only transformer: RMSNorm, rotary position
+embeddings, SwiGLU MLP, weight-tied input/output embedding, no biases.
+On top of that:
 
-`.github/workflows/deploy.yml` builds and deploys this automatically —
-this is the intended way to get a working, live copy, since it runs on a
-GitHub Actions runner with normal internet access (unlike this project's
-dev sandbox; see "What's tested and what isn't" below). It installs the
-Rust `wasm32` target and `wasm-pack`, runs `llm-core`'s test suite as a
-gate, builds `crates/wasm-app` to `frontend/pkg`, and publishes
-`frontend/` to Pages.
+- **Byte-level BPE tokenizer.** The base alphabet is all 256 byte values,
+  so anything encodes and there is no unknown token; learned merges sit
+  on top. A 700-word story is ~900 tokens instead of ~4,000, which is a
+  4x saving on generation time, on training time, and on how much story
+  fits in the attention window, all at once. The pre-tokenizer keeps
+  whitespace runs as their own chunk on purpose — in a plain-text
+  screenplay the indent is the only thing separating a character cue from
+  an action line, so `"\n\n     "` becoming one token is the model
+  learning what a character cue looks like.
+- **Grouped-query attention.** Several query heads share one key/value
+  head, which shrinks Wk/Wv and — the part that matters — shrinks the KV
+  cache per generated token, which is what bounds how long a generation
+  can run.
+- **Sliding-window attention.** The window is configurable separately
+  from context length, and attention probabilities are stored *banded*,
+  so both time and memory are `context * window` rather than `context²`.
+- **A KV cache.** The prompt is processed once; each new token costs one
+  row plus attention over the window. Generating a 900-token story used
+  to cost ~460,000 token-forwards and now costs ~1,400.
+- **Per-layer embeddings** (Gemma 3n's PLE) are implemented and off by
+  default. At a byte vocabulary they were free; at an 8k BPE vocabulary
+  each table is the size of the whole input embedding, so a 6-layer model
+  would spend more parameters on them than on all its attention and MLP
+  combined.
 
-It triggers on push to `dev`, `main`, or `master`, plus manual dispatch
-from the Actions tab. One manual one-time step is required and can't be
-done through the GitHub API this was built with: repo **Settings → Pages
-→ Build and deployment → Source → "GitHub Actions"**. After that, every
-push to one of those branches deploys automatically to
-`https://<owner>.github.io/<repo>/`.
+### The instruction format
 
-## Build locally
-
-You'll need:
+A plain language model continues text. Given an instruction it continues
+*the instruction*. So the model is trained on a format instead:
 
 ```
+BOS TASK form=novel; words=medium; about: two people in space;
+         echoing: Plato's allegory of the cave STORY <the text> EOS
+```
+
+`TASK` and `STORY` are single tokens, so the boundary between the ask and
+the answer costs two tokens rather than a paragraph of scaffolding. One
+function renders that line, called by both the training path and the
+generation path — any divergence between them would be a silent quality
+bug.
+
+Nobody hand-writes training examples. `llm_core::instruct::synthesize_examples`
+cuts a real book or play at paragraph boundaries and pairs each chunk with
+the instruction that would have asked for it: the form its own shape says
+it is, its own length bucket, and a subject drawn from its most
+distinctive words.
+
+Lengths are **buckets**, not numbers. The model can't count, so training
+it against "700" teaches a number it can't honour. The counting is done by
+the code, which can: generation runs to your target and then to the next
+sentence boundary, so it ends on a finished sentence, with a hard ceiling
+40% over in case the model never produces one.
+
+### Where training happens
+
+Pretraining runs natively on a GitHub Actions runner
+(`.github/workflows/pretrain.yml` → `crates/llm-train`). A browser tab
+gets one thread — wasm threads need `SharedArrayBuffer`, which needs
+cross-origin isolation headers, which GitHub Pages does not serve — and
+it competes with the compositor for the machine, and it loses everything
+when you close it. A runner has four cores, native optimization flags,
+and six hours.
+
+Six hours is also the cap, and useful training is longer than that, so a
+run is one *round*: resume from the published checkpoint, train for the
+budget, publish, and optionally dispatch the next round. The model
+improves run over run.
+
+Fine-tuning in the browser is still there, demoted to an optional panel,
+running on a duty cycle you choose so it can't take the machine.
+
+### Nothing is compiled in the browser
+
+The `.wasm` file is built by `wasm-pack` in CI and served as a compiled
+artifact; the page fetches and instantiates it. There is no toolchain on
+the page and no client-side compilation step. `frontend/pkg/` is
+generated in CI and deliberately not in git.
+
+The model is likewise not built on demand: it's a release asset the
+deploy workflow packages with the site.
+
+## The corpus
+
+`corpus/manifest.tsv` lists the works, one per line, with the form each is
+labelled as. `corpus/fetch.sh` downloads them and **verifies each against
+its expected title** — a wrong Project Gutenberg id doesn't 404, it
+quietly returns a different book, so the check is what keeps a typo cheap.
+Gutenberg's ~500-line licence wrapper is stripped before training; left
+in, the model would see it dozens of times and learn it better than any of
+the prose.
+
+**On film scripts.** Film scripts are almost never public domain. What
+stands in for them is public-domain *drama* — stage plays, in the same
+character-cue-and-dialogue shape a screenplay uses. That teaches the
+structure without teaching film formatting, and the README should say so
+rather than let the `form=screenplay` label imply otherwise. To train on
+real film scripts, add them as sources in the app and fine-tune; that's
+what that path is for. Adding more public-domain works is one line in the
+manifest.
+
+## Running it
+
+### The deployed site
+
+`.github/workflows/deploy.yml` builds and publishes on every push to
+`dev`/`main`/`master`. One manual step is required once: repo **Settings →
+Pages → Build and deployment → Source → "GitHub Actions"**.
+
+### Training a model
+
+From the Actions tab, run **Pretrain the shipped model**. `minutes` is the
+budget for one round; `rounds` chains several. The first run starts from
+scratch; later runs resume. Each round publishes to the `model-latest`
+release and redeploys the site.
+
+### Locally
+
+```
+cargo test                      # the engine, no network needed
+cargo run --release -p llm-bench   # throughput numbers
+
+corpus/fetch.sh
+cargo run --release -p llm-data  -- --raw corpus/raw --out corpus/build
+cargo run --release -p llm-train -- --data corpus/build \
+    --out model/scriptonait.ckpt --web-out frontend/model/scriptonait.ckpt \
+    --minutes 30
+
 rustup target add wasm32-unknown-unknown
 cargo install wasm-pack
-```
-
-Then, from the repo root:
-
-```
 RUSTFLAGS="-C target-feature=+simd128" \
   wasm-pack build crates/wasm-app --release --target web --out-dir ../../frontend/pkg
 cd frontend && python3 -m http.server 8000
 ```
 
-`+simd128` is what lets the compiler vectorize `llm-core`'s inner loops
-into real wasm SIMD; it makes a large difference to CPU training speed,
-which is the default path everywhere and the only path in a browser
-without WebGPU. It's what the deploy workflow builds with. (Dropping the
-flag still builds and runs, just slower; WebAssembly SIMD has been
-baseline in Chrome/Edge/Firefox/Safari since 2023.)
+`+simd128` is what lets the compiler vectorize the inner loops into real
+wasm SIMD; it makes a large difference to how fast text appears. Serve
+over HTTP — module workers and `fetch` don't work from a `file://` URL.
 
-Open `http://localhost:8000` in a recent Chrome or Edge (WebGPU support;
-both generation and training fall back to CPU-only in browsers without it,
-or for model shapes too large for the GPU backend — see "Where training
-happens vs. where WebGPU is used" above). It needs to be served over
-HTTP(S) (or localhost), not opened as a `file://` URL — module workers and
-`fetch` won't work otherwise.
+## Performance
 
-## What's tested and what isn't
+Measured by `cargo run --release -p llm-bench`, at a ~5M-parameter shape
+with 512-token sequences, on four cores:
 
-This was built in a sandboxed environment with **no network access to any
-package registry** — crates.io, npmjs.org, and `static.rust-lang.org`
-(needed for `rustup target add wasm32-unknown-unknown`) all returned 403.
-That means:
+| | before | after |
+|---|---|---|
+| training | 94 tok/s | 892 tok/s |
+| generation | 12.7 tok/s | 373 tok/s |
 
-- **`llm-core` (tokenizer, text prep, corpus, model, training, generation)
-  is real, verified work**: zero external dependencies (own tiny PRNG
-  instead of pulling in `rand`, no `serde`), so it built and ran fully
-  offline. Its 100 tests include full gradient checks (analytic vs.
-  numerical differentiation) for every op — RMSNorm, the linear layers,
-  RoPE, sliding-window attention, SwiGLU, cross-entropy — plus a full-model
-  gradient check across embeddings, PLE tables, attention/MLP weights, and
-  norm gains, plus an end-to-end "does Adam actually reduce loss"
-  training test. Run it yourself: `cargo test -p llm-core` from the repo
-  root, no network needed.
-- **`llm-gpu` (the WGSL/wgpu backend) and `wasm-app` (the wasm-bindgen
-  glue) could not be compiled, let alone run, in that sandbox** — no GPU,
-  no `wasm32` target, no way to fetch `wgpu`/`wasm-bindgen`/etc. They were
-  written as carefully as I could manage by hand (the GPU kernels — forward
-  *and* backward, including the Adam update — are direct, commented
-  translations of the already-verified CPU ops in `llm-core/src/ops.rs`,
-  cross-checked line-by-line against `llm-core::model::backward`). Every
-  backward kernel is written as a *gather*, never a *scatter* (see
-  `llm-gpu/src/model.rs`'s module docs), specifically so nothing needs
-  atomic float adds — the highest-bug-risk shortcut this crate deliberately
-  avoids. The GitHub Actions deploy workflow *does* build both crates
-  (that's the point of it — a runner with normal internet access) and that
-  build has succeeded, so the code is at least known to compile cleanly
-  against real dependencies; what's still unverified is *runtime*
-  correctness (does the WGSL actually compute the right numbers, does it
-  run at all on a given GPU/driver) — that needs an actual browser, which
-  is what `debug_compare_gpu_cpu` and `debug_compare_gpu_cpu_gradient`
-  below are for.
-- **The frontend JS** (`app.js`, `worker.js`, `db.js`) was syntax-checked
-  with Node and carefully reviewed, but never run in an actual browser.
+Training: the workspace release profile had been set to `opt-level = "z"`
+— a size setting meant for the wasm bundle, applied to native builds
+nobody ships (2.4x); blocked matmuls, which matter most for the tied
+output head at a BPE-sized vocabulary (1.1x); and splitting a batch across
+threads (3.6x).
 
-**First thing to do after building**: open the browser console, create a
-small model, and click "Compare GPU vs CPU (debug)" in the Generate panel
-and "Compare GPU vs CPU gradient (debug)" in the Train panel (both appear
-once a WebGPU device initializes). The first calls `debug_compare_gpu_cpu`,
-comparing one forward pass's logits between backends; the second calls
-`debug_compare_gpu_cpu_gradient`, which runs forward + cross-entropy +
-backward on both backends (without touching any real weights) and compares
-their embedding-table gradients — since that gradient depends on nearly the
-entire backward pass (every layer's attention/MLP backward, every layer's
-PLE scatter, and the input embedding scatter all feed into it), a small
-diff there is a strong end-to-end signal the WGSL backward kernels are
-correct. Both should report a tiny difference (well under `1e-2`, just
-float rounding). If either doesn't, or if the WebGPU path doesn't work at
-all, that's expected risk materializing, not a mystery: the bug is almost
-certainly in `crates/llm-gpu` (compare its WGSL/Rust against the matching
-function in `llm-core/src/ops.rs` or `model.rs`, which you can trust).
-Please report back what you find — a follow-up session with real
-WebGPU/wasm32 access should be able to fix it quickly once the actual
-failure is known.
+Generation: almost entirely the KV cache. Then the tokenizer change puts
+roughly 4x more *text* behind each of those tokens.
 
-## Using the app
+## What's tested, and what isn't
 
-1. **Add sources** — paste text, upload `.txt`/`.md`/`.fountain`/etc.
-   files, or fetch a URL (see the CORS caveat below). Each source is
-   stored in IndexedDB and can be edited or deleted later; edits and
-   deletes immediately update the live training corpus if a model exists.
-2. **Pick a model shape** — layers, nodes (hidden size), attention heads,
-   context length, attention window. A live parameter-count/memory
-   estimate updates as you adjust these. Click "Create model".
-3. **Train** — pick a batch size and learning rate, optionally check
-   "Train on WebGPU" (falls back to CPU if the model's window is too large
-   for the GPU backend or no WebGPU device is available), click "Start
-   training". Loss is plotted live; training runs in a background worker
-   so the UI stays responsive.
-4. **Generate** — type a prompt, optionally enable WebGPU acceleration,
-   optionally tag it with a genre/tone and/or a target word count, and
-   optionally have the model reminded of characters/locations so far or
-   given similar scenes from your sources as context (see "Story-aware
-   features" below). Click "Generate"; a QA pass runs automatically and
-   any notes appear under the output.
-5. **Save/load** — checkpoint weights to IndexedDB (with a name, for
-   later reloading), or download/import raw weight bytes as a file.
+`llm-core` has zero dependencies and 150+ tests that run with no network
+access, including analytic-vs-numerical gradient checks for every op and
+for the full model, an end-to-end "does AdamW reduce loss" test, and an
+equivalence test between KV-cached decoding and a full forward pass.
+(That last one earned its place immediately: it caught the cache attending
+over one key too many.) Run them with `cargo test`.
 
-### Story-aware features (non-neural scaffolding)
+`wasm-app` cannot be compiled in this project's development sandbox at all
+— no wasm32 target, no route to crates.io — so the Actions build is its
+only compiler, which is why every push runs it. The frontend JavaScript is
+syntax-checked as ES modules and reviewed, but has not been run in a
+browser here.
 
-A few features sit *around* the model rather than inside it — plain
-heuristics and orchestration, not anything learned or trained. They're
-cheap, don't need a bigger model, and were prioritized over deeper
-architecture changes precisely because they're low-risk:
+There used to be a WebGPU backend (`crates/llm-gpu`). It has been removed:
+it was never verified to compute the right numbers, it couldn't express
+grouped-query attention or PLE-off models without a rewrite that also
+couldn't be verified here, and its CPU/GPU toggle kept two independent
+sets of weights and optimizer state — flipping it mid-run silently reset
+Adam's momentum. With the KV cache and a BPE vocabulary the CPU path is
+fast enough at this model size. It's in the git history if someone with a
+real WebGPU setup wants to bring it back.
 
-- **Story state** (`crates/llm-core/src/screenplay.rs`): a plain
-  line-shape scan (no ML) over your sources for scene headings
-  (`INT./EXT. ...`) and ALL-CAPS character cues, aggregated into a running
-  character/location list shown in the Sources panel. This is genuinely
-  "free" auto-tagging — it's what answers "who are the characters in my
-  corpus" without training a classifier for it. It's a heuristic, not a
-  parser: unusual formatting can fool it (that's noted in the UI too).
-- **Control tags**: optional genre/tone text prepended to a source's text
-  (`[GENRE: sci-fi] [TONE: dark]`) or to a generation prompt. For a tag to
-  actually influence training rather than getting buried mid-window,
-  `Corpus::sample_batch` deliberately samples 40% of training windows
-  starting exactly at a source boundary (see its doc comment) — a
-  preamble only teaches the model anything if the model consistently sees
-  it positioned at the start.
-- **Retrieval** (`crates/llm-core/src/retrieval.rs`): TF-IDF + cosine
-  similarity over your sources' scenes, no embedding model needed at this
-  scale. "Use similar scenes from your sources as context" in the
-  Generate panel prepends the best-matching scenes to the prompt; "Preview
-  retrieved context" shows what would be retrieved without generating.
-- **QA notes** (`crates/llm-core/src/qa.rs`): a rule-based pass over
-  freshly generated text — unbalanced parentheses, degenerate
-  line-repetition loops (a common small-model failure mode), characters
-  introduced that don't appear in any source yet, and a rough
-  length-vs-target check. Not a quality judgement, just things worth a
-  glance.
+## Known limitations
 
-These are all covered by `llm-core`'s offline test suite like everything
-else in that crate.
-
-### Known limitations
-
-- **URL fetching is subject to CORS** — most sites don't send the headers
-  that allow a browser page to `fetch()` them cross-origin. When it fails,
-  copy the text and use "Paste text" instead; this isn't a bug in the app.
-- **Only plain-text file formats** are supported for upload (`.txt`,
-  `.md`, `.fountain`, ...) — not `.pdf`/`.docx`, which need a real parser
-  this project doesn't include.
-- **No KV cache**: generation re-runs the full forward pass over the
-  current context window for every new token, so it's O(n²) in the number
-  of generated tokens. Fine at "simple hobbyist model" scale; a real
-  optimization opportunity if you extend this.
-- **Byte-level tokenization** means a generation window boundary can
-  occasionally cut a multi-byte UTF-8 character in half, showing up as a
-  stray `�` in the output — a known, minor artifact of this tokenizer
-  choice, not a crash.
-- This is a **from-scratch, small model** trained only on what you feed
-  it — expect it to pick up local style and formatting quickly, not to
-  write a coherent multi-page story.
-
-### Possible extensions
-
-- Grouped-query attention (fewer KV heads than Q heads) to shrink the
-  KV-cache once one exists.
-- A KV cache for generation, to drop the O(n²) re-forward cost.
-- Raising `MAX_GPU_WINDOW` (currently 256) once someone can verify a larger
-  dense per-layer attention-probs cache still fits comfortably in GPU
-  memory for the context lengths people actually want to train.
-- A real BPE tokenizer if you want a larger effective context per
-  character (trades away the byte-level tokenizer's simplicity and small,
-  fixed vocab size).
+- **URL fetching is subject to CORS.** Most sites don't allow it. Paste
+  the text instead; that isn't a bug in this page.
+- **Plain text only** for uploads — no PDF or DOCX.
+- **Byte-level BPE** means a generation cut short can end mid-character.
+  The streaming path only ever emits complete characters, so this shows up
+  as a slightly short ending rather than a `�`.
+- **The model is small.** See the top of this file.

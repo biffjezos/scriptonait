@@ -121,7 +121,7 @@ jobs:
             --data corpus/build \
             --out "$CHECKPOINT" \
             --web-out "$WEB_CHECKPOINT" \
-            ${{ inputs.fresh == true && ' ' || format('--resume {0}', env.CHECKPOINT) }} \
+            ${{ inputs.fresh == true && ' ' || '--resume model/scriptonait.ckpt' }} \
             --minutes "${{ inputs.minutes }}" \
             --total-steps "${{ inputs.total_steps }}" \
             --lr "${{ inputs.lr }}" \
