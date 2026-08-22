@@ -40,25 +40,36 @@ struct P4 {
     d: u32,
 }
 
-fn dispatch(ctx: &GpuContext, pipeline: &wgpu::ComputePipeline, entries: &[wgpu::BindGroupEntry], workgroups: (u32, u32, u32)) {
+fn dispatch(encoder: &mut wgpu::CommandEncoder, ctx: &GpuContext, pipeline: &wgpu::ComputePipeline, entries: &[wgpu::BindGroupEntry], workgroups: (u32, u32, u32)) {
     let bind_group = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: None,
         layout: &pipeline.get_bind_group_layout(0),
         entries,
     });
-    let mut encoder = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
-    {
-        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: None, timestamp_writes: None });
-        pass.set_pipeline(pipeline);
-        pass.set_bind_group(0, &bind_group, &[]);
-        pass.dispatch_workgroups(workgroups.0, workgroups.1, workgroups.2);
-    }
-    ctx.queue.submit(Some(encoder.finish()));
+    let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: None, timestamp_writes: None });
+    pass.set_pipeline(pipeline);
+    pass.set_bind_group(0, &bind_group, &[]);
+    pass.dispatch_workgroups(workgroups.0, workgroups.1, workgroups.2);
 }
 
 // --- Forward-pass dispatch helpers ------------------------------------
+//
+// Every `dispatch_*` helper below takes a `&mut wgpu::CommandEncoder` and
+// only *records* a compute pass into it - it never creates its own encoder
+// or calls `queue.submit` itself. Callers (`forward`/`backward`/`zero_all`
+// and their callers) share one encoder across an entire training step (or
+// close to it) and submit once at the end. Each `queue.submit` is a real,
+// expensive round trip (validation, then a hop to the browser's separate
+// GPU process); doing that once per dispatch - as this used to - meant
+// thousands of submits per training step, which dominated step time far
+// more than the actual matrix math ever did. Compute passes recorded into
+// one command buffer still execute strictly in encoding order with all
+// necessary read-after-write hazard tracking handled automatically by
+// wgpu/WebGPU, so this is exactly how multi-dispatch work is meant to be
+// batched - not a correctness trade-off, just no longer paying for
+// thousands of unnecessary round trips.
 
-fn dispatch_linear(ctx: &GpuContext, x: &wgpu::Buffer, w: &wgpu::Buffer, y: &wgpu::Buffer, rows: usize, in_dim: usize, out_dim: usize) {
+fn dispatch_linear(encoder: &mut wgpu::CommandEncoder, ctx: &GpuContext, x: &wgpu::Buffer, w: &wgpu::Buffer, y: &wgpu::Buffer, rows: usize, in_dim: usize, out_dim: usize) {
     let params = uniform(&ctx.device, "linear-params", P4 { a: rows as u32, b: in_dim as u32, c: out_dim as u32, d: 0 });
     let entries = [
         wgpu::BindGroupEntry { binding: 0, resource: params.as_entire_binding() },
@@ -66,20 +77,20 @@ fn dispatch_linear(ctx: &GpuContext, x: &wgpu::Buffer, w: &wgpu::Buffer, y: &wgp
         wgpu::BindGroupEntry { binding: 2, resource: w.as_entire_binding() },
         wgpu::BindGroupEntry { binding: 3, resource: y.as_entire_binding() },
     ];
-    dispatch(ctx, &ctx.pipelines.linear, &entries, (ceil_div(rows, 8), ceil_div(out_dim, 8), 1));
+    dispatch(encoder, ctx, &ctx.pipelines.linear, &entries, (ceil_div(rows, 8), ceil_div(out_dim, 8), 1));
 }
 
-fn dispatch_add_inplace(ctx: &GpuContext, dst: &wgpu::Buffer, src: &wgpu::Buffer, len: usize) {
+fn dispatch_add_inplace(encoder: &mut wgpu::CommandEncoder, ctx: &GpuContext, dst: &wgpu::Buffer, src: &wgpu::Buffer, len: usize) {
     let params = uniform(&ctx.device, "add-params", P4 { a: len as u32, b: 0, c: 0, d: 0 });
     let entries = [
         wgpu::BindGroupEntry { binding: 0, resource: params.as_entire_binding() },
         wgpu::BindGroupEntry { binding: 1, resource: dst.as_entire_binding() },
         wgpu::BindGroupEntry { binding: 2, resource: src.as_entire_binding() },
     ];
-    dispatch(ctx, &ctx.pipelines.add_inplace, &entries, (ceil_div(len, 64), 1, 1));
+    dispatch(encoder, ctx, &ctx.pipelines.add_inplace, &entries, (ceil_div(len, 64), 1, 1));
 }
 
-fn dispatch_gather(ctx: &GpuContext, table: &wgpu::Buffer, ids: &wgpu::Buffer, out: &wgpu::Buffer, t_len: usize, hidden: usize) {
+fn dispatch_gather(encoder: &mut wgpu::CommandEncoder, ctx: &GpuContext, table: &wgpu::Buffer, ids: &wgpu::Buffer, out: &wgpu::Buffer, t_len: usize, hidden: usize) {
     let params = uniform(&ctx.device, "gather-params", P4 { a: t_len as u32, b: hidden as u32, c: 0, d: 0 });
     let entries = [
         wgpu::BindGroupEntry { binding: 0, resource: params.as_entire_binding() },
@@ -87,7 +98,7 @@ fn dispatch_gather(ctx: &GpuContext, table: &wgpu::Buffer, ids: &wgpu::Buffer, o
         wgpu::BindGroupEntry { binding: 2, resource: ids.as_entire_binding() },
         wgpu::BindGroupEntry { binding: 3, resource: out.as_entire_binding() },
     ];
-    dispatch(ctx, &ctx.pipelines.embedding_gather, &entries, (ceil_div(t_len, 8), ceil_div(hidden, 8), 1));
+    dispatch(encoder, ctx, &ctx.pipelines.embedding_gather, &entries, (ceil_div(t_len, 8), ceil_div(hidden, 8), 1));
 }
 
 #[repr(C)]
@@ -100,7 +111,7 @@ struct RmsnormParams {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn dispatch_rmsnorm(ctx: &GpuContext, x: &wgpu::Buffer, gain: &wgpu::Buffer, y: &wgpu::Buffer, inv_rms_out: &wgpu::Buffer, rows: usize, dim: usize) {
+fn dispatch_rmsnorm(encoder: &mut wgpu::CommandEncoder, ctx: &GpuContext, x: &wgpu::Buffer, gain: &wgpu::Buffer, y: &wgpu::Buffer, inv_rms_out: &wgpu::Buffer, rows: usize, dim: usize) {
     let params = uniform(&ctx.device, "rmsnorm-params", RmsnormParams { rows: rows as u32, dim: dim as u32, eps: 1e-6, _pad: 0 });
     let entries = [
         wgpu::BindGroupEntry { binding: 0, resource: params.as_entire_binding() },
@@ -109,20 +120,21 @@ fn dispatch_rmsnorm(ctx: &GpuContext, x: &wgpu::Buffer, gain: &wgpu::Buffer, y: 
         wgpu::BindGroupEntry { binding: 3, resource: y.as_entire_binding() },
         wgpu::BindGroupEntry { binding: 4, resource: inv_rms_out.as_entire_binding() },
     ];
-    dispatch(ctx, &ctx.pipelines.rmsnorm, &entries, (ceil_div(rows, 64), 1, 1));
+    dispatch(encoder, ctx, &ctx.pipelines.rmsnorm, &entries, (ceil_div(rows, 64), 1, 1));
 }
 
-fn dispatch_rope(ctx: &GpuContext, x: &wgpu::Buffer, t_len: usize, heads: usize, head_dim: usize, inverse: bool) {
+fn dispatch_rope(encoder: &mut wgpu::CommandEncoder, ctx: &GpuContext, x: &wgpu::Buffer, t_len: usize, heads: usize, head_dim: usize, inverse: bool) {
     let params = uniform(&ctx.device, "rope-params", P4 { a: t_len as u32, b: heads as u32, c: head_dim as u32, d: inverse as u32 });
     let entries = [
         wgpu::BindGroupEntry { binding: 0, resource: params.as_entire_binding() },
         wgpu::BindGroupEntry { binding: 1, resource: x.as_entire_binding() },
     ];
-    dispatch(ctx, &ctx.pipelines.rope, &entries, (ceil_div(t_len, 8), ceil_div(heads, 8), 1));
+    dispatch(encoder, ctx, &ctx.pipelines.rope, &entries, (ceil_div(t_len, 8), ceil_div(heads, 8), 1));
 }
 
 #[allow(clippy::too_many_arguments)]
 fn dispatch_attention(
+    encoder: &mut wgpu::CommandEncoder,
     ctx: &GpuContext,
     q: &wgpu::Buffer,
     k: &wgpu::Buffer,
@@ -143,10 +155,10 @@ fn dispatch_attention(
         wgpu::BindGroupEntry { binding: 4, resource: out.as_entire_binding() },
         wgpu::BindGroupEntry { binding: 5, resource: probs_out.as_entire_binding() },
     ];
-    dispatch(ctx, &ctx.pipelines.attention, &entries, (ceil_div(t_len, 8), ceil_div(heads, 8), 1));
+    dispatch(encoder, ctx, &ctx.pipelines.attention, &entries, (ceil_div(t_len, 8), ceil_div(heads, 8), 1));
 }
 
-fn dispatch_swiglu(ctx: &GpuContext, gate: &wgpu::Buffer, up: &wgpu::Buffer, out: &wgpu::Buffer, len: usize) {
+fn dispatch_swiglu(encoder: &mut wgpu::CommandEncoder, ctx: &GpuContext, gate: &wgpu::Buffer, up: &wgpu::Buffer, out: &wgpu::Buffer, len: usize) {
     let params = uniform(&ctx.device, "swiglu-params", P4 { a: len as u32, b: 0, c: 0, d: 0 });
     let entries = [
         wgpu::BindGroupEntry { binding: 0, resource: params.as_entire_binding() },
@@ -154,12 +166,12 @@ fn dispatch_swiglu(ctx: &GpuContext, gate: &wgpu::Buffer, up: &wgpu::Buffer, out
         wgpu::BindGroupEntry { binding: 2, resource: up.as_entire_binding() },
         wgpu::BindGroupEntry { binding: 3, resource: out.as_entire_binding() },
     ];
-    dispatch(ctx, &ctx.pipelines.swiglu, &entries, (ceil_div(len, 64), 1, 1));
+    dispatch(encoder, ctx, &ctx.pipelines.swiglu, &entries, (ceil_div(len, 64), 1, 1));
 }
 
 // --- Backward-pass dispatch helpers -----------------------------------
 
-fn dispatch_linear_bwd_dx(ctx: &GpuContext, dy: &wgpu::Buffer, w: &wgpu::Buffer, dx: &wgpu::Buffer, rows: usize, in_dim: usize, out_dim: usize) {
+fn dispatch_linear_bwd_dx(encoder: &mut wgpu::CommandEncoder, ctx: &GpuContext, dy: &wgpu::Buffer, w: &wgpu::Buffer, dx: &wgpu::Buffer, rows: usize, in_dim: usize, out_dim: usize) {
     let params = uniform(&ctx.device, "lbdx-params", P4 { a: rows as u32, b: in_dim as u32, c: out_dim as u32, d: 0 });
     let entries = [
         wgpu::BindGroupEntry { binding: 0, resource: params.as_entire_binding() },
@@ -167,10 +179,10 @@ fn dispatch_linear_bwd_dx(ctx: &GpuContext, dy: &wgpu::Buffer, w: &wgpu::Buffer,
         wgpu::BindGroupEntry { binding: 2, resource: w.as_entire_binding() },
         wgpu::BindGroupEntry { binding: 3, resource: dx.as_entire_binding() },
     ];
-    dispatch(ctx, &ctx.pipelines.linear_bwd_dx, &entries, (ceil_div(rows, 8), ceil_div(in_dim, 8), 1));
+    dispatch(encoder, ctx, &ctx.pipelines.linear_bwd_dx, &entries, (ceil_div(rows, 8), ceil_div(in_dim, 8), 1));
 }
 
-fn dispatch_linear_bwd_dw(ctx: &GpuContext, dy: &wgpu::Buffer, x: &wgpu::Buffer, dw: &wgpu::Buffer, rows: usize, in_dim: usize, out_dim: usize) {
+fn dispatch_linear_bwd_dw(encoder: &mut wgpu::CommandEncoder, ctx: &GpuContext, dy: &wgpu::Buffer, x: &wgpu::Buffer, dw: &wgpu::Buffer, rows: usize, in_dim: usize, out_dim: usize) {
     let params = uniform(&ctx.device, "lbdw-params", P4 { a: rows as u32, b: in_dim as u32, c: out_dim as u32, d: 0 });
     let entries = [
         wgpu::BindGroupEntry { binding: 0, resource: params.as_entire_binding() },
@@ -178,17 +190,18 @@ fn dispatch_linear_bwd_dw(ctx: &GpuContext, dy: &wgpu::Buffer, x: &wgpu::Buffer,
         wgpu::BindGroupEntry { binding: 2, resource: x.as_entire_binding() },
         wgpu::BindGroupEntry { binding: 3, resource: dw.as_entire_binding() },
     ];
-    dispatch(ctx, &ctx.pipelines.linear_bwd_dw, &entries, (ceil_div(out_dim, 8), ceil_div(in_dim, 8), 1));
+    dispatch(encoder, ctx, &ctx.pipelines.linear_bwd_dw, &entries, (ceil_div(out_dim, 8), ceil_div(in_dim, 8), 1));
 }
 
 /// Runs both halves of a linear layer's backward pass.
 #[allow(clippy::too_many_arguments)]
-fn dispatch_linear_bwd(ctx: &GpuContext, dy: &wgpu::Buffer, x: &wgpu::Buffer, w: &wgpu::Buffer, dx: &wgpu::Buffer, dw: &wgpu::Buffer, rows: usize, in_dim: usize, out_dim: usize) {
-    dispatch_linear_bwd_dx(ctx, dy, w, dx, rows, in_dim, out_dim);
-    dispatch_linear_bwd_dw(ctx, dy, x, dw, rows, in_dim, out_dim);
+fn dispatch_linear_bwd(encoder: &mut wgpu::CommandEncoder, ctx: &GpuContext, dy: &wgpu::Buffer, x: &wgpu::Buffer, w: &wgpu::Buffer, dx: &wgpu::Buffer, dw: &wgpu::Buffer, rows: usize, in_dim: usize, out_dim: usize) {
+    dispatch_linear_bwd_dx(encoder, ctx, dy, w, dx, rows, in_dim, out_dim);
+    dispatch_linear_bwd_dw(encoder, ctx, dy, x, dw, rows, in_dim, out_dim);
 }
 
 fn dispatch_rmsnorm_bwd(
+    encoder: &mut wgpu::CommandEncoder,
     ctx: &GpuContext,
     dy: &wgpu::Buffer,
     x: &wgpu::Buffer,
@@ -208,7 +221,7 @@ fn dispatch_rmsnorm_bwd(
         wgpu::BindGroupEntry { binding: 4, resource: inv_rms.as_entire_binding() },
         wgpu::BindGroupEntry { binding: 5, resource: dx.as_entire_binding() },
     ];
-    dispatch(ctx, &ctx.pipelines.rmsnorm_bwd_dx, &entries_dx, (ceil_div(rows, 64), 1, 1));
+    dispatch(encoder, ctx, &ctx.pipelines.rmsnorm_bwd_dx, &entries_dx, (ceil_div(rows, 64), 1, 1));
 
     let params_dg = uniform(&ctx.device, "rbdg-params", P4 { a: rows as u32, b: dim as u32, c: 0, d: 0 });
     let entries_dg = [
@@ -218,10 +231,10 @@ fn dispatch_rmsnorm_bwd(
         wgpu::BindGroupEntry { binding: 3, resource: inv_rms.as_entire_binding() },
         wgpu::BindGroupEntry { binding: 4, resource: dgain.as_entire_binding() },
     ];
-    dispatch(ctx, &ctx.pipelines.rmsnorm_bwd_dgain, &entries_dg, (ceil_div(dim, 64), 1, 1));
+    dispatch(encoder, ctx, &ctx.pipelines.rmsnorm_bwd_dgain, &entries_dg, (ceil_div(dim, 64), 1, 1));
 }
 
-fn dispatch_swiglu_bwd(ctx: &GpuContext, d_act: &wgpu::Buffer, gate: &wgpu::Buffer, up: &wgpu::Buffer, dgate: &wgpu::Buffer, dup: &wgpu::Buffer, len: usize) {
+fn dispatch_swiglu_bwd(encoder: &mut wgpu::CommandEncoder, ctx: &GpuContext, d_act: &wgpu::Buffer, gate: &wgpu::Buffer, up: &wgpu::Buffer, dgate: &wgpu::Buffer, dup: &wgpu::Buffer, len: usize) {
     let params = uniform(&ctx.device, "sgbwd-params", P4 { a: len as u32, b: 0, c: 0, d: 0 });
     let entries = [
         wgpu::BindGroupEntry { binding: 0, resource: params.as_entire_binding() },
@@ -231,7 +244,7 @@ fn dispatch_swiglu_bwd(ctx: &GpuContext, d_act: &wgpu::Buffer, gate: &wgpu::Buff
         wgpu::BindGroupEntry { binding: 4, resource: dgate.as_entire_binding() },
         wgpu::BindGroupEntry { binding: 5, resource: dup.as_entire_binding() },
     ];
-    dispatch(ctx, &ctx.pipelines.swiglu_bwd, &entries, (ceil_div(len, 64), 1, 1));
+    dispatch(encoder, ctx, &ctx.pipelines.swiglu_bwd, &entries, (ceil_div(len, 64), 1, 1));
 }
 
 /// Runs all three attention-backward passes; see the .wgsl files for why
@@ -239,6 +252,7 @@ fn dispatch_swiglu_bwd(ctx: &GpuContext, d_act: &wgpu::Buffer, gate: &wgpu::Buff
 /// the caller needs afterward.
 #[allow(clippy::too_many_arguments)]
 fn dispatch_attention_bwd(
+    encoder: &mut wgpu::CommandEncoder,
     ctx: &GpuContext,
     d_out: &wgpu::Buffer,
     q: &wgpu::Buffer,
@@ -263,7 +277,7 @@ fn dispatch_attention_bwd(
         wgpu::BindGroupEntry { binding: 3, resource: probs.as_entire_binding() },
         wgpu::BindGroupEntry { binding: 4, resource: d_score_scratch.as_entire_binding() },
     ];
-    dispatch(ctx, &ctx.pipelines.attention_bwd_dscore, &entries_score, (ceil_div(t_len, 8), ceil_div(heads, 8), 1));
+    dispatch(encoder, ctx, &ctx.pipelines.attention_bwd_dscore, &entries_score, (ceil_div(t_len, 8), ceil_div(heads, 8), 1));
 
     let params_q = uniform(&ctx.device, "abwdq-params", P4 { a: t_len as u32, b: heads as u32, c: head_dim as u32, d: window as u32 });
     let entries_q = [
@@ -272,7 +286,7 @@ fn dispatch_attention_bwd(
         wgpu::BindGroupEntry { binding: 2, resource: k.as_entire_binding() },
         wgpu::BindGroupEntry { binding: 3, resource: dq.as_entire_binding() },
     ];
-    dispatch(ctx, &ctx.pipelines.attention_bwd_dq, &entries_q, (ceil_div(t_len, 8), ceil_div(heads, 8), 1));
+    dispatch(encoder, ctx, &ctx.pipelines.attention_bwd_dq, &entries_q, (ceil_div(t_len, 8), ceil_div(heads, 8), 1));
 
     let params_kv = uniform(&ctx.device, "abwdkv-params", P4 { a: t_len as u32, b: heads as u32, c: head_dim as u32, d: window as u32 });
     let entries_kv = [
@@ -284,10 +298,10 @@ fn dispatch_attention_bwd(
         wgpu::BindGroupEntry { binding: 5, resource: dk.as_entire_binding() },
         wgpu::BindGroupEntry { binding: 6, resource: dv.as_entire_binding() },
     ];
-    dispatch(ctx, &ctx.pipelines.attention_bwd_dkdv, &entries_kv, (ceil_div(t_len, 8), ceil_div(heads, 8), 1));
+    dispatch(encoder, ctx, &ctx.pipelines.attention_bwd_dkdv, &entries_kv, (ceil_div(t_len, 8), ceil_div(heads, 8), 1));
 }
 
-fn dispatch_embedding_scatter_add(ctx: &GpuContext, d_rows: &wgpu::Buffer, ids: &wgpu::Buffer, table_grad: &wgpu::Buffer, t_len: usize, hidden: usize, vocab: usize) {
+fn dispatch_embedding_scatter_add(encoder: &mut wgpu::CommandEncoder, ctx: &GpuContext, d_rows: &wgpu::Buffer, ids: &wgpu::Buffer, table_grad: &wgpu::Buffer, t_len: usize, hidden: usize, vocab: usize) {
     let params = uniform(&ctx.device, "embgrad-params", P4 { a: t_len as u32, b: hidden as u32, c: vocab as u32, d: 0 });
     let entries = [
         wgpu::BindGroupEntry { binding: 0, resource: params.as_entire_binding() },
@@ -295,10 +309,10 @@ fn dispatch_embedding_scatter_add(ctx: &GpuContext, d_rows: &wgpu::Buffer, ids: 
         wgpu::BindGroupEntry { binding: 2, resource: ids.as_entire_binding() },
         wgpu::BindGroupEntry { binding: 3, resource: table_grad.as_entire_binding() },
     ];
-    dispatch(ctx, &ctx.pipelines.embedding_scatter_add, &entries, (ceil_div(vocab, 8), ceil_div(hidden, 8), 1));
+    dispatch(encoder, ctx, &ctx.pipelines.embedding_scatter_add, &entries, (ceil_div(vocab, 8), ceil_div(hidden, 8), 1));
 }
 
-fn dispatch_cross_entropy(ctx: &GpuContext, logits: &wgpu::Buffer, targets: &wgpu::Buffer, d_logits: &wgpu::Buffer, loss_out: &wgpu::Buffer, t_len: usize) {
+fn dispatch_cross_entropy(encoder: &mut wgpu::CommandEncoder, ctx: &GpuContext, logits: &wgpu::Buffer, targets: &wgpu::Buffer, d_logits: &wgpu::Buffer, loss_out: &wgpu::Buffer, t_len: usize) {
     let params = uniform(&ctx.device, "ce-params", P4 { a: t_len as u32, b: 0, c: 0, d: 0 });
     let entries = [
         wgpu::BindGroupEntry { binding: 0, resource: params.as_entire_binding() },
@@ -307,16 +321,16 @@ fn dispatch_cross_entropy(ctx: &GpuContext, logits: &wgpu::Buffer, targets: &wgp
         wgpu::BindGroupEntry { binding: 3, resource: d_logits.as_entire_binding() },
         wgpu::BindGroupEntry { binding: 4, resource: loss_out.as_entire_binding() },
     ];
-    dispatch(ctx, &ctx.pipelines.cross_entropy, &entries, (ceil_div(t_len, 64), 1, 1));
+    dispatch(encoder, ctx, &ctx.pipelines.cross_entropy, &entries, (ceil_div(t_len, 64), 1, 1));
 }
 
-fn dispatch_zero(ctx: &GpuContext, buf: &wgpu::Buffer, len: usize) {
+fn dispatch_zero(encoder: &mut wgpu::CommandEncoder, ctx: &GpuContext, buf: &wgpu::Buffer, len: usize) {
     let params = uniform(&ctx.device, "zero-params", P4 { a: len as u32, b: 0, c: 0, d: 0 });
     let entries = [
         wgpu::BindGroupEntry { binding: 0, resource: params.as_entire_binding() },
         wgpu::BindGroupEntry { binding: 1, resource: buf.as_entire_binding() },
     ];
-    dispatch(ctx, &ctx.pipelines.zero, &entries, (ceil_div(len, 64), 1, 1));
+    dispatch(encoder, ctx, &ctx.pipelines.zero, &entries, (ceil_div(len, 64), 1, 1));
 }
 
 #[repr(C)]
@@ -328,13 +342,13 @@ struct ScaleParams {
     _p1: u32,
 }
 
-fn dispatch_scale(ctx: &GpuContext, buf: &wgpu::Buffer, scale: f32, len: usize) {
+fn dispatch_scale(encoder: &mut wgpu::CommandEncoder, ctx: &GpuContext, buf: &wgpu::Buffer, scale: f32, len: usize) {
     let params = uniform(&ctx.device, "scale-params", ScaleParams { len: len as u32, scale, _p0: 0, _p1: 0 });
     let entries = [
         wgpu::BindGroupEntry { binding: 0, resource: params.as_entire_binding() },
         wgpu::BindGroupEntry { binding: 1, resource: buf.as_entire_binding() },
     ];
-    dispatch(ctx, &ctx.pipelines.scale_inplace, &entries, (ceil_div(len, 64), 1, 1));
+    dispatch(encoder, ctx, &ctx.pipelines.scale_inplace, &entries, (ceil_div(len, 64), 1, 1));
 }
 
 #[repr(C)]
@@ -347,7 +361,7 @@ struct AdamParams {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn dispatch_adam(ctx: &GpuContext, w: &wgpu::Buffer, g: &wgpu::Buffer, m: &wgpu::Buffer, v: &wgpu::Buffer, lr: f32, bias1: f32, bias2: f32, len: usize) {
+fn dispatch_adam(encoder: &mut wgpu::CommandEncoder, ctx: &GpuContext, w: &wgpu::Buffer, g: &wgpu::Buffer, m: &wgpu::Buffer, v: &wgpu::Buffer, lr: f32, bias1: f32, bias2: f32, len: usize) {
     let params = uniform(&ctx.device, "adam-params", AdamParams { len: len as u32, lr, bias1, bias2 });
     let entries = [
         wgpu::BindGroupEntry { binding: 0, resource: params.as_entire_binding() },
@@ -356,7 +370,7 @@ fn dispatch_adam(ctx: &GpuContext, w: &wgpu::Buffer, g: &wgpu::Buffer, m: &wgpu:
         wgpu::BindGroupEntry { binding: 3, resource: m.as_entire_binding() },
         wgpu::BindGroupEntry { binding: 4, resource: v.as_entire_binding() },
     ];
-    dispatch(ctx, &ctx.pipelines.adam_update, &entries, (ceil_div(len, 64), 1, 1));
+    dispatch(encoder, ctx, &ctx.pipelines.adam_update, &entries, (ceil_div(len, 64), 1, 1));
 }
 
 // --- Buffer sets ---------------------------------------------------------
@@ -639,8 +653,10 @@ impl GpuModel {
     }
 
     /// Runs the forward pass over `tokens`, populating `self.hidden`,
-    /// `self.logits`, and every per-layer cache buffer.
-    fn forward(&self, ctx: &GpuContext, tokens: &[u32]) -> usize {
+    /// `self.logits`, and every per-layer cache buffer. Records into the
+    /// caller's shared `encoder` rather than submitting anything itself -
+    /// see the `dispatch_*` helpers' module docs for why.
+    fn forward(&self, encoder: &mut wgpu::CommandEncoder, ctx: &GpuContext, tokens: &[u32]) -> usize {
         let t_len = tokens.len();
         let h = self.config.hidden_dim;
         let heads = self.config.num_heads;
@@ -650,37 +666,37 @@ impl GpuModel {
         let vocab = self.config.vocab_size();
 
         write_u32(&ctx.queue, &self.ids, tokens);
-        dispatch_gather(ctx, &self.embed, &self.ids, &self.hidden, t_len, h);
+        dispatch_gather(encoder, ctx, &self.embed, &self.ids, &self.hidden, t_len, h);
 
         for (layer, lc) in self.layers.iter().zip(&self.layer_caches) {
-            dispatch_gather(ctx, &layer.w.ple, &self.ids, &self.ple_scratch, t_len, h);
-            dispatch_add_inplace(ctx, &self.hidden, &self.ple_scratch, t_len * h);
+            dispatch_gather(encoder, ctx, &layer.w.ple, &self.ids, &self.ple_scratch, t_len, h);
+            dispatch_add_inplace(encoder, ctx, &self.hidden, &self.ple_scratch, t_len * h);
             // hidden now holds h_after_ple for this layer; snapshot it into the cache.
-            copy_buffer(ctx, &self.hidden, &lc.h_after_ple, t_len * h);
+            copy_buffer(encoder, &self.hidden, &lc.h_after_ple, t_len * h);
 
-            dispatch_rmsnorm(ctx, &lc.h_after_ple, &layer.w.attn_norm_gain, &lc.normed1, &lc.inv_rms1, t_len, h);
-            dispatch_linear(ctx, &lc.normed1, &layer.w.wq, &lc.q, t_len, h, h);
-            dispatch_linear(ctx, &lc.normed1, &layer.w.wk, &lc.k, t_len, h, h);
-            dispatch_linear(ctx, &lc.normed1, &layer.w.wv, &lc.v, t_len, h, h);
-            dispatch_rope(ctx, &lc.q, t_len, heads, head_dim, false);
-            dispatch_rope(ctx, &lc.k, t_len, heads, head_dim, false);
-            dispatch_attention(ctx, &lc.q, &lc.k, &lc.v, &lc.concat, &lc.probs, t_len, heads, head_dim, window);
-            dispatch_linear(ctx, &lc.concat, &layer.w.wo, &self.attn_out, t_len, h, h);
-            dispatch_add_inplace(ctx, &self.hidden, &self.attn_out, t_len * h);
-            copy_buffer(ctx, &self.hidden, &lc.h_after_attn, t_len * h);
+            dispatch_rmsnorm(encoder, ctx, &lc.h_after_ple, &layer.w.attn_norm_gain, &lc.normed1, &lc.inv_rms1, t_len, h);
+            dispatch_linear(encoder, ctx, &lc.normed1, &layer.w.wq, &lc.q, t_len, h, h);
+            dispatch_linear(encoder, ctx, &lc.normed1, &layer.w.wk, &lc.k, t_len, h, h);
+            dispatch_linear(encoder, ctx, &lc.normed1, &layer.w.wv, &lc.v, t_len, h, h);
+            dispatch_rope(encoder, ctx, &lc.q, t_len, heads, head_dim, false);
+            dispatch_rope(encoder, ctx, &lc.k, t_len, heads, head_dim, false);
+            dispatch_attention(encoder, ctx, &lc.q, &lc.k, &lc.v, &lc.concat, &lc.probs, t_len, heads, head_dim, window);
+            dispatch_linear(encoder, ctx, &lc.concat, &layer.w.wo, &self.attn_out, t_len, h, h);
+            dispatch_add_inplace(encoder, ctx, &self.hidden, &self.attn_out, t_len * h);
+            copy_buffer(encoder, &self.hidden, &lc.h_after_attn, t_len * h);
 
-            dispatch_rmsnorm(ctx, &lc.h_after_attn, &layer.w.mlp_norm_gain, &lc.normed2, &lc.inv_rms2, t_len, h);
-            dispatch_linear(ctx, &lc.normed2, &layer.w.w_gate, &lc.gate, t_len, h, ffn);
-            dispatch_linear(ctx, &lc.normed2, &layer.w.w_up, &lc.up, t_len, h, ffn);
-            dispatch_swiglu(ctx, &lc.gate, &lc.up, &self.act, t_len * ffn);
-            dispatch_linear(ctx, &self.act, &layer.w.w_down, &self.mlp_out, t_len, ffn, h);
-            dispatch_add_inplace(ctx, &self.hidden, &self.mlp_out, t_len * h);
+            dispatch_rmsnorm(encoder, ctx, &lc.h_after_attn, &layer.w.mlp_norm_gain, &lc.normed2, &lc.inv_rms2, t_len, h);
+            dispatch_linear(encoder, ctx, &lc.normed2, &layer.w.w_gate, &lc.gate, t_len, h, ffn);
+            dispatch_linear(encoder, ctx, &lc.normed2, &layer.w.w_up, &lc.up, t_len, h, ffn);
+            dispatch_swiglu(encoder, ctx, &lc.gate, &lc.up, &self.act, t_len * ffn);
+            dispatch_linear(encoder, ctx, &self.act, &layer.w.w_down, &self.mlp_out, t_len, ffn, h);
+            dispatch_add_inplace(encoder, ctx, &self.hidden, &self.mlp_out, t_len * h);
         }
 
-        copy_buffer(ctx, &self.hidden, &self.h_final, t_len * h);
-        dispatch_rmsnorm(ctx, &self.h_final, &self.final_norm_gain, &self.final_normed, &self.final_inv_rms, t_len, h);
+        copy_buffer(encoder, &self.hidden, &self.h_final, t_len * h);
+        dispatch_rmsnorm(encoder, ctx, &self.h_final, &self.final_norm_gain, &self.final_normed, &self.final_inv_rms, t_len, h);
         // Weight-tied output head: logits = final_normed @ embed^T.
-        dispatch_linear(ctx, &self.final_normed, &self.embed, &self.logits, t_len, h, vocab);
+        dispatch_linear(encoder, ctx, &self.final_normed, &self.embed, &self.logits, t_len, h, vocab);
 
         t_len
     }
@@ -695,15 +711,17 @@ impl GpuModel {
             return Err(format!("tokens.len()={t_len} must be in 1..={}", self.config.context_len));
         }
         let vocab = self.config.vocab_size();
-        self.forward(ctx, tokens);
+        let mut encoder = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("forward-last-logits") });
+        self.forward(&mut encoder, ctx, tokens);
+        ctx.queue.submit(Some(encoder.finish()));
         let all_logits = read_f32(&ctx.device, &ctx.queue, &self.logits, t_len * vocab).await;
         Ok(all_logits[(t_len - 1) * vocab..t_len * vocab].to_vec())
     }
 
     /// Zeroes every gradient buffer in `bufs` (paired with `lens`).
-    fn zero_all(&self, ctx: &GpuContext, bufs: &[&wgpu::Buffer], lens: &[usize]) {
+    fn zero_all(&self, encoder: &mut wgpu::CommandEncoder, ctx: &GpuContext, bufs: &[&wgpu::Buffer], lens: &[usize]) {
         for (buf, &len) in bufs.iter().zip(lens) {
-            dispatch_zero(ctx, buf, len);
+            dispatch_zero(encoder, ctx, buf, len);
         }
     }
 
@@ -764,7 +782,7 @@ impl GpuModel {
     /// `forward`, given `d_logits` already populated (see
     /// `dispatch_cross_entropy`). Fills `self.grad_*` (assumed
     /// zeroed beforehand by the caller). Mirrors `llm_core::model::backward`.
-    fn backward(&self, ctx: &GpuContext, tokens: &[u32]) {
+    fn backward(&self, encoder: &mut wgpu::CommandEncoder, ctx: &GpuContext, tokens: &[u32]) {
         let t_len = tokens.len();
         let h = self.config.hidden_dim;
         let heads = self.config.num_heads;
@@ -774,9 +792,9 @@ impl GpuModel {
         let vocab = self.config.vocab_size();
 
         // Output head (tied with embed): logits = final_normed @ embed^T.
-        dispatch_linear_bwd(ctx, &self.d_logits, &self.final_normed, &self.embed, &self.d_normed, &self.grad_embed, t_len, h, vocab);
+        dispatch_linear_bwd(encoder, ctx, &self.d_logits, &self.final_normed, &self.embed, &self.d_normed, &self.grad_embed, t_len, h, vocab);
 
-        dispatch_rmsnorm_bwd(ctx, &self.d_normed, &self.h_final, &self.final_norm_gain, &self.final_inv_rms, &self.d_hidden, &self.grad_final_norm_gain, t_len, h);
+        dispatch_rmsnorm_bwd(encoder, ctx, &self.d_normed, &self.h_final, &self.final_norm_gain, &self.final_inv_rms, &self.d_hidden, &self.grad_final_norm_gain, t_len, h);
 
         for (layer_idx, layer) in self.layers.iter().enumerate().rev() {
             let lc = &self.layer_caches[layer_idx];
@@ -784,20 +802,21 @@ impl GpuModel {
 
             // --- MLP branch (residual: h_after_attn + mlp_out) ---
             // d_mlp_out = d_hidden (residual splits equally); act = swiglu(gate,up).
-            dispatch_swiglu(ctx, &lc.gate, &lc.up, &self.act, t_len * ffn);
-            dispatch_linear_bwd(ctx, &self.d_hidden, &self.act, &layer.w.w_down, &self.d_act, &lg.w_down, t_len, ffn, h);
-            dispatch_swiglu_bwd(ctx, &self.d_act, &lc.gate, &lc.up, &self.d_gate, &self.d_up, t_len * ffn);
-            dispatch_linear_bwd(ctx, &self.d_gate, &lc.normed2, &layer.w.w_gate, &self.d_normed, &lg.w_gate, t_len, h, ffn);
-            dispatch_linear_bwd(ctx, &self.d_up, &lc.normed2, &layer.w.w_up, &self.d_normed_tmp, &lg.w_up, t_len, h, ffn);
-            dispatch_add_inplace(ctx, &self.d_normed, &self.d_normed_tmp, t_len * h);
+            dispatch_swiglu(encoder, ctx, &lc.gate, &lc.up, &self.act, t_len * ffn);
+            dispatch_linear_bwd(encoder, ctx, &self.d_hidden, &self.act, &layer.w.w_down, &self.d_act, &lg.w_down, t_len, ffn, h);
+            dispatch_swiglu_bwd(encoder, ctx, &self.d_act, &lc.gate, &lc.up, &self.d_gate, &self.d_up, t_len * ffn);
+            dispatch_linear_bwd(encoder, ctx, &self.d_gate, &lc.normed2, &layer.w.w_gate, &self.d_normed, &lg.w_gate, t_len, h, ffn);
+            dispatch_linear_bwd(encoder, ctx, &self.d_up, &lc.normed2, &layer.w.w_up, &self.d_normed_tmp, &lg.w_up, t_len, h, ffn);
+            dispatch_add_inplace(encoder, ctx, &self.d_normed, &self.d_normed_tmp, t_len * h);
 
-            dispatch_rmsnorm_bwd(ctx, &self.d_normed, &lc.h_after_attn, &layer.w.mlp_norm_gain, &lc.inv_rms2, &self.d_normed_tmp, &lg.mlp_norm_gain, t_len, h);
+            dispatch_rmsnorm_bwd(encoder, ctx, &self.d_normed, &lc.h_after_attn, &layer.w.mlp_norm_gain, &lc.inv_rms2, &self.d_normed_tmp, &lg.mlp_norm_gain, t_len, h);
             // d_h_after_attn = d_hidden (pass-through) + d_normed_tmp (norm branch); accumulate into d_hidden in place.
-            dispatch_add_inplace(ctx, &self.d_hidden, &self.d_normed_tmp, t_len * h);
+            dispatch_add_inplace(encoder, ctx, &self.d_hidden, &self.d_normed_tmp, t_len * h);
 
             // --- Attention branch (residual: h_after_ple + attn_out) ---
-            dispatch_linear_bwd(ctx, &self.d_hidden, &lc.concat, &layer.w.wo, &self.d_concat, &lg.wo, t_len, h, h);
+            dispatch_linear_bwd(encoder, ctx, &self.d_hidden, &lc.concat, &layer.w.wo, &self.d_concat, &lg.wo, t_len, h, h);
             dispatch_attention_bwd(
+                encoder,
                 ctx,
                 &self.d_concat,
                 &lc.q,
@@ -813,26 +832,26 @@ impl GpuModel {
                 head_dim,
                 window,
             );
-            dispatch_rope(ctx, &self.d_q, t_len, heads, head_dim, true);
-            dispatch_rope(ctx, &self.d_k, t_len, heads, head_dim, true);
+            dispatch_rope(encoder, ctx, &self.d_q, t_len, heads, head_dim, true);
+            dispatch_rope(encoder, ctx, &self.d_k, t_len, heads, head_dim, true);
 
-            dispatch_linear_bwd(ctx, &self.d_q, &lc.normed1, &layer.w.wq, &self.d_normed, &lg.wq, t_len, h, h);
-            dispatch_linear_bwd(ctx, &self.d_k, &lc.normed1, &layer.w.wk, &self.d_normed_tmp, &lg.wk, t_len, h, h);
-            dispatch_add_inplace(ctx, &self.d_normed, &self.d_normed_tmp, t_len * h);
-            dispatch_linear_bwd(ctx, &self.d_v, &lc.normed1, &layer.w.wv, &self.d_normed_tmp, &lg.wv, t_len, h, h);
-            dispatch_add_inplace(ctx, &self.d_normed, &self.d_normed_tmp, t_len * h);
+            dispatch_linear_bwd(encoder, ctx, &self.d_q, &lc.normed1, &layer.w.wq, &self.d_normed, &lg.wq, t_len, h, h);
+            dispatch_linear_bwd(encoder, ctx, &self.d_k, &lc.normed1, &layer.w.wk, &self.d_normed_tmp, &lg.wk, t_len, h, h);
+            dispatch_add_inplace(encoder, ctx, &self.d_normed, &self.d_normed_tmp, t_len * h);
+            dispatch_linear_bwd(encoder, ctx, &self.d_v, &lc.normed1, &layer.w.wv, &self.d_normed_tmp, &lg.wv, t_len, h, h);
+            dispatch_add_inplace(encoder, ctx, &self.d_normed, &self.d_normed_tmp, t_len * h);
 
-            dispatch_rmsnorm_bwd(ctx, &self.d_normed, &lc.h_after_ple, &layer.w.attn_norm_gain, &lc.inv_rms1, &self.d_normed_tmp, &lg.attn_norm_gain, t_len, h);
+            dispatch_rmsnorm_bwd(encoder, ctx, &self.d_normed, &lc.h_after_ple, &layer.w.attn_norm_gain, &lc.inv_rms1, &self.d_normed_tmp, &lg.attn_norm_gain, t_len, h);
             // d_h_after_ple = d_hidden (pass-through) + d_normed_tmp (norm branch).
-            dispatch_add_inplace(ctx, &self.d_hidden, &self.d_normed_tmp, t_len * h);
+            dispatch_add_inplace(encoder, ctx, &self.d_hidden, &self.d_normed_tmp, t_len * h);
 
             // PLE residual add: gradient passes through unchanged (already
             // in d_hidden) and also scatters into this layer's PLE grad.
-            dispatch_embedding_scatter_add(ctx, &self.d_hidden, &self.ids, &lg.ple, t_len, h, vocab);
+            dispatch_embedding_scatter_add(encoder, ctx, &self.d_hidden, &self.ids, &lg.ple, t_len, h, vocab);
         }
 
         // Input embedding gather (the other half of the tied embed/head gradient).
-        dispatch_embedding_scatter_add(ctx, &self.d_hidden, &self.ids, &self.grad_embed, t_len, h, vocab);
+        dispatch_embedding_scatter_add(encoder, ctx, &self.d_hidden, &self.ids, &self.grad_embed, t_len, h, vocab);
     }
 
     /// Dev/sanity-check tool: runs forward, cross-entropy, and backward
@@ -855,12 +874,14 @@ impl GpuModel {
         let vocab = self.config.vocab_size();
 
         let lens = self.tensor_lens();
-        self.zero_all(ctx, &self.grad_buffers(), &lens);
+        let mut encoder = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("debug-grad-embed") });
+        self.zero_all(&mut encoder, ctx, &self.grad_buffers(), &lens);
 
-        self.forward(ctx, tokens);
+        self.forward(&mut encoder, ctx, tokens);
         write_u32(&ctx.queue, &self.targets, targets);
-        dispatch_cross_entropy(ctx, &self.logits, &self.targets, &self.d_logits, &self.loss_per_row, t_len);
-        self.backward(ctx, tokens);
+        dispatch_cross_entropy(&mut encoder, ctx, &self.logits, &self.targets, &self.d_logits, &self.loss_per_row, t_len);
+        self.backward(&mut encoder, ctx, tokens);
+        ctx.queue.submit(Some(encoder.finish()));
 
         Ok(read_f32(&ctx.device, &ctx.queue, &self.grad_embed, vocab * h).await)
     }
@@ -891,44 +912,64 @@ impl GpuModel {
         let t_len = batch.context_len;
 
         let lens = self.tensor_lens();
-        self.zero_all(ctx, &self.grad_accum_buffers(), &lens);
-        dispatch_zero(ctx, &self.loss_accum, t_len);
+
+        // Three command buffers per step (one per phase below), not one
+        // per dispatch and not one for the whole step: batching the whole
+        // step into a single command buffer would work too, but keeping
+        // per-sequence chunks bounds how much GPU work is in flight in any
+        // one submission - a conservative margin against driver/OS
+        // watchdogs on unfamiliar hardware, at a cost of a few extra
+        // submits that's negligible next to the thousands this replaces.
+        {
+            let mut encoder = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("train-step-zero-accum") });
+            self.zero_all(&mut encoder, ctx, &self.grad_accum_buffers(), &lens);
+            dispatch_zero(&mut encoder, ctx, &self.loss_accum, t_len);
+            ctx.queue.submit(Some(encoder.finish()));
+        }
 
         for b in 0..batch.batch_size {
             let start = b * t_len;
             let input = &batch.inputs[start..start + t_len];
             let target = &batch.targets[start..start + t_len];
 
-            self.zero_all(ctx, &self.grad_buffers(), &lens);
+            let mut encoder = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("train-step-sequence") });
 
-            self.forward(ctx, input);
+            self.zero_all(&mut encoder, ctx, &self.grad_buffers(), &lens);
+
+            self.forward(&mut encoder, ctx, input);
             write_u32(&ctx.queue, &self.targets, target);
-            dispatch_cross_entropy(ctx, &self.logits, &self.targets, &self.d_logits, &self.loss_per_row, t_len);
-            dispatch_add_inplace(ctx, &self.loss_accum, &self.loss_per_row, t_len);
+            dispatch_cross_entropy(&mut encoder, ctx, &self.logits, &self.targets, &self.d_logits, &self.loss_per_row, t_len);
+            dispatch_add_inplace(&mut encoder, ctx, &self.loss_accum, &self.loss_per_row, t_len);
 
-            self.backward(ctx, input);
+            self.backward(&mut encoder, ctx, input);
 
             // grad_accum_buffers()/grad_buffers() are built from the same
             // shape list as `lens`, so all three zip up in lockstep.
             for ((accum, g), &len) in self.grad_accum_buffers().into_iter().zip(self.grad_buffers()).zip(&lens) {
-                dispatch_add_inplace(ctx, accum, g, len);
+                dispatch_add_inplace(&mut encoder, ctx, accum, g, len);
             }
+
+            ctx.queue.submit(Some(encoder.finish()));
         }
 
-        for (buf, &len) in self.grad_accum_buffers().into_iter().zip(&lens) {
-            dispatch_scale(ctx, buf, 1.0 / batch.batch_size as f32, len);
-        }
+        {
+            let mut encoder = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("train-step-scale-and-adam") });
+            for (buf, &len) in self.grad_accum_buffers().into_iter().zip(&lens) {
+                dispatch_scale(&mut encoder, ctx, buf, 1.0 / batch.batch_size as f32, len);
+            }
 
-        let step = self.adam_step.get() + 1;
-        self.adam_step.set(step);
-        let bias1 = 1.0 - 0.9f32.powi(step as i32);
-        let bias2 = 1.0 - 0.999f32.powi(step as i32);
-        let weight_bufs = self.weight_buffers();
-        let grad_bufs = self.grad_accum_buffers();
-        let m_bufs = self.adam_m_buffers();
-        let v_bufs = self.adam_v_buffers();
-        for i in 0..weight_bufs.len() {
-            dispatch_adam(ctx, weight_bufs[i], grad_bufs[i], m_bufs[i], v_bufs[i], lr, bias1, bias2, lens[i]);
+            let step = self.adam_step.get() + 1;
+            self.adam_step.set(step);
+            let bias1 = 1.0 - 0.9f32.powi(step as i32);
+            let bias2 = 1.0 - 0.999f32.powi(step as i32);
+            let weight_bufs = self.weight_buffers();
+            let grad_bufs = self.grad_accum_buffers();
+            let m_bufs = self.adam_m_buffers();
+            let v_bufs = self.adam_v_buffers();
+            for i in 0..weight_bufs.len() {
+                dispatch_adam(&mut encoder, ctx, weight_bufs[i], grad_bufs[i], m_bufs[i], v_bufs[i], lr, bias1, bias2, lens[i]);
+            }
+            ctx.queue.submit(Some(encoder.finish()));
         }
 
         // sum(loss_accum) / (t_len * batch_size) is exactly the same
@@ -971,9 +1012,7 @@ impl GpuModel {
 /// host round trip) — used to snapshot the running `hidden` buffer into a
 /// per-layer cache slot without a separate shader (a `copy_buffer_to_buffer`
 /// command covers it).
-fn copy_buffer(ctx: &GpuContext, src: &wgpu::Buffer, dst: &wgpu::Buffer, len: usize) {
+fn copy_buffer(encoder: &mut wgpu::CommandEncoder, src: &wgpu::Buffer, dst: &wgpu::Buffer, len: usize) {
     let byte_len = (len * std::mem::size_of::<f32>()) as u64;
-    let mut encoder = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("cache-copy") });
     encoder.copy_buffer_to_buffer(src, 0, dst, 0, byte_len);
-    ctx.queue.submit(Some(encoder.finish()));
 }

@@ -346,6 +346,12 @@ impl WasmLLM {
         let (ctx, model, config) = self.ensure_gpu_model().await?;
 
         let mut tokens = llm_core::tokenizer::encode(&prompt);
+        // See llm_core::generate::generate's matching comment: an empty
+        // prompt needs a real seed token or the loop below exits before
+        // generating anything.
+        if tokens.is_empty() {
+            tokens.push(llm_core::tokenizer::BOS);
+        }
         let mut rng = llm_core::rng::Rng::seed_from_u64(seed as u64);
         for _ in 0..max_new_tokens {
             let window: Vec<u32> = if tokens.len() > config.context_len {

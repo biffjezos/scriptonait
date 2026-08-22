@@ -14,6 +14,48 @@ let stepMsHistory = [];
 const STEP_MS_WINDOW = 20;
 let training = false;
 
+// --- Wake lock -------------------------------------------------------------
+// Training/generation can run for hours; without this the OS treats the tab
+// as idle and lets the screen (and often the whole machine) go to sleep
+// mid-run, same as any video player would request a wake lock to avoid.
+// Reference-counted so training and a concurrent generate() don't stomp on
+// each other's release.
+let wakeLock = null;
+let activeWakeJobs = 0;
+
+async function acquireWakeLock() {
+  if (wakeLock || !('wakeLock' in navigator)) return;
+  try {
+    wakeLock = await navigator.wakeLock.request('screen');
+    wakeLock.addEventListener('release', () => {
+      wakeLock = null;
+    });
+  } catch {
+    // Request can fail (tab not visible, low battery, etc.) - harmless;
+    // the visibilitychange listener below retries once the tab is visible.
+  }
+}
+
+function beginWakeJob() {
+  activeWakeJobs += 1;
+  acquireWakeLock();
+}
+
+function endWakeJob() {
+  activeWakeJobs = Math.max(0, activeWakeJobs - 1);
+  if (activeWakeJobs === 0 && wakeLock) {
+    wakeLock.release();
+  }
+}
+
+document.addEventListener('visibilitychange', () => {
+  // A wake lock is auto-released whenever the tab is hidden - re-acquire
+  // it once visible again if a job is still supposed to be running.
+  if (activeWakeJobs > 0 && document.visibilityState === 'visible') {
+    acquireWakeLock();
+  }
+});
+
 const webgpuBrowserSupported = 'gpu' in navigator;
 
 // This app's own limit, not a hardware one: llm-gpu's attention kernel
@@ -162,7 +204,6 @@ worker.onmessage = (event) => {
     case 'sourceStats':
     case 'sourceRemoved': {
       refreshCorpusStatsFromWorker(msg);
-      updateStoryStatePanel(msg.storyState);
       break;
     }
 
@@ -189,6 +230,7 @@ worker.onmessage = (event) => {
     case 'trainStalled': {
       training = false;
       setTrainingButtons(false);
+      endWakeJob();
       el('train-status').textContent = msg.message;
       break;
     }
@@ -223,6 +265,7 @@ worker.onmessage = (event) => {
     case 'trainStopped': {
       training = false;
       setTrainingButtons(false);
+      endWakeJob();
       el('train-status').textContent = `Stopped at step ${Math.round(msg.step).toLocaleString()}.`;
       break;
     }
@@ -230,6 +273,7 @@ worker.onmessage = (event) => {
     case 'generateResult': {
       el('generate-output').textContent = msg.text;
       el('generate-btn').disabled = false;
+      endWakeJob();
       renderQaNotes(msg.qaNotes || []);
       el('effective-prompt').textContent = msg.effectivePrompt || '';
       el('effective-prompt-details').hidden = !msg.effectivePrompt;
@@ -302,6 +346,12 @@ worker.onmessage = (event) => {
       // wasn't the one that failed).
       el('generate-btn').disabled = false;
       el('preview-retrieval-btn').disabled = false;
+      if (msg.context === 'generate') endWakeJob();
+      if (msg.context === 'train_step') {
+        training = false;
+        setTrainingButtons(false);
+        endWakeJob();
+      }
       break;
     }
 
@@ -320,37 +370,6 @@ function setTrainingButtons(isTraining) {
   el('start-train-btn').disabled = isTraining;
   el('stop-train-btn').disabled = !isTraining;
 }
-
-const STORY_STATE_DISMISSED_KEY = 'scriptonait.storyStateDismissed';
-
-function isStoryStateDismissed() {
-  try {
-    return localStorage.getItem(STORY_STATE_DISMISSED_KEY) === '1';
-  } catch {
-    return false;
-  }
-}
-
-function updateStoryStatePanel(storyState) {
-  if (!storyState) return;
-  const panel = el('story-state-panel');
-  const hasAnything = storyState.characters.length > 0 || storyState.locations.length > 0;
-  panel.hidden = !hasAnything || isStoryStateDismissed();
-  if (!hasAnything) return;
-  el('story-characters').textContent = storyState.characters.length ? storyState.characters.join(', ') : '—';
-  el('story-locations').textContent = storyState.locations.length ? storyState.locations.join(', ') : '—';
-  el('story-scene-count').textContent = String(storyState.sceneCount);
-}
-
-el('dismiss-story-state-btn').addEventListener('click', () => {
-  el('story-state-panel').hidden = true;
-  try {
-    localStorage.setItem(STORY_STATE_DISMISSED_KEY, '1');
-  } catch {
-    // Storage unavailable (private mode, quota) - the panel still stays
-    // hidden for this page load, it just won't persist across reloads.
-  }
-});
 
 function renderQaNotes(notes) {
   const container = el('qa-notes');
@@ -846,6 +865,7 @@ el('create-model-btn').addEventListener('click', () => {
 el('start-train-btn').addEventListener('click', () => {
   training = true;
   setTrainingButtons(true);
+  beginWakeJob();
   el('train-samples').innerHTML = '';
   stepMsHistory = [];
   el('train-perf').textContent = '';
@@ -906,6 +926,7 @@ function currentGenerationTags() {
 el('generate-btn').addEventListener('click', () => {
   const prompt = el('prompt-input').value;
   el('generate-btn').disabled = true;
+  beginWakeJob();
   el('generate-output').textContent = '';
   renderQaNotes([]);
   el('effective-prompt-details').hidden = true;

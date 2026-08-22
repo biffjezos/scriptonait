@@ -111,14 +111,6 @@ function post(msg) {
   postMessage(msg);
 }
 
-function storyState() {
-  return {
-    characters: llm.story_characters(),
-    locations: llm.story_locations(),
-    sceneCount: llm.story_scene_count(),
-  };
-}
-
 // Builds the [GENRE: x] [TONE: y] preamble used both when adding a
 // tagged source and when tagging a generation prompt — see db.js's note
 // on `tags` for why this lives entirely in JS (llm-core just sees text).
@@ -217,7 +209,6 @@ async function handleMessage(msg) {
         tokenCount: stats.token_count,
         numSources: llm.num_sources(),
         totalTokens: llm.total_tokens(),
-        storyState: storyState(),
       });
       break;
     }
@@ -229,7 +220,6 @@ async function handleMessage(msg) {
         id: msg.id,
         numSources: llm.num_sources(),
         totalTokens: llm.total_tokens(),
-        storyState: storyState(),
       });
       break;
     }
