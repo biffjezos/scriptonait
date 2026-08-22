@@ -31,7 +31,9 @@ formatting, recurring phrasing), not at long-range plot coherence.
   (scripts, book chapters) you can push context length up while keeping
   the window — and so the compute/memory cost — small, since local
   structure (a scene, a line of dialogue) rarely needs to look back
-  thousands of tokens.
+  thousands of tokens. The CPU backend stores attention probabilities
+  **banded** (`[heads, T, window]`), so both the time and the memory are
+  genuinely `context_len * local_window`, not `context_len^2`.
 - **Text prep**: HTML is stripped for URL sources; all sources get
   whitespace-normalized, but — deliberately — *leading indentation is
   preserved*. Plain-text screenplay exports commonly use indentation as
@@ -42,6 +44,23 @@ formatting, recurring phrasing), not at long-range plot coherence.
 See doc comments in `crates/llm-core/src/config.rs` and `model.rs` for the
 full per-layer layout and parameter-count formula (also surfaced live in
 the UI as you adjust settings).
+
+### Memory, and why the UI refuses some shapes
+
+The dominant memory cost of a training step is not the weights — it's the
+activation cache the backward pass needs, and within that, the attention
+probabilities: `num_layers * num_heads * context_len * local_window`
+floats, live all at once. At the largest shape the UI's inputs allow
+(16 layers, 1024 nodes, 16 heads, 4096-token full attention) that is
+around 5 GB even with banded storage, against 790 MB of weights.
+
+So `ModelConfig::memory_bytes(true)` counts activations
+(`ModelConfig::activation_bytes`), the size estimate under the model
+settings shows the split and flags heavy configs, and
+`ModelConfig::validate` rejects anything over
+`MAX_TRAINING_BYTES` (2 GB) outright — a wasm32 heap cannot hold more, so
+such a config doesn't train slowly, it allocates until the tab dies and
+drags the machine into swap first.
 
 ### Where training happens vs. where WebGPU is used
 
@@ -73,7 +92,7 @@ in the WebGPU path specifically.
 crates/
   llm-core/   Tokenizer, text prep, corpus/batch sampling, model
               (forward+backward+Adam), generation. Zero external
-              dependencies — builds and its 90 tests run with no network
+              dependencies — builds and its 100 tests run with no network
               access. This is the verified reference implementation.
   llm-gpu/    WebGPU (wgpu + WGSL) backend, mirroring llm-core's forward
               pass, backward pass, and Adam optimizer kernel-for-kernel —
@@ -125,9 +144,17 @@ cargo install wasm-pack
 Then, from the repo root:
 
 ```
-wasm-pack build crates/wasm-app --target web --out-dir ../../frontend/pkg
+RUSTFLAGS="-C target-feature=+simd128" \
+  wasm-pack build crates/wasm-app --release --target web --out-dir ../../frontend/pkg
 cd frontend && python3 -m http.server 8000
 ```
+
+`+simd128` is what lets the compiler vectorize `llm-core`'s inner loops
+into real wasm SIMD; it makes a large difference to CPU training speed,
+which is the default path everywhere and the only path in a browser
+without WebGPU. It's what the deploy workflow builds with. (Dropping the
+flag still builds and runs, just slower; WebAssembly SIMD has been
+baseline in Chrome/Edge/Firefox/Safari since 2023.)
 
 Open `http://localhost:8000` in a recent Chrome or Edge (WebGPU support;
 both generation and training fall back to CPU-only in browsers without it,
@@ -146,7 +173,7 @@ That means:
 - **`llm-core` (tokenizer, text prep, corpus, model, training, generation)
   is real, verified work**: zero external dependencies (own tiny PRNG
   instead of pulling in `rand`, no `serde`), so it built and ran fully
-  offline. Its 90 tests include full gradient checks (analytic vs.
+  offline. Its 100 tests include full gradient checks (analytic vs.
   numerical differentiation) for every op — RMSNorm, the linear layers,
   RoPE, sliding-window attention, SwiGLU, cross-entropy — plus a full-model
   gradient check across embeddings, PLE tables, attention/MLP weights, and

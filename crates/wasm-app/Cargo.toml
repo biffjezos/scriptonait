@@ -35,3 +35,14 @@ console_error_panic_hook = "0.1"
 # it trades a somewhat larger .wasm file for a build that doesn't
 # intermittently fail on toolchain drift outside this project's control.
 wasm-opt = false
+
+# This crate is where llm-core's training math actually runs for users, so
+# the release profile is tuned for speed rather than for .wasm size: the
+# inner loops in llm-core::ops are the whole cost of a training step, and
+# they need cross-crate inlining plus vectorization to be worth anything.
+# (Note the *root* workspace uses opt-level = "z" — that profile does not
+# apply here, since this crate is deliberately its own workspace.)
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1

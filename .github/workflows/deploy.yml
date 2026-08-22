@@ -53,6 +53,13 @@ jobs:
         run: cargo test -p llm-core
 
       - name: Build wasm-app -> frontend/pkg
+        # +simd128 is what lets LLVM turn llm-core's dot/axpy inner loops
+        # into real wasm SIMD instead of scalar float ops - a large,
+        # measurable difference for CPU training, which is the default
+        # (and the only) path in browsers without WebGPU. WebAssembly SIMD
+        # has been baseline in Chrome/Edge/Firefox/Safari since 2023.
+        env:
+          RUSTFLAGS: -C target-feature=+simd128
         run: wasm-pack build crates/wasm-app --release --target web --out-dir ../../frontend/pkg
 
       - name: Upload Pages artifact

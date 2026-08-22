@@ -58,24 +58,72 @@ pub fn rmsnorm_bwd(
     (dx, dgain)
 }
 
+/// Dot product with four independent accumulators.
+///
+/// Float addition isn't associative, so a single-accumulator loop forces
+/// the compiler into one serial dependency chain - no vectorization, and
+/// one FP-add latency per element. Four partial sums break that chain and
+/// let LLVM emit SIMD (real SIMD on wasm when built with
+/// `-C target-feature=+simd128`; see the deploy workflow). The summation
+/// order differs from a naive left fold, which is fine: both are equally
+/// valid float reductions, and this one is if anything slightly more
+/// accurate.
+#[inline]
+fn dot(a: &[f32], b: &[f32]) -> f32 {
+    debug_assert_eq!(a.len(), b.len());
+    let mut acc = [0.0f32; 4];
+    let mut ac = a.chunks_exact(4);
+    let mut bc = b.chunks_exact(4);
+    for (av, bv) in ac.by_ref().zip(bc.by_ref()) {
+        acc[0] += av[0] * bv[0];
+        acc[1] += av[1] * bv[1];
+        acc[2] += av[2] * bv[2];
+        acc[3] += av[3] * bv[3];
+    }
+    let tail: f32 = ac.remainder().iter().zip(bc.remainder()).map(|(x, y)| x * y).sum();
+    (acc[0] + acc[1]) + (acc[2] + acc[3]) + tail
+}
+
+/// `dst += scale * src`, elementwise. Written over `chunks_exact` for the
+/// same reason as `dot`: it drops the per-element bounds check and gives
+/// LLVM a shape it will vectorize.
+#[inline]
+fn axpy(dst: &mut [f32], src: &[f32], scale: f32) {
+    debug_assert_eq!(dst.len(), src.len());
+    let mut dc = dst.chunks_exact_mut(4);
+    let mut sc = src.chunks_exact(4);
+    for (d, s) in dc.by_ref().zip(sc.by_ref()) {
+        d[0] += scale * s[0];
+        d[1] += scale * s[1];
+        d[2] += scale * s[2];
+        d[3] += scale * s[3];
+    }
+    for (d, s) in dc.into_remainder().iter_mut().zip(sc.remainder()) {
+        *d += scale * s;
+    }
+}
+
 /// `y[rows,out_dim] = x[rows,in_dim] @ w[out_dim,in_dim]^T`, no bias.
 pub fn linear_fwd(x: &[f32], w: &[f32], rows: usize, in_dim: usize, out_dim: usize) -> Vec<f32> {
     let mut y = vec![0.0f32; rows * out_dim];
     for r in 0..rows {
         let x_row = &x[r * in_dim..(r + 1) * in_dim];
-        for o in 0..out_dim {
-            let w_row = &w[o * in_dim..(o + 1) * in_dim];
-            let mut acc = 0.0f32;
-            for i in 0..in_dim {
-                acc += x_row[i] * w_row[i];
-            }
-            y[r * out_dim + o] = acc;
+        let y_row = &mut y[r * out_dim..(r + 1) * out_dim];
+        for (o, y_o) in y_row.iter_mut().enumerate() {
+            *y_o = dot(x_row, &w[o * in_dim..(o + 1) * in_dim]);
         }
     }
     y
 }
 
 /// Returns `(dx, dw)` for the same linear op.
+///
+/// `dx` and `dw` are accumulated in separate passes rather than one fused
+/// loop. The fused version rereads and rewrites a whole `dw` row
+/// (`out_dim * in_dim` floats, far past L1 for real layer sizes) for every
+/// single token, which is what made this the most expensive op in the
+/// backward pass; keeping the two passes apart lets each one stream over
+/// memory it can actually keep hot.
 pub fn linear_bwd(
     dy: &[f32],
     x: &[f32],
@@ -86,21 +134,31 @@ pub fn linear_bwd(
 ) -> (Vec<f32>, Vec<f32>) {
     let mut dx = vec![0.0f32; rows * in_dim];
     let mut dw = vec![0.0f32; out_dim * in_dim];
+
+    // dx[r] = sum_o dy[r,o] * w[o]
     for r in 0..rows {
-        let x_row = &x[r * in_dim..(r + 1) * in_dim];
         let dy_row = &dy[r * out_dim..(r + 1) * out_dim];
-        for o in 0..out_dim {
-            let dyo = dy_row[o];
+        let dx_row = &mut dx[r * in_dim..(r + 1) * in_dim];
+        for (o, &dyo) in dy_row.iter().enumerate() {
             if dyo == 0.0 {
                 continue;
             }
-            let w_row = &w[o * in_dim..(o + 1) * in_dim];
-            for i in 0..in_dim {
-                dx[r * in_dim + i] += dyo * w_row[i];
-                dw[o * in_dim + i] += dyo * x_row[i];
-            }
+            axpy(dx_row, &w[o * in_dim..(o + 1) * in_dim], dyo);
         }
     }
+
+    // dw[o] = sum_r dy[r,o] * x[r]
+    for o in 0..out_dim {
+        let dw_row = &mut dw[o * in_dim..(o + 1) * in_dim];
+        for r in 0..rows {
+            let dyo = dy[r * out_dim + o];
+            if dyo == 0.0 {
+                continue;
+            }
+            axpy(dw_row, &x[r * in_dim..(r + 1) * in_dim], dyo);
+        }
+    }
+
     (dx, dw)
 }
 
@@ -113,13 +171,19 @@ pub fn rope_apply(x: &mut [f32], rows: usize, heads: usize, head_dim: usize, inv
     debug_assert_eq!(head_dim % 2, 0);
     let half = head_dim / 2;
     let sign = if inverse { -1.0 } else { 1.0 };
+    // The rotation angle depends only on (position, dim-pair) - not on the
+    // head - so the `powf`/`sin_cos` pair is computed once per (t, k) and
+    // reused across heads, instead of once per (t, h, k). Every layer runs
+    // this four times per training step (q and k, forward and backward),
+    // so the transcendentals dominated an otherwise trivial op.
+    let inv_freq: Vec<f32> =
+        (0..half).map(|k| 1.0f32 / 10000f32.powf(2.0 * k as f32 / head_dim as f32)).collect();
     for t in 0..rows {
-        for h in 0..heads {
-            let base_idx = t * heads * head_dim + h * head_dim;
-            for k in 0..half {
-                let freq = 1.0f32 / 10000f32.powf(2.0 * k as f32 / head_dim as f32);
-                let angle = sign * t as f32 * freq;
-                let (s, c) = angle.sin_cos();
+        for k in 0..half {
+            let angle = sign * t as f32 * inv_freq[k];
+            let (s, c) = angle.sin_cos();
+            for h in 0..heads {
+                let base_idx = t * heads * head_dim + h * head_dim;
                 let a = x[base_idx + 2 * k];
                 let b = x[base_idx + 2 * k + 1];
                 x[base_idx + 2 * k] = a * c - b * s;
@@ -179,11 +243,34 @@ pub fn softmax_row_inplace(row: &mut [f32]) {
     }
 }
 
+/// Number of stored attention-probability columns per query row: the
+/// sliding window, clamped to the sequence length. See `attention_fwd`.
+pub fn band_width(t_len: usize, window: usize) -> usize {
+    window.max(1).min(t_len)
+}
+
+/// First key position attended by query position `t` under a `band`-wide
+/// sliding window.
+#[inline]
+fn band_lo(t: usize, band: usize) -> usize {
+    t.saturating_sub(band.saturating_sub(1))
+}
+
 /// Multi-head causal, optionally windowed, scaled dot-product attention.
 /// `q`/`k`/`v` are `[T, heads*head_dim]` (`q`/`k` already RoPE'd). Returns
-/// `(concat_out[T, heads*head_dim], probs[heads*T*T])`; `probs` is the
-/// dense (masked entries = 0) attention matrix per head, cached for the
-/// backward pass.
+/// `(concat_out[T, heads*head_dim], probs[heads*T*band])`, where `band` is
+/// `band_width(t_len, window)`.
+///
+/// `probs` is stored **banded**, not dense: row `t` holds only the
+/// `band` in-window columns, with column `j` meaning key position
+/// `band_lo(t, band) + j` (entries past the causal diagonal stay 0).
+/// A dense `[heads, T, T]` cache would be quadratic in context length —
+/// at, say, 8 heads and a 4096-token context that is 512 MB *per layer,
+/// per sequence*, all of it live at once because backward needs every
+/// layer's copy. It also made the whole point of sliding-window
+/// attention moot: masking and re-normalizing a full-length row is O(T)
+/// work per query no matter how narrow the window is. Banded storage
+/// makes both the memory and the time genuinely O(T * window).
 pub fn attention_fwd(
     q: &[f32],
     k: &[f32],
@@ -194,41 +281,40 @@ pub fn attention_fwd(
     window: usize,
 ) -> (Vec<f32>, Vec<f32>) {
     let hd = heads * head_dim;
+    let band = band_width(t_len, window);
     let mut out = vec![0.0f32; t_len * hd];
-    let mut probs = vec![0.0f32; heads * t_len * t_len];
+    let mut probs = vec![0.0f32; heads * t_len * band];
     let scale = 1.0 / (head_dim as f32).sqrt();
 
     for h in 0..heads {
         for t in 0..t_len {
-            let lo = t.saturating_sub(window.saturating_sub(1));
+            let lo = band_lo(t, band);
+            let n = t - lo + 1; // in-window keys for this query
             let q_t = &q[t * hd + h * head_dim..t * hd + h * head_dim + head_dim];
-            let row = &mut probs[h * t_len * t_len + t * t_len..h * t_len * t_len + t * t_len + t_len];
-            for v_ in row.iter_mut() {
-                *v_ = f32::NEG_INFINITY;
-            }
-            for s in lo..=t {
+            let base = h * t_len * band + t * band;
+            let row = &mut probs[base..base + n];
+            for (j, slot) in row.iter_mut().enumerate() {
+                let s = lo + j;
                 let k_s = &k[s * hd + h * head_dim..s * hd + h * head_dim + head_dim];
-                let dot: f32 = q_t.iter().zip(k_s).map(|(a, b)| a * b).sum();
-                row[s] = dot * scale;
+                *slot = dot(q_t, k_s) * scale;
             }
             softmax_row_inplace(row);
             let out_t = &mut out[t * hd + h * head_dim..t * hd + h * head_dim + head_dim];
-            for s in lo..=t {
-                let p = row[s];
+            for j in 0..n {
+                let p = probs[base + j];
                 if p == 0.0 {
                     continue;
                 }
-                let v_s = &v[s * hd + h * head_dim..s * hd + h * head_dim + head_dim];
-                for d in 0..head_dim {
-                    out_t[d] += p * v_s[d];
-                }
+                let s = lo + j;
+                axpy(out_t, &v[s * hd + h * head_dim..s * hd + h * head_dim + head_dim], p);
             }
         }
     }
     (out, probs)
 }
 
-/// Returns `(dq, dk, dv)`, all `[T, heads*head_dim]`.
+/// Returns `(dq, dk, dv)`, all `[T, heads*head_dim]`. `probs` is the
+/// banded cache `attention_fwd` returned, same `window`.
 pub fn attention_bwd(
     d_out: &[f32],
     q: &[f32],
@@ -241,52 +327,48 @@ pub fn attention_bwd(
     window: usize,
 ) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
     let hd = heads * head_dim;
+    let band = band_width(t_len, window);
     let mut dq = vec![0.0f32; t_len * hd];
     let mut dk = vec![0.0f32; t_len * hd];
     let mut dv = vec![0.0f32; t_len * hd];
     let scale = 1.0 / (head_dim as f32).sqrt();
+    // One row's worth of scratch, reused across rows and heads - the
+    // gradient wrt the probabilities is only needed within the row it
+    // belongs to (softmax rows are independent), so there's no reason to
+    // materialize a second full-size cache alongside `probs`.
+    let mut d_probs_row = vec![0.0f32; band];
 
     for h in 0..heads {
-        let probs_h = &probs[h * t_len * t_len..(h + 1) * t_len * t_len];
-        let mut d_probs = vec![0.0f32; t_len * t_len];
+        let probs_h = &probs[h * t_len * band..(h + 1) * t_len * band];
         for t in 0..t_len {
-            let lo = t.saturating_sub(window.saturating_sub(1));
+            let lo = band_lo(t, band);
+            let n = t - lo + 1;
             let d_out_t = &d_out[t * hd + h * head_dim..t * hd + h * head_dim + head_dim];
-            let probs_row = &probs_h[t * t_len..t * t_len + t_len];
-            for s in lo..=t {
+            let probs_row = &probs_h[t * band..t * band + n];
+
+            // dv, and the gradient arriving at each probability.
+            for j in 0..n {
+                let s = lo + j;
                 let v_s = &v[s * hd + h * head_dim..s * hd + h * head_dim + head_dim];
-                let dot: f32 = d_out_t.iter().zip(v_s).map(|(a, b)| a * b).sum();
-                d_probs[t * t_len + s] = dot;
-                let p = probs_row[s];
+                d_probs_row[j] = dot(d_out_t, v_s);
+                let p = probs_row[j];
                 if p != 0.0 {
-                    let dv_s = &mut dv[s * hd + h * head_dim..s * hd + h * head_dim + head_dim];
-                    for d in 0..head_dim {
-                        dv_s[d] += p * d_out_t[d];
-                    }
+                    axpy(&mut dv[s * hd + h * head_dim..s * hd + h * head_dim + head_dim], d_out_t, p);
                 }
             }
-        }
-        // Softmax backward per row, then project into dq/dk.
-        for t in 0..t_len {
-            let lo = t.saturating_sub(window.saturating_sub(1));
-            let probs_row = &probs_h[t * t_len..t * t_len + t_len];
-            let dprobs_row = &d_probs[t * t_len..t * t_len + t_len];
-            let s_sum: f32 = (lo..=t).map(|s| probs_row[s] * dprobs_row[s]).sum();
+
+            // Softmax backward for this row, then project into dq/dk.
+            let s_sum: f32 = (0..n).map(|j| probs_row[j] * d_probs_row[j]).sum();
             let q_t = &q[t * hd + h * head_dim..t * hd + h * head_dim + head_dim];
-            let dq_t = &mut dq[t * hd + h * head_dim..t * hd + h * head_dim + head_dim];
-            for s in lo..=t {
-                let d_score = probs_row[s] * (dprobs_row[s] - s_sum) * scale;
+            for j in 0..n {
+                let d_score = probs_row[j] * (d_probs_row[j] - s_sum) * scale;
                 if d_score == 0.0 {
                     continue;
                 }
+                let s = lo + j;
                 let k_s = &k[s * hd + h * head_dim..s * hd + h * head_dim + head_dim];
-                for d in 0..head_dim {
-                    dq_t[d] += d_score * k_s[d];
-                }
-                let dk_s = &mut dk[s * hd + h * head_dim..s * hd + h * head_dim + head_dim];
-                for d in 0..head_dim {
-                    dk_s[d] += d_score * q_t[d];
-                }
+                axpy(&mut dq[t * hd + h * head_dim..t * hd + h * head_dim + head_dim], k_s, d_score);
+                axpy(&mut dk[s * hd + h * head_dim..s * hd + h * head_dim + head_dim], q_t, d_score);
             }
         }
     }
@@ -524,6 +606,43 @@ mod tests {
         assert_close(&dk, &num_dk, 5e-2, "windowed attention dk");
         let num_dv = numerical_grad(&v, |vv| loss_of(&q, &k, vv), 1e-3);
         assert_close(&dv, &num_dv, 5e-2, "windowed attention dv");
+    }
+
+    #[test]
+    fn banded_probs_cache_is_sized_by_the_window_not_the_context() {
+        // A dense [heads, T, T] cache is what made long-context training
+        // allocate gigabytes; this is the invariant that keeps it linear
+        // in the window.
+        let (t_len, heads, head_dim, window) = (64, 2, 4, 8);
+        let x = vec![0.05f32; t_len * heads * head_dim];
+        let (_, probs) = attention_fwd(&x, &x, &x, t_len, heads, head_dim, window);
+        assert_eq!(probs.len(), heads * t_len * window);
+
+        // A window at or above the context length degenerates to full
+        // causal attention, and the band is then just the context.
+        let (_, full) = attention_fwd(&x, &x, &x, t_len, heads, head_dim, t_len * 4);
+        assert_eq!(full.len(), heads * t_len * t_len);
+    }
+
+    #[test]
+    fn banded_probs_rows_are_normalized_over_the_window() {
+        let (t_len, heads, head_dim, window) = (16, 2, 4, 5);
+        let mut x = vec![0.0f32; t_len * heads * head_dim];
+        for (i, v) in x.iter_mut().enumerate() {
+            *v = ((i % 7) as f32 - 3.0) * 0.3;
+        }
+        let (_, probs) = attention_fwd(&x, &x, &x, t_len, heads, head_dim, window);
+        for h in 0..heads {
+            for t in 0..t_len {
+                let lo = t.saturating_sub(window - 1);
+                let n = t - lo + 1;
+                let row = &probs[h * t_len * window + t * window..h * t_len * window + t * window + window];
+                let sum: f32 = row[..n].iter().sum();
+                assert!((sum - 1.0).abs() < 1e-5, "h={h} t={t} sum={sum}");
+                // Slots past the causal diagonal are never written.
+                assert!(row[n..].iter().all(|&p| p == 0.0), "h={h} t={t} tail not zero");
+            }
+        }
     }
 
     #[test]

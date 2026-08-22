@@ -364,16 +364,37 @@ pub fn forward(weights: &ModelWeights, config: &ModelConfig, tokens: &[u32]) -> 
 }
 
 /// Backward pass given the upstream gradient wrt the logits (from
-/// `ops::cross_entropy`, already mean-reduced over `T`).
+/// `ops::cross_entropy`, already mean-reduced over `T`), allocating a
+/// fresh gradient buffer. Prefer `backward_into` in a training loop.
 pub fn backward(weights: &ModelWeights, config: &ModelConfig, cache: &Cache, d_logits: &[f32]) -> Gradients {
+    let mut grads = Gradients::zeros(config);
+    backward_into(weights, config, cache, d_logits, &mut grads);
+    grads
+}
+
+/// Backward pass that *accumulates* into an existing gradient buffer
+/// (`grads += dL/dw`) instead of returning a new one.
+///
+/// Every write in here is already an accumulate, so summing a batch's
+/// gradients needs no separate per-sequence buffer and no second
+/// add-everything-together pass: the caller zeroes one buffer per step
+/// and each sequence adds straight into it. At real model sizes that
+/// buffer is several MB, and allocating plus zeroing one per sequence per
+/// step was pure garbage-collector pressure inside the hottest loop in
+/// the app.
+pub fn backward_into(
+    weights: &ModelWeights,
+    config: &ModelConfig,
+    cache: &Cache,
+    d_logits: &[f32],
+    grads: &mut Gradients,
+) {
     let t_len = cache.tokens.len();
     let h = config.hidden_dim;
     let heads = config.num_heads;
     let head_dim = config.head_dim();
     let window = config.effective_window();
     let vocab = config.vocab_size();
-
-    let mut grads = Gradients::zeros(config);
 
     // Output head (tied with embed): logits = final_normed @ embed^T.
     let (d_final_normed, d_embed_from_head) =
@@ -463,8 +484,6 @@ pub fn backward(weights: &ModelWeights, config: &ModelConfig, cache: &Cache, d_l
 
     // Input embedding gather (the other half of the tied embed/head gradient).
     scatter_add_rows(&mut grads.embed, &cache.tokens, &d_hidden, h);
-
-    grads
 }
 
 impl LayerCache {

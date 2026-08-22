@@ -60,6 +60,9 @@ pub enum ConfigError {
     HeadsMustDivideHidden { hidden_dim: usize, num_heads: usize },
     HeadDimMustBeEven { head_dim: usize },
     TooSmall { field: &'static str, min: usize },
+    /// The config's training memory can't fit in a 32-bit wasm heap. See
+    /// `MAX_TRAINING_BYTES`.
+    TooLarge { training_bytes: usize, limit: usize },
 }
 
 impl std::fmt::Display for ConfigError {
@@ -76,6 +79,14 @@ impl std::fmt::Display for ConfigError {
             ConfigError::TooSmall { field, min } => {
                 write!(f, "{field} must be at least {min}")
             }
+            ConfigError::TooLarge { training_bytes, limit } => write!(
+                f,
+                "this shape needs about {} MB to train, over the {} MB a browser tab can \
+                 address — reduce context length, attention window, layers, or nodes \
+                 (the attention cache alone costs layers x heads x context x window floats)",
+                training_bytes / (1024 * 1024),
+                limit / (1024 * 1024),
+            ),
         }
     }
 }
@@ -89,6 +100,16 @@ pub fn default_ffn_dim(hidden_dim: usize) -> usize {
     let multiple = 32;
     raw.div_ceil(multiple) * multiple
 }
+
+/// Ceiling on a config's estimated training memory.
+///
+/// wasm32 tops out at a 4 GiB linear heap and browsers refuse to grow one
+/// anywhere near that in practice, so a config past this point doesn't
+/// train slowly — it allocates until the tab dies, and takes the machine
+/// into swap on the way there. Rejecting it up front, with a message that
+/// names the knob to turn, beats letting the UI offer a shape that can
+/// only ever end that way.
+pub const MAX_TRAINING_BYTES: usize = 2 * 1024 * 1024 * 1024;
 
 impl ModelConfig {
     pub fn validate(&self) -> Result<(), ConfigError> {
@@ -116,6 +137,10 @@ impl ModelConfig {
         let head_dim = self.hidden_dim / self.num_heads;
         if head_dim % 2 != 0 {
             return Err(ConfigError::HeadDimMustBeEven { head_dim });
+        }
+        let training_bytes = self.memory_bytes(true);
+        if training_bytes > MAX_TRAINING_BYTES {
+            return Err(ConfigError::TooLarge { training_bytes, limit: MAX_TRAINING_BYTES });
         }
         Ok(())
     }
@@ -155,16 +180,50 @@ impl ModelConfig {
         embedding + self.num_layers * per_layer + final_norm
     }
 
+    /// Bytes of activation memory one training step holds live, f32
+    /// throughout.
+    ///
+    /// This is *not* the rounding error the old estimate implied by
+    /// leaving it out. `forward` keeps a full activation cache for every
+    /// layer because `backward` needs all of it, and the
+    /// attention-probability part of that cache is
+    /// `num_layers * num_heads * context_len * effective_window` floats —
+    /// at a long context that single term dwarfs every parameter in the
+    /// model. Surfacing it is what lets the UI say "this config needs
+    /// 3 GB" *before* the tab dies trying.
+    ///
+    /// Batch size doesn't appear here: `train.rs` runs one sequence at a
+    /// time and accumulates gradients, so a bigger batch costs time, not
+    /// activation memory.
+    pub fn activation_bytes(&self) -> usize {
+        let t = self.context_len;
+        let h = self.hidden_dim;
+        let f = self.ffn_dim();
+        let band = self.effective_window();
+
+        // Per layer, from model.rs's LayerCache: h_after_ple, normed1, q,
+        // k, v, concat, h_after_attn, normed2 (8 x [T,h]), gate and up
+        // (2 x [T,f]), the banded attention probabilities, and the two
+        // per-row inv_rms vectors.
+        let per_layer = 8 * t * h + 2 * t * f + self.num_heads * t * band + 2 * t;
+        // Plus the residual stream and final-norm cache, logits and
+        // d_logits, and - generously - the handful of [T,h]/[T,f]
+        // temporaries backward holds while walking one layer.
+        let shared = 3 * t * h + 2 * t * self.vocab_size() + 6 * t * h + 3 * t * f;
+
+        (self.num_layers * per_layer + shared) * 4
+    }
+
     /// Rough memory estimate in bytes, f32 throughout (WebGPU's baseline
-    /// numeric type). `training` additionally accounts for gradients plus
-    /// Adam's two moment buffers (so ~4x the raw weight bytes), which is
-    /// the dominant cost; per-step activation memory is small at these
-    /// sizes and scales with batch_size * context_len, not shown here.
+    /// numeric type). `training` accounts for gradients plus Adam's two
+    /// moment buffers (~4x the raw weight bytes) *and* the per-step
+    /// activation memory from `activation_bytes`.
     pub fn memory_bytes(&self, training: bool) -> usize {
         let bytes_per_param = 4;
         let weight_bytes = self.param_count() * bytes_per_param;
         if training {
-            weight_bytes * 4 // weights + grad + adam.m + adam.v
+            // weights + grad + adam.m + adam.v, plus one step's activations
+            weight_bytes * 4 + self.activation_bytes()
         } else {
             weight_bytes
         }
@@ -215,24 +274,56 @@ mod tests {
     }
 
     #[test]
+    fn rejects_a_config_too_big_for_a_wasm_heap() {
+        // The largest shape the UI's own input limits allowed: 16 layers,
+        // 1024 nodes, 16 heads, full 4096-token attention. Its activation
+        // cache alone is ~20 GB, which used to be reported to the user as
+        // "3.1 GB while training" and then simply killed the tab.
+        let cfg = ModelConfig { num_layers: 16, hidden_dim: 1024, num_heads: 16, context_len: 4096, local_window: 4096 };
+        assert!(matches!(cfg.validate(), Err(ConfigError::TooLarge { .. })));
+        assert!(ModelConfig::default().validate().is_ok());
+    }
+
+    #[test]
     fn rejects_zero_local_window() {
         let cfg = ModelConfig { local_window: 0, ..Default::default() };
         assert!(matches!(cfg.validate(), Err(ConfigError::TooSmall { field: "local_window", .. })));
     }
 
     #[test]
-    fn training_memory_is_four_x_inference() {
+    fn training_memory_includes_optimizer_state_and_activations() {
         let cfg = ModelConfig::default();
-        assert_eq!(cfg.memory_bytes(true), cfg.memory_bytes(false) * 4);
+        assert_eq!(cfg.memory_bytes(true), cfg.memory_bytes(false) * 4 + cfg.activation_bytes());
+    }
+
+    #[test]
+    fn activation_memory_follows_the_window_not_context_squared() {
+        // The whole point of sliding-window attention: doubling the
+        // context at a fixed window must not quadruple anything.
+        let narrow = ModelConfig { context_len: 2048, local_window: 128, ..Default::default() };
+        let wide = ModelConfig { context_len: 4096, local_window: 128, ..Default::default() };
+        assert!(
+            wide.activation_bytes() < narrow.activation_bytes() * 3,
+            "narrow={} wide={}",
+            narrow.activation_bytes(),
+            wide.activation_bytes()
+        );
+        // ...whereas full attention at that context genuinely is enormous
+        // next to the weights, and the estimate has to say so.
+        let full = ModelConfig { context_len: 4096, local_window: 4096, ..Default::default() };
+        assert!(full.activation_bytes() > 10 * full.memory_bytes(false));
     }
 
     #[test]
     fn small_config_stays_under_a_few_tens_of_mb() {
         let cfg = ModelConfig { num_layers: 4, hidden_dim: 128, num_heads: 4, context_len: 256, local_window: 256 };
         // Byte-level vocab keeps embedding/PLE tables tiny (tens of KB
-        // each); the attention/MLP matrices dominate, but at this size
-        // even full training memory (weights+grad+Adam) stays well under
-        // 20 MB, far below what a browser tab can comfortably hold.
-        assert!(cfg.memory_bytes(true) < 20 * 1024 * 1024);
+        // each); the attention/MLP matrices dominate the weights, and the
+        // per-step activation cache is the same order again at this
+        // context length. Both together still fit comfortably in a browser
+        // tab - unlike the long-context configs the UI also allows, which
+        // is exactly why the estimate counts activations at all.
+        assert!(cfg.memory_bytes(true) < 48 * 1024 * 1024);
+        assert!(cfg.memory_bytes(true) > cfg.memory_bytes(false) * 4);
     }
 }

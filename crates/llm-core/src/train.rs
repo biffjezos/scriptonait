@@ -13,6 +13,10 @@ pub struct Trainer {
     pub config: ModelConfig,
     adam: AdamState,
     rng: Rng,
+    /// Reused across steps - see `model::backward_into`. Allocating this
+    /// per step (let alone per batch element) meant churning several MB
+    /// through the allocator on every single training step.
+    grad_accum: Gradients,
     pub step: u64,
 }
 
@@ -20,7 +24,15 @@ impl Trainer {
     pub fn new(config: ModelConfig, seed: u64) -> Self {
         let weights = ModelWeights::init(&config, seed);
         let adam = AdamState::new(&config);
-        Self { weights, config, adam, rng: Rng::seed_from_u64(seed ^ 0xA5A5_A5A5_A5A5_A5A5), step: 0 }
+        let grad_accum = Gradients::zeros(&config);
+        Self {
+            weights,
+            config,
+            adam,
+            rng: Rng::seed_from_u64(seed ^ 0xA5A5_A5A5_A5A5_A5A5),
+            grad_accum,
+            step: 0,
+        }
     }
 
     /// Samples one batch from `corpus` and runs a full step (forward,
@@ -30,7 +42,7 @@ impl Trainer {
     pub fn train_step(&mut self, corpus: &mut Corpus, batch_size: usize, lr: f32) -> Option<f32> {
         let batch = corpus.sample_batch(batch_size, self.config.context_len, &mut self.rng)?;
         let mut total_loss = 0.0f32;
-        let mut grad_accum = Gradients::zeros(&self.config);
+        self.grad_accum.zero_();
 
         for b in 0..batch.batch_size {
             let start = b * batch.context_len;
@@ -42,11 +54,10 @@ impl Trainer {
                 ops::cross_entropy(&logits, target, batch.context_len, self.config.vocab_size());
             total_loss += loss;
 
-            let grads = model::backward(&self.weights, &self.config, &cache, &d_logits);
-            grad_accum.add_assign(&grads);
+            model::backward_into(&self.weights, &self.config, &cache, &d_logits, &mut self.grad_accum);
         }
-        grad_accum.scale_(1.0 / batch.batch_size as f32);
-        self.adam.step(&mut self.weights, &grad_accum, lr);
+        self.grad_accum.scale_(1.0 / batch.batch_size as f32);
+        self.adam.step(&mut self.weights, &self.grad_accum, lr);
         self.step += 1;
         Some(total_loss / batch.batch_size as f32)
     }
