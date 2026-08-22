@@ -380,6 +380,20 @@ let targetWords = 0;
 // The worker's log, mirrored into the page's console so both are in one
 // place: which device was acquired, what each training step cost, and
 // why a run refused to start.
+// A worker that fails to parse or throws outside a handler used to be
+// invisible: no reply, no error, every call timing out after a minute.
+// It reports itself now, and the page says so.
+worker.addEventListener('error', (event) => {
+  const detail = (event && (event.message || String(event.error))) || 'unknown error';
+  console.error('[scriptonait] worker failed to load or crashed:', detail, event);
+  showError(`the background worker failed: ${detail}`);
+});
+
+onStream('worker-error', ({ message, stack }) => {
+  console.error(`[scriptonait] worker error: ${message}`, stack || '');
+  showError(`worker error: ${message}`);
+});
+
 onStream('log', ({ message, data }) => {
   if (data === null || data === undefined) {
     console.info(`[scriptonait] ${message}`);

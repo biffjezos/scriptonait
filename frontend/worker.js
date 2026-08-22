@@ -17,8 +17,16 @@
 // indistinguishable from a hung one, which is exactly the complaint this
 // rewrite started from.
 
-import init, { WasmLLM, parse_prompt_standalone } from './pkg/wasm_app.js';
-
+// The wasm glue is imported dynamically, inside `ensureWasm`, not with a
+// static top-level `import`.
+//
+// A static import that fails - a missing or stale `pkg/`, a renamed
+// export, a 404 on the .wasm - aborts the whole worker module before
+// `self.onmessage` is ever assigned. The page then gets no reply, no
+// error and no log for anything it asks: every call just times out after
+// a minute. Loading it here instead turns that into an error message
+// naming the file.
+let wasm = null;
 let llm = null;
 let wasmReady = null;
 
@@ -32,6 +40,22 @@ const PROGRESS_INTERVAL_MS = 250;
 function post(type, payload = {}) {
   self.postMessage({ type, ...payload });
 }
+
+// Anything that escapes a handler - or happens outside one - reaches the
+// page instead of dying in a console nobody has open.
+self.addEventListener('error', (event) => {
+  post('worker-error', {
+    message: (event && (event.message || String(event.error))) || 'unknown worker error',
+    stack: (event && event.error && event.error.stack) || '',
+  });
+});
+self.addEventListener('unhandledrejection', (event) => {
+  const reason = event && event.reason;
+  post('worker-error', {
+    message: `unhandled rejection: ${(reason && reason.message) || String(reason)}`,
+    stack: (reason && reason.stack) || '',
+  });
+});
 
 function fail(rid, error) {
   // The stack travels with the message. "Cannot read properties of
@@ -62,7 +86,23 @@ function text(value, what) {
 }
 
 async function ensureWasm() {
-  if (!wasmReady) wasmReady = init();
+  if (!wasmReady) {
+    wasmReady = (async () => {
+      log('loading ./pkg/wasm_app.js');
+      const module = await import('./pkg/wasm_app.js');
+      await module.default();
+      wasm = module;
+      log('wasm module ready');
+    })().catch((error) => {
+      // A failed load must not be cached as a pending promise, or every
+      // later call waits on something that will never resolve.
+      wasmReady = null;
+      throw new Error(
+        `could not load the wasm module (./pkg/wasm_app.js): ${(error && error.message) || error}. ` +
+          'The build in frontend/pkg is missing or does not match this page.',
+      );
+    });
+  }
   await wasmReady;
 }
 
@@ -78,7 +118,7 @@ async function ensureWasm() {
 /// failure mode shorter.
 async function loadModelBytes(bytes) {
   await ensureWasm();
-  llm = WasmLLM.from_checkpoint(new Uint8Array(bytes));
+  llm = wasm.WasmLLM.from_checkpoint(new Uint8Array(bytes));
   await initGpu();
   return describeModel();
 }
@@ -145,7 +185,7 @@ function describeModel() {
 }
 
 function describePrompt(prompt) {
-  const parsed = llm ? llm.parse_prompt(prompt) : parse_prompt_standalone(prompt);
+  const parsed = llm ? llm.parse_prompt(prompt) : wasm.parse_prompt_standalone(prompt);
   return {
     form: parsed.form,
     targetWords: parsed.target_words,
@@ -355,6 +395,21 @@ async function train({ batchSize, learningRate, maxSteps, effort, sampleEvery, s
   };
 }
 
+/// A lost or reset device is the one failure worth naming precisely: it
+/// means a submission ran past the driver's watchdog, and the answer is a
+/// smaller batch or a shorter context, not a retry.
+function describeTrainingFailure(error) {
+  const message = (error && error.message) || String(error);
+  if (/device.*(lost|hung|removed|reset)|DXGI_ERROR|GPUDevice/i.test(message)) {
+    return (
+      `the GPU device was reset mid-step (${message}). That is the driver's watchdog: ` +
+      'the work it was given took too long. Lower the batch size or the context length ' +
+      'and reload the page.'
+    );
+  }
+  return message;
+}
+
 const handlers = {
   async 'load-model'({ bytes }) {
     return loadModelBytes(bytes);
@@ -362,7 +417,9 @@ const handlers = {
 
   async 'create-model'({ layers, hidden, heads, kvHeads, contextLen, window: attentionWindow, seed }) {
     await ensureWasm();
-    llm = new WasmLLM(layers, hidden, heads, kvHeads, contextLen, attentionWindow, seed);
+    log('creating model', { layers, hidden, heads, kvHeads, contextLen, window: attentionWindow });
+    llm = new wasm.WasmLLM(layers, hidden, heads, kvHeads, contextLen, attentionWindow, seed);
+    log('model created; asking for a GPU device');
     await initGpu();
     return describeModel();
   },
@@ -370,7 +427,7 @@ const handlers = {
   async 'import-checkpoint'({ bytes }) {
     await ensureWasm();
     if (!llm) {
-      llm = WasmLLM.from_checkpoint(new Uint8Array(bytes));
+      llm = wasm.WasmLLM.from_checkpoint(new Uint8Array(bytes));
     } else {
       llm.import_checkpoint(new Uint8Array(bytes));
     }
@@ -442,21 +499,6 @@ const handlers = {
     result.notes = llm.qa_check(result.text || '', parsed.targetWords || 0);
     return result;
   },
-
-/// A lost or reset device is the one failure worth naming precisely: it
-/// means a submission ran past the driver's watchdog, and the answer is a
-/// smaller batch or a shorter context, not a retry.
-function describeTrainingFailure(error) {
-  const message = (error && error.message) || String(error);
-  if (/device.*(lost|hung|removed|reset)|DXGI_ERROR|GPUDevice/i.test(message)) {
-    return (
-      `the GPU device was reset mid-step (${message}). That is the driver's watchdog: ` +
-      'the work it was given took too long. Lower the batch size or the context length ' +
-      'and reload the page.'
-    );
-  }
-  return message;
-}
 
   async train(payload) {
     // Training is GPU work. Without a device there is nothing to fall

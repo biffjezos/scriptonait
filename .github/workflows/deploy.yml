@@ -58,6 +58,16 @@ jobs:
         with:
           version: latest
 
+      - name: Parse the frontend as ES modules
+        # A worker that does not parse installs no message handler: the
+        # page then hangs on every call with no error and no log. Node
+        # parses each file as a module here so that never ships.
+        run: |
+          for f in frontend/app.js frontend/worker.js frontend/db.js; do
+            cp "$f" "/tmp/$(basename "$f" .js).mjs"
+            node --check "/tmp/$(basename "$f" .js).mjs"
+          done
+
       - name: Test the engine
         run: cargo test
 
