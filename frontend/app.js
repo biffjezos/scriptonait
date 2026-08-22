@@ -20,10 +20,31 @@ let nextRequestId = 1;
 const pending = new Map();
 const streamHandlers = new Map();
 
-function call(type, payload = {}, transfer = []) {
+// Long jobs (generation, fine-tuning) legitimately run for minutes and
+// opt out with `timeoutMs: 0`. Everything else gets a deadline, because
+// a request that never settles is the worst possible failure: the UI
+// waits forever, shows nothing, and says nothing. That is exactly what
+// happened when the worker's own fetch hung — the page sat on "Loading
+// the model..." and every subsequent action queued up behind it in
+// silence.
+const DEFAULT_TIMEOUT_MS = 60000;
+
+function call(type, payload = {}, transfer = [], timeoutMs = DEFAULT_TIMEOUT_MS) {
   const id = nextRequestId++;
   return new Promise((resolve, reject) => {
-    pending.set(id, { resolve, reject });
+    let timer = null;
+    const settle = (fn) => (value) => {
+      if (timer) clearTimeout(timer);
+      pending.delete(id);
+      fn(value);
+    };
+    pending.set(id, { resolve: settle(resolve), reject: settle(reject) });
+    if (timeoutMs > 0) {
+      timer = setTimeout(() => {
+        pending.delete(id);
+        reject(new Error(`the worker didn't answer "${type}" within ${Math.round(timeoutMs / 1000)}s`));
+      }, timeoutMs);
+    }
     worker.postMessage({ id, type, ...payload }, transfer);
   });
 }
@@ -184,31 +205,59 @@ function renderModel(info) {
     : 'No sources added yet.';
 }
 
-onStream('download-progress', ({ received, total }) => {
-  $('model-progress').hidden = false;
-  const fraction = total > 0 ? received / total : 0;
-  setProgress('model-progress-bar', fraction);
-  const mb = (received / 1e6).toFixed(1);
-  const totalMb = total > 0 ? ` of ${(total / 1e6).toFixed(1)}` : '';
-  setModelStatus('loading', `Downloading the model — ${mb}${totalMb} MB`);
-  setTitleProgress('Loading', fraction);
-});
+/// Download the shipped checkpoint, reporting progress as it streams.
+async function downloadModel(url) {
+  const response = await fetch(url, { cache: 'no-cache' });
+  if (!response.ok) {
+    throw new Error(`no model published at ${url} (HTTP ${response.status})`);
+  }
+  const total = Number(response.headers.get('content-length')) || 0;
+  const reader = response.body && response.body.getReader ? response.body.getReader() : null;
+  if (!reader) {
+    return new Uint8Array(await response.arrayBuffer());
+  }
+  const chunks = [];
+  let received = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    chunks.push(value);
+    received += value.length;
+    const fraction = total > 0 ? received / total : 0;
+    $('model-progress').hidden = false;
+    setProgress('model-progress-bar', fraction);
+    setModelStatus(
+      'loading',
+      `Downloading the model — ${(received / 1e6).toFixed(1)}` +
+        `${total > 0 ? ` of ${(total / 1e6).toFixed(1)}` : ''} MB`,
+    );
+    setTitleProgress('Loading', fraction);
+  }
+  const bytes = new Uint8Array(received);
+  let at = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, at);
+    at += chunk.length;
+  }
+  return bytes;
+}
 
 async function loadModel() {
   try {
-    const info = await call('load-model', { url: MODEL_URL });
-    $('model-progress').hidden = true;
-    setTitleProgress(null);
+    const bytes = await downloadModel(MODEL_URL);
+    // Transferred, not copied: the checkpoint is tens of MB.
+    const info = await call('load-model', { bytes: bytes.buffer }, [bytes.buffer]);
     renderModel(info);
   } catch (error) {
-    $('model-progress').hidden = true;
-    setTitleProgress(null);
     setModelStatus(
       'absent',
-      'No pretrained model is published for this site yet. You can still ' +
-        'load a model file, or create an untrained one, under "The model".',
+      `${error.message}. You can still add your own material below, load a ` +
+        'model file, or create an untrained one under "The model".',
     );
     $('model-panel').open = true;
+  } finally {
+    $('model-progress').hidden = true;
+    setTitleProgress(null);
   }
 }
 
@@ -302,7 +351,7 @@ $('generate-btn').addEventListener('click', async () => {
       seed: Number($('opt-seed').value) || Math.floor(Math.random() * 1e9),
       useStoryState: $('use-story-state').checked,
       useRetrieval: $('use-retrieval').checked,
-    });
+    }, [], 0);
     setProgress('generate-progress-bar', 1);
     const why = {
       'end-of-text': 'the model ended the piece',
@@ -344,6 +393,18 @@ function renderNotes(notes) {
 
 // --- Sources -----------------------------------------------------------
 
+/// Render the source list from IndexedDB.
+///
+/// From the database, not from the model — that distinction is the whole
+/// bug fix here. Adding a source used to mean: write it to IndexedDB,
+/// then await the worker, then re-render. With no model loaded (or a
+/// worker that never answered) the await never returned, so the loop
+/// stopped on the first file, the list never re-rendered, and the only
+/// way to see what had actually been saved was to reload the page.
+/// Uploading thirty files added thirty database rows and displayed one.
+///
+/// Your material belongs to you and to the database. Handing it to the
+/// model is a separate, best-effort step.
 async function refreshSources() {
   const sources = await db.listSources();
   const list = $('sources-list');
@@ -357,6 +418,7 @@ async function refreshSources() {
           <div class="meta">
             <span class="title">${escapeHtml(source.title)}</span>
             <span class="kind-badge">${source.kind}</span>
+            <span class="stats">${formatCount((source.rawText || '').length)} chars</span>
           </div>
           <button type="button" class="secondary remove-source" data-id="${source.id}">Remove</button>
         </div>`,
@@ -365,26 +427,92 @@ async function refreshSources() {
     for (const button of list.querySelectorAll('.remove-source')) {
       button.addEventListener('click', async () => {
         await db.deleteSource(button.dataset.id);
-        renderModel(await call('remove-source', { id: button.dataset.id }));
         await refreshSources();
-        await refreshStoryState();
+        try {
+          renderModel(await call('remove-source', { id: button.dataset.id }));
+          await refreshStoryState();
+        } catch (error) {
+          /* no model: it was only ever in the database anyway */
+        }
       });
     }
   }
   $('train-btn').disabled = !model || sources.length === 0;
+  updateSourceSummary(sources);
 }
 
-async function addSource({ title, kind, rawText, sourceUrl = null }) {
+/// Say how much material is stored, and whether the model has seen it.
+function updateSourceSummary(sources, note = '') {
+  const stats = $('corpus-stats');
+  if (sources.length === 0) {
+    stats.textContent = note || 'No sources added yet.';
+    return;
+  }
+  const chars = sources.reduce((sum, s) => sum + (s.rawText || '').length, 0);
+  const seen = model ? '' : ' — no model loaded yet, so nothing is using them';
+  stats.textContent =
+    `${sources.length} source${sources.length === 1 ? '' : 's'}, ` +
+    `${formatCount(chars)} characters${seen}${note ? ` · ${note}` : ''}`;
+}
+
+/// Hand one stored source to the model. Best effort: with no model
+/// loaded this is expected to fail, and failing here must not stop
+/// anything.
+async function syncSource(source) {
+  try {
+    const result = await call('upsert-source', {
+      id: source.id,
+      text: source.rawText,
+      isHtml: source.kind === 'url',
+    });
+    if (result && result.model) renderModel(result.model);
+    return true;
+  } catch (error) {
+    return false;
+  }
+}
+
+/// Add sources one at a time, reporting progress and surviving
+/// individual failures.
+///
+/// Each entry is a `{ title, kind, read() }`, where `read()` returns the
+/// text. Reading is deferred into this loop on purpose: with thirty
+/// files, reading all thirty before storing any means the list stays
+/// empty for the whole batch, and one unreadable file loses the lot.
+/// Here each file is read, stored, and *rendered* before the next one
+/// starts, so thirty files look like thirty files arriving.
+async function addSources(entries) {
   clearError();
-  const record = await db.addSource({ title, kind, rawText, sourceUrl });
-  const result = await call('upsert-source', {
-    id: record.id,
-    text: rawText,
-    isHtml: kind === 'url',
-  });
-  renderModel(result.model);
+  const failures = [];
+  let added = 0;
+  for (const [index, entry] of entries.entries()) {
+    const progress = entries.length > 1 ? `adding ${index + 1} of ${entries.length}…` : 'adding…';
+    updateSourceSummary(await db.listSources(), progress);
+    try {
+      const rawText = await entry.read();
+      const record = await db.addSource({
+        title: entry.title,
+        kind: entry.kind,
+        rawText,
+        sourceUrl: entry.sourceUrl || null,
+      });
+      added += 1;
+      await refreshSources();
+      await syncSource(record);
+    } catch (error) {
+      failures.push(`${entry.title}: ${error.message}`);
+    }
+  }
   await refreshSources();
   await refreshStoryState();
+  if (failures.length) {
+    showError(
+      failures.length === 1
+        ? `couldn't add ${failures[0]}`
+        : `${failures.length} of ${entries.length} couldn't be added — first was ${failures[0]}`,
+    );
+  }
+  updateSourceSummary(await db.listSources(), added ? `added ${added} just now` : '');
 }
 
 async function refreshStoryState() {
@@ -410,17 +538,19 @@ $('add-paste-btn').addEventListener('click', async () => {
   const text = $('paste-input').value.trim();
   if (!text) return;
   const title = $('paste-title').value.trim() || `Pasted ${new Date().toLocaleString()}`;
-  await addSource({ title, kind: 'paste', rawText: text });
+  await addSources([{ title, kind: 'paste', read: () => text }]);
   $('paste-input').value = '';
   $('paste-title').value = '';
 });
 
 $('file-input').addEventListener('change', async (event) => {
-  for (const file of event.target.files) {
-    const text = await file.text();
-    await addSource({ title: file.name, kind: 'file', rawText: text });
-  }
+  const files = Array.from(event.target.files);
+  // Cleared immediately so picking the same files again still fires a
+  // change event, and so a slow batch can't be submitted twice.
   event.target.value = '';
+  await addSources(
+    files.map((file) => ({ title: file.name, kind: 'file', read: () => file.text() })),
+  );
 });
 
 $('add-url-btn').addEventListener('click', async () => {
@@ -430,7 +560,7 @@ $('add-url-btn').addEventListener('click', async () => {
     const response = await fetch(url);
     if (!response.ok) throw new Error(`the server answered ${response.status}`);
     const text = await response.text();
-    await addSource({ title: url, kind: 'url', rawText: text, sourceUrl: url });
+    await addSources([{ title: url, kind: 'url', read: () => text, sourceUrl: url }]);
     $('url-input').value = '';
   } catch (error) {
     showError(`couldn't fetch that URL (${error.message}). Most sites block cross-origin fetches — paste the text instead.`);
@@ -468,7 +598,7 @@ $('train-btn').addEventListener('click', async () => {
       learningRate: Number($('train-lr').value),
       maxSteps: Number($('train-steps').value),
       effort: Number($('train-effort').value),
-    });
+    }, [], 0);
     if (result.stopReason === 'no-data') {
       showError('there isn\'t enough source text yet to fill even one context window — add more.');
     } else {
@@ -574,27 +704,20 @@ $('create-model-btn').addEventListener('click', async () => {
 // --- Start -------------------------------------------------------------
 
 (async function start() {
+  // Sources render before anything touches the model, so the page is
+  // useful (and visibly alive) even if the model never arrives.
   await refreshSources();
   await loadModel();
-  // Sources persist across reloads, so hand them back to the freshly
-  // loaded model — it has no memory of them.
-  for (const source of await db.listSources()) {
-    try {
-      await call('upsert-source', { id: source.id, text: source.rawText, isHtml: source.kind === 'url' });
-    } catch (error) {
-      // A model that failed to load will reject these; the banner
-      // already says so.
-      break;
-    }
-  }
   if (model) {
-    // The source count and token total changed while those were being
-    // re-fed, so ask the worker for the current numbers.
+    for (const source of await db.listSources()) {
+      await syncSource(source);
+    }
     try {
       renderModel(await call('model-info'));
     } catch (error) {
-      /* the banner already says the model didn't load */
+      /* the banner already says what went wrong */
     }
+    await refreshStoryState();
   }
-  await refreshStoryState();
+  updateSourceSummary(await db.listSources());
 })();

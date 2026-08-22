@@ -42,42 +42,19 @@ async function ensureWasm() {
   await wasmReady;
 }
 
-/// Load the checkpoint the site ships with. A missing one is a normal
-/// state, not an error: the page then offers to train a model instead.
-async function loadShippedModel(url) {
+/// Load the checkpoint the site ships with, from bytes the page already
+/// downloaded.
+///
+/// The download itself deliberately happens on the main thread. It used
+/// to happen here, and that was a bad idea twice over: a worker's fetch
+/// is harder to observe when it misbehaves (a hung one produced no
+/// error, no reply, and an app that sat on "Loading the model..."
+/// forever), and progress reporting has to be relayed back to the page
+/// anyway. Fetching where the progress bar lives is simpler and one
+/// failure mode shorter.
+async function loadModelBytes(bytes) {
   await ensureWasm();
-  const response = await fetch(url);
-  if (!response.ok) {
-    throw new Error(`no pretrained model at ${url} (${response.status})`);
-  }
-  const total = Number(response.headers.get('content-length')) || 0;
-  // Streamed rather than awaited whole, so a 15 MB download over a slow
-  // connection shows a real progress bar instead of a blank page.
-  const chunks = [];
-  let received = 0;
-  const reader = response.body && response.body.getReader ? response.body.getReader() : null;
-  if (reader) {
-    for (;;) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      chunks.push(value);
-      received += value.length;
-      post('download-progress', { received, total });
-    }
-  } else {
-    const buffer = new Uint8Array(await response.arrayBuffer());
-    chunks.push(buffer);
-    received = buffer.length;
-    post('download-progress', { received, total: received });
-  }
-
-  const bytes = new Uint8Array(received);
-  let at = 0;
-  for (const chunk of chunks) {
-    bytes.set(chunk, at);
-    at += chunk.length;
-  }
-  llm = WasmLLM.from_checkpoint(bytes);
+  llm = WasmLLM.from_checkpoint(new Uint8Array(bytes));
   return describeModel();
 }
 
@@ -218,8 +195,8 @@ async function train({ batchSize, learningRate, maxSteps, effort }) {
 }
 
 const handlers = {
-  async 'load-model'({ url }) {
-    return loadShippedModel(url);
+  async 'load-model'({ bytes }) {
+    return loadModelBytes(bytes);
   },
 
   async 'create-model'({ layers, hidden, heads, kvHeads, contextLen, window: attentionWindow, seed }) {
