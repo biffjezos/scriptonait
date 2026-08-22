@@ -2,9 +2,6 @@
 resolver = "2"
 members = [
     "crates/llm-core",
-    "crates/llm-bench",
-    "crates/llm-data",
-    "crates/llm-train",
 ]
 # crates/wasm-app is deliberately NOT a workspace member. It pulls in
 # wasm-bindgen and needs the wasm32 target, so it's its own standalone
@@ -17,10 +14,9 @@ version = "0.1.0"
 edition = "2021"
 license = "MIT"
 
-# Native release builds (llm-core's tests, llm-bench, the llm-train CLI
-# that does the actual pretraining). Speed, not size: nothing built from
-# this workspace is shipped to a browser. `crates/wasm-app` is its own
-# workspace and carries its own profile for the wasm bundle.
+# Native release builds — llm-core's tests. Speed, not size: nothing
+# built from this workspace is shipped to a browser. `crates/wasm-app` is
+# its own workspace and carries its own profile for the wasm bundle.
 [profile.release]
 opt-level = 3
 lto = "thin"

@@ -221,7 +221,10 @@ function updateGuidance() {
   const words = sources.reduce((sum, s) => sum + (s.rawText || '').length, 0);
   const enoughText = words > 4000;
 
-  $('train-btn').disabled = training || sources.length === 0;
+  // Training is GPU work and has no CPU path: with no device the button
+  // is not something to press and find out.
+  const canTrain = !model || model.usingGpu;
+  $('train-btn').disabled = training || sources.length === 0 || (model && !model.usingGpu);
   $('generate-btn').disabled = generating || !model;
 
   $('train-btn').textContent = model
@@ -229,14 +232,16 @@ function updateGuidance() {
     : 'Train a model on my writing';
 
   const explains = $('train-explains');
-  explains.textContent = !model
-    ? 'New model, from scratch. Slow — hours, not minutes.'
-    : model.pretrained
-      ? 'Nudges the loaded model toward your writing.'
-      : 'Continues where it stopped.';
+  explains.textContent = !canTrain
+    ? 'Training needs WebGPU. This browser did not give the page a GPU.'
+    : !model
+      ? 'New model, from scratch, trained on your GPU.'
+      : model.pretrained
+        ? 'Nudges the loaded model toward your writing.'
+        : 'Continues where it stopped.';
 
   if (training) {
-    step.textContent = 'Training. Stop any time — progress is kept.';
+    step.textContent = 'Training on your GPU. Stop any time — progress is kept.';
   } else if (generating) {
     step.textContent = 'Writing…';
   } else if (!model && sources.length === 0) {
@@ -245,6 +250,8 @@ function updateGuidance() {
     step.textContent = `Only ${formatCount(words)} characters. Add more, then train.`;
   } else if (!model) {
     step.textContent = 'Step 2: train.';
+  } else if (!canTrain) {
+    step.textContent = 'No WebGPU here, so this model can write but not train.';
   } else if (model.step < 500) {
     step.textContent = 'Barely trained. Keep training, or try step 3.';
   } else {
@@ -276,13 +283,15 @@ function renderModel(info) {
   // enclosing pair rather than stripping brackets blindly, which left
   // the parentheses unbalanced.
   const device = (info.device || '').trim().replace(/^\((.*)\)$/, '$1').trim();
+  // Training only ever happens on the GPU, so a machine without one is
+  // told that here rather than when it presses Train.
   const where = info.usingGpu
-    ? `writing on your GPU${device ? ` (${device})` : ''}`
-    : 'writing on the CPU — this browser has no WebGPU';
+    ? `training and writing on your GPU${device ? ` (${device})` : ''}`
+    : 'no WebGPU in this browser — it can write on the CPU, but not train';
   setModelStatus(
     'ready',
     info.step > 0
-      ? `Your model: ${params} parameters, trained ${formatCount(info.step)} steps, ${where}.`
+      ? `Your model: ${params} parameters, trained ${info.step.toLocaleString()} steps, ${where}.`
       : `Your model: ${params} parameters, not trained yet, ${where}.`,
   );
   $('model-details').innerHTML = `
@@ -293,8 +302,8 @@ function renderModel(info) {
       <div><dt>Heads</dt><dd>${info.heads} (${info.kvHeads} key/value)</dd></div>
       <div><dt>Context</dt><dd>${info.contextLen} tokens, ${info.window}-token attention window</dd></div>
       <div><dt>Vocabulary</dt><dd>${info.vocabSize} tokens</dd></div>
-      <div><dt>Training steps</dt><dd>${formatCount(info.step)}</dd></div>
-      <div><dt>Generating on</dt><dd>${escapeHtml(info.device || 'CPU')}</dd></div>
+      <div><dt>Training steps</dt><dd>${info.step.toLocaleString()}</dd></div>
+      <div><dt>Training and generating on</dt><dd>${escapeHtml(info.device || 'no GPU — cannot train')}</dd></div>
     </dl>`;
   updateGuidance();
 }
@@ -508,16 +517,38 @@ function newSourceId() {
     : `${Date.now()}-${Math.random().toString(36).slice(2)}`;
 }
 
+// A few hundred sources is a normal amount to load at once, and a few
+// hundred rows is not a list anybody can use: it buries the rest of the
+// page, and every render would rebuild all of it. The list scrolls
+// (capped in CSS), rows above this many are not drawn at all, and the
+// filter is how you reach the ones that aren't.
+const MAX_SOURCE_ROWS = 50;
+let sourceFilter = '';
+
 /// Draw the list from memory. Synchronous on purpose: nothing it needs
 /// can be slow, so nothing can stop it running.
 function renderSources() {
   const list = $('sources-list');
+  const toolbar = $('sources-toolbar');
+  // The filter and Remove all only exist to make a long list usable, so
+  // they stay out of the way of a short one.
+  toolbar.hidden = sources.length <= MAX_SOURCE_ROWS && !sourceFilter;
+  const needle = sourceFilter.toLowerCase();
+  const matches = needle
+    ? sources.filter((source) => (source.title || '').toLowerCase().includes(needle))
+    : sources;
+
   if (sources.length === 0) {
     list.innerHTML = '<p class="empty-hint">Nothing added yet.</p>';
+  } else if (matches.length === 0) {
+    list.innerHTML = `<p class="empty-hint">No source matches "${escapeHtml(sourceFilter)}".</p>`;
   } else {
-    list.innerHTML = sources
-      .map(
-        (source) => `
+    const shown = matches.slice(0, MAX_SOURCE_ROWS);
+    const hidden = matches.length - shown.length;
+    list.innerHTML =
+      shown
+        .map(
+          (source) => `
         <div class="source-item" data-id="${source.id}">
           <div class="meta">
             <span class="title">${escapeHtml(source.title)}</span>
@@ -526,15 +557,49 @@ function renderSources() {
           </div>
           <button type="button" class="secondary remove-source" data-id="${source.id}">Remove</button>
         </div>`,
-      )
-      .join('');
-    for (const button of list.querySelectorAll('.remove-source')) {
-      button.addEventListener('click', () => removeSource(button.dataset.id));
-    }
+        )
+        .join('') +
+      (hidden > 0
+        ? `<p class="empty-hint">${hidden.toLocaleString()} more not shown — filter by name to reach them.</p>`
+        : '');
   }
   updateSourceSummary(sources);
   updateGuidance();
 }
+
+// One listener on the container instead of one per row: with hundreds of
+// sources, re-binding a button per row on every render is the expensive
+// part of drawing the list.
+$('sources-list').addEventListener('click', (event) => {
+  const button = event.target.closest('.remove-source');
+  if (button) removeSource(button.dataset.id);
+});
+
+$('sources-filter').addEventListener('input', (event) => {
+  sourceFilter = event.target.value.trim();
+  renderSources();
+});
+
+$('remove-all-btn').addEventListener('click', async () => {
+  if (sources.length === 0) return;
+  if (!confirm(`Remove all ${sources.length.toLocaleString()} sources? This can't be undone.`)) {
+    return;
+  }
+  const removed = sources;
+  sources = [];
+  sourceFilter = '';
+  $('sources-filter').value = '';
+  renderSources();
+  for (const source of removed) {
+    await persist('deleting a source', () => db.deleteSource(source.id));
+    try {
+      renderModel(await call('remove-source', { id: source.id }));
+    } catch (error) {
+      /* no model loaded: it was only ever in the list */
+    }
+  }
+  await refreshStoryState();
+});
 
 async function removeSource(id) {
   sources = sources.filter((source) => source.id !== id);
@@ -671,6 +736,17 @@ async function addSources(entries) {
   updateSourceSummary(sources, added ? `added ${added}` : '');
 }
 
+// Across a few hundred sources these run to thousands of entries, and a
+// paragraph of comma-separated names tells nobody anything. Show the
+// first handful and count the rest.
+const MAX_NAMES_SHOWN = 25;
+
+function nameList(names) {
+  const shown = names.slice(0, MAX_NAMES_SHOWN);
+  const hidden = names.length - shown.length;
+  return escapeHtml(shown.join(', ')) + (hidden > 0 ? ` <span class="hint">+${hidden.toLocaleString()} more</span>` : '');
+}
+
 async function refreshStoryState() {
   const box = $('story-state');
   try {
@@ -680,8 +756,8 @@ async function refreshStoryState() {
       return;
     }
     const parts = [];
-    if (state.characters.length) parts.push(`<strong>Characters:</strong> ${escapeHtml(state.characters.join(', '))}`);
-    if (state.locations.length) parts.push(`<strong>Locations:</strong> ${escapeHtml(state.locations.join(', '))}`);
+    if (state.characters.length) parts.push(`<strong>Characters:</strong> ${nameList(state.characters)}`);
+    if (state.locations.length) parts.push(`<strong>Locations:</strong> ${nameList(state.locations)}`);
     if (state.sceneCount) parts.push(`<strong>Scenes:</strong> ${state.sceneCount}`);
     box.innerHTML = `${parts.join('<br />')}<p class="hint">Found by looking at line shapes, not by understanding the text — unusual formatting can fool it.</p>`;
     box.hidden = false;
@@ -730,28 +806,32 @@ const lossHistory = [];
 onStream('train-progress', (progress) => {
   setProgress('train-progress-bar', progress.fractionDone);
   $('train-stats').textContent =
-    `step ${formatCount(progress.step)} · loss ${progress.smoothedLoss.toFixed(3)} · ` +
+    `step ${progress.step.toLocaleString()} · loss ${progress.smoothedLoss.toFixed(3)} · ` +
     `${progress.tokensPerSecond.toFixed(0)} tokens/s · ${formatDuration(progress.elapsedSeconds)} elapsed`;
   setTitleProgress('Fine-tuning', progress.fractionDone);
   lossHistory.push(progress.smoothedLoss);
   drawLossChart();
 });
 
-// Samples from the model as it trains, newest first, so the top of the
-// list is always the current state of the writing.
+// Samples from the model as it trains. Exactly one card, rewritten in
+// place every time a sample arrives: `replaceChildren` runs on every
+// event, so the box holds this card and nothing else no matter what was
+// in it before. Never append - a stack of stale samples buries the only
+// one worth reading, which is the current one.
 onStream('train-sample', ({ step, loss, text }) => {
   const box = $('train-samples');
-  const block = document.createElement('div');
-  block.className = 'train-sample';
-  const head = document.createElement('div');
-  head.className = 'train-sample-head';
-  head.textContent = `step ${formatCount(step)}` +
-    (typeof loss === 'number' ? ` · loss ${loss.toFixed(3)}` : '');
-  const body = document.createElement('pre');
-  body.textContent = text;
-  block.append(head, body);
-  box.prepend(block);
-  while (box.children.length > 20) box.lastElementChild.remove();
+  let block = box.firstElementChild;
+  if (!block || box.children.length !== 1) {
+    block = document.createElement('div');
+    block.className = 'train-sample';
+    const head = document.createElement('div');
+    head.className = 'train-sample-head';
+    block.append(head, document.createElement('pre'));
+  }
+  block.firstElementChild.textContent = `step ${step.toLocaleString()}` +
+    (typeof loss === 'number' ? ` \u00b7 loss ${loss.toFixed(3)}` : '');
+  block.lastElementChild.textContent = text;
+  box.replaceChildren(block);
 });
 
 $('train-btn').addEventListener('click', async () => {
@@ -803,7 +883,13 @@ $('train-btn').addEventListener('click', async () => {
       sampleWords: 40,
     }, [], 0);
 
-    if (result.stopReason === 'no-data') {
+    if (result.stopReason === 'no-gpu') {
+      showError(
+        'Training runs on your GPU, and this browser did not give the page one. ' +
+          'Try a browser with WebGPU (Chrome or Edge 113+, Safari 18+), or enable it in ' +
+          "your browser's flags.",
+      );
+    } else if (result.stopReason === 'no-data') {
       showError('Not enough text to train on. Add more in step 1.');
     } else {
       setProgress('train-progress-bar', 1);

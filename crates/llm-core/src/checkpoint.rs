@@ -34,9 +34,9 @@
 //! rounding across a resume.
 //!
 //! Optimizer state is deliberately *not* here: it is three times the
-//! size of the weights and only a resuming trainer wants it (see
-//! `llm-train`, which writes it to a separate file that CI caches rather
-//! than commits).
+//! size of the weights, and the GPU trainer keeps it in device memory
+//! for the life of the run rather than round-tripping it through a
+//! file.
 
 use crate::config::ModelConfig;
 use crate::model::ModelWeights;

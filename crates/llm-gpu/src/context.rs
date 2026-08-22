@@ -24,7 +24,26 @@ pub struct Pipelines {
     pub rmsnorm: Kernel,
     pub rope: Kernel,
     pub attention_decode: Kernel,
+    pub attention_fwd: Kernel,
     pub swiglu: Kernel,
+    // Training. Generation never dispatches any of these, but they are
+    // compiled with everything else: pipeline creation is where a WGSL
+    // error surfaces, and finding out that the backward pass does not
+    // compile at the end of the first training step is finding out too
+    // late.
+    pub linear_bwd_dw: Kernel,
+    pub linear_bwd_dx: Kernel,
+    pub rmsnorm_bwd_dx: Kernel,
+    pub rmsnorm_bwd_dgain: Kernel,
+    pub swiglu_bwd: Kernel,
+    pub attention_bwd_dscore: Kernel,
+    pub attention_bwd_dq: Kernel,
+    pub attention_bwd_dkdv: Kernel,
+    pub embedding_scatter_add: Kernel,
+    pub cross_entropy: Kernel,
+    pub adam_update: Kernel,
+    pub zero: Kernel,
+    pub reduce: Kernel,
 }
 
 /// A recycled pool of tiny uniform buffers, one per dispatch.
@@ -174,7 +193,61 @@ impl GpuContext {
                 "attention_decode",
                 include_str!("shaders/attention_decode.wgsl"),
             ),
+            attention_fwd: make_pipeline(
+                &device,
+                "attention_fwd",
+                include_str!("shaders/attention_fwd.wgsl"),
+            ),
             swiglu: make_pipeline(&device, "swiglu", include_str!("shaders/swiglu.wgsl")),
+            linear_bwd_dw: make_pipeline(
+                &device,
+                "linear_bwd_dw",
+                include_str!("shaders/linear_bwd_dw.wgsl"),
+            ),
+            linear_bwd_dx: make_pipeline(
+                &device,
+                "linear_bwd_dx",
+                include_str!("shaders/linear_bwd_dx.wgsl"),
+            ),
+            rmsnorm_bwd_dx: make_pipeline(
+                &device,
+                "rmsnorm_bwd_dx",
+                include_str!("shaders/rmsnorm_bwd_dx.wgsl"),
+            ),
+            rmsnorm_bwd_dgain: make_pipeline(
+                &device,
+                "rmsnorm_bwd_dgain",
+                include_str!("shaders/rmsnorm_bwd_dgain.wgsl"),
+            ),
+            swiglu_bwd: make_pipeline(&device, "swiglu_bwd", include_str!("shaders/swiglu_bwd.wgsl")),
+            attention_bwd_dscore: make_pipeline(
+                &device,
+                "attention_bwd_dscore",
+                include_str!("shaders/attention_bwd_dscore.wgsl"),
+            ),
+            attention_bwd_dq: make_pipeline(
+                &device,
+                "attention_bwd_dq",
+                include_str!("shaders/attention_bwd_dq.wgsl"),
+            ),
+            attention_bwd_dkdv: make_pipeline(
+                &device,
+                "attention_bwd_dkdv",
+                include_str!("shaders/attention_bwd_dkdv.wgsl"),
+            ),
+            embedding_scatter_add: make_pipeline(
+                &device,
+                "embedding_scatter_add",
+                include_str!("shaders/embedding_scatter_add.wgsl"),
+            ),
+            cross_entropy: make_pipeline(
+                &device,
+                "cross_entropy",
+                include_str!("shaders/cross_entropy.wgsl"),
+            ),
+            adam_update: make_pipeline(&device, "adam_update", include_str!("shaders/adam_update.wgsl")),
+            zero: make_pipeline(&device, "zero", include_str!("shaders/zero.wgsl")),
+            reduce: make_pipeline(&device, "reduce", include_str!("shaders/reduce.wgsl")),
         };
 
         let info = adapter.get_info();

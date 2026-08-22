@@ -48,18 +48,35 @@ pub fn supports(config: &ModelConfig) -> bool {
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
-struct P4 {
-    a: u32,
-    b: u32,
-    c: u32,
-    d: u32,
+pub(crate) struct P4 {
+    pub a: u32,
+    pub b: u32,
+    pub c: u32,
+    pub d: u32,
 }
 
-fn ceil_div(a: usize, b: usize) -> u32 {
+/// The eight-word parameter block, for kernels that need more than four
+/// values. A uniform struct's size has to be a multiple of 16 bytes, so
+/// the choices are four words or eight; the pool's slots are sized for
+/// the larger one.
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+pub(crate) struct P8 {
+    pub a: u32,
+    pub b: u32,
+    pub c: u32,
+    pub d: u32,
+    pub e: u32,
+    pub f: u32,
+    pub g: u32,
+    pub h: u32,
+}
+
+pub(crate) fn ceil_div(a: usize, b: usize) -> u32 {
     ((a + b - 1) / b) as u32
 }
 
-fn dispatch(
+pub(crate) fn dispatch(
     encoder: &mut wgpu::CommandEncoder,
     ctx: &GpuContext,
     kernel: &Kernel,
@@ -81,7 +98,7 @@ fn dispatch(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn dispatch_linear(
+pub(crate) fn dispatch_linear(
     encoder: &mut wgpu::CommandEncoder,
     ctx: &GpuContext,
     x: &wgpu::Buffer,
@@ -113,7 +130,7 @@ fn dispatch_linear(
     );
 }
 
-fn dispatch_add_inplace(
+pub(crate) fn dispatch_add_inplace(
     encoder: &mut wgpu::CommandEncoder,
     ctx: &GpuContext,
     dst: &wgpu::Buffer,
@@ -178,7 +195,7 @@ fn dispatch_rope(
     let params = ctx.params.alloc(
         &ctx.device,
         &ctx.queue,
-        P4 { a: 1, b: heads as u32, c: head_dim as u32, d: pos as u32 },
+        P8 { a: 1, b: heads as u32, c: head_dim as u32, d: pos as u32, e: 0, f: 0, g: 0, h: 0 },
     );
     let entries = [
         wgpu::BindGroupEntry { binding: 0, resource: params.as_entire_binding() },
@@ -187,7 +204,7 @@ fn dispatch_rope(
     dispatch(encoder, ctx, &ctx.pipelines.rope, &entries, (1, ceil_div(heads, 8), 1));
 }
 
-fn dispatch_swiglu(
+pub(crate) fn dispatch_swiglu(
     encoder: &mut wgpu::CommandEncoder,
     ctx: &GpuContext,
     gate: &wgpu::Buffer,

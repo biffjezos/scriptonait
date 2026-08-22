@@ -85,10 +85,10 @@ async function loadModelBytes(bytes) {
 
 /// Ask for a WebGPU device and upload the weights to it.
 ///
-/// Not a setting and not a fallback the user has to think about: if the
-/// browser has WebGPU, generation runs there; if it doesn't, it runs on
-/// the CPU. Either way the page says which. A failure here is normal —
-/// browsers without WebGPU exist — so it's reported, not thrown.
+/// This is what training runs on, and there is no second path: without a
+/// device the page can still generate (on the CPU) but cannot train.
+/// A failure is reported rather than thrown, so the page can say which
+/// of the two it is looking at.
 async function initGpu() {
   if (!llm) return;
   try {
@@ -192,9 +192,9 @@ async function generate({ prompt, extraContext, temperature, topK, topP, repetit
 /// Uses the ordinary generation path, stopped by its own callback once
 /// enough words have arrived — the model is mid-training, so this is
 /// about hearing where it has got to, not producing anything finished.
-/// It runs on the CPU: the GPU copy of the weights is the one uploaded
-/// before training started, and `generate` already declines to use a
-/// stale copy.
+/// `generate` pulls the freshly trained weights off the GPU first, so a
+/// sample shows the model as it is at this step rather than as it was
+/// when training started.
 async function trainingSample(prompt, words) {
   const result = await llm.generate(
     prompt,
@@ -228,7 +228,7 @@ async function train({ batchSize, learningRate, maxSteps, effort, sampleEvery, s
     const sliceStart = performance.now();
     // Work for a slice...
     while (performance.now() - sliceStart < sliceMs) {
-      const report = llm.train_step(batchSize);
+      const report = await llm.train_step(batchSize);
       if (!report) {
         return { steps, stopReason: 'no-data', elapsedSeconds: (performance.now() - startedAt) / 1000 };
       }
@@ -315,7 +315,7 @@ const handlers = {
   },
 
   async 'export-checkpoint'() {
-    const bytes = llm.export_checkpoint();
+    const bytes = await llm.export_checkpoint();
     return { bytes: bytes.buffer, byteLength: bytes.length };
   },
 
@@ -380,6 +380,11 @@ const handlers = {
   },
 
   async train(payload) {
+    // Training is GPU work. Without a device there is nothing to fall
+    // back to, so say which of the two reasons stopped it.
+    if (!llm.has_gpu()) {
+      return { steps: 0, stopReason: 'no-gpu', elapsedSeconds: 0 };
+    }
     if (!llm.can_train()) {
       return { steps: 0, stopReason: 'no-data', elapsedSeconds: 0 };
     }
