@@ -92,13 +92,15 @@ impl WasmLLM {
             num_heads: num_heads as usize,
             context_len: context_len as usize,
             local_window: local_window as usize,
-            // Multi-head attention and no per-layer embeddings until
-            // step 8 rebuilds this constructor around the shipped
-            // checkpoint, which carries its own shape.
+            // Multi-head attention and the defaults for everything else
+            // until step 8 rebuilds this constructor around the shipped
+            // checkpoint, which carries its own shape. `..Default` is
+            // load-bearing: this crate can't be compiled in the dev
+            // sandbox (no wasm32 target, no crates.io route), so a full
+            // literal here turns every new ModelConfig field into a
+            // CI-only build failure.
             num_kv_heads: num_heads as usize,
-            // Byte level for now; step 8 replaces this constructor with
-            // one that loads the shipped tokenizer and takes its vocab.
-            vocab_size: llm_core::tokenizer::BASE_VOCAB_SIZE,
+            ..Default::default()
         };
         config.validate().map_err(js_err)?;
         let trainer = Trainer::new(config, seed as u64);
