@@ -120,14 +120,14 @@ pub(crate) fn dispatch_linear(
         wgpu::BindGroupEntry { binding: 2, resource: w.as_entire_binding() },
         wgpu::BindGroupEntry { binding: 3, resource: y.as_entire_binding() },
     ];
-    // gid.x indexes out_dim, gid.y indexes rows — matches
-    // shaders/linear.wgsl's dispatch convention.
+    // One workgroup per 64x64 output tile: gid.x covers out_dim, gid.y
+    // covers rows, matching shaders/linear.wgsl.
     dispatch(
         encoder,
         ctx,
         &ctx.pipelines.linear,
         &entries,
-        (ceil_div(out_dim, 16), ceil_div(rows, 16), 1),
+        (ceil_div(out_dim, 64), ceil_div(rows, 64), 1),
     );
 }
 

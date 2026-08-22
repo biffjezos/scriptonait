@@ -1183,12 +1183,14 @@ impl GpuTrainer {
             wgpu::BindGroupEntry { binding: 2, resource: x.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 3, resource: dw.as_entire_binding() },
         ];
+        // gid.x covers in_dim, gid.y covers out_dim, both in 64-wide
+        // tiles - see shaders/linear_bwd_dw.wgsl.
         dispatch(
             chunks.enc(),
             ctx,
             &ctx.pipelines.linear_bwd_dw,
             &entries,
-            (ceil_div(in_dim, 16), ceil_div(out_dim, 16), 1),
+            (ceil_div(in_dim, 64), ceil_div(out_dim, 64), 1),
         );
     }
 
@@ -1215,12 +1217,13 @@ impl GpuTrainer {
             wgpu::BindGroupEntry { binding: 2, resource: w.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 3, resource: dx.as_entire_binding() },
         ];
+        // gid.x covers in_dim, gid.y covers rows, both in 64-wide tiles.
         dispatch(
             chunks.enc(),
             ctx,
             &ctx.pipelines.linear_bwd_dx,
             &entries,
-            (ceil_div(in_dim, 16), ceil_div(rows, 16), 1),
+            (ceil_div(in_dim, 64), ceil_div(rows, 64), 1),
         );
     }
 
