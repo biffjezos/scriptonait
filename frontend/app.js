@@ -282,7 +282,7 @@ function renderModel(info) {
   setModelStatus(
     'ready',
     info.step > 0
-      ? `Your model: ${params} parameters, trained ${formatCount(info.step)} steps, ${where}.`
+      ? `Your model: ${params} parameters, trained ${info.step.toLocaleString()} steps, ${where}.`
       : `Your model: ${params} parameters, not trained yet, ${where}.`,
   );
   $('model-details').innerHTML = `
@@ -293,7 +293,7 @@ function renderModel(info) {
       <div><dt>Heads</dt><dd>${info.heads} (${info.kvHeads} key/value)</dd></div>
       <div><dt>Context</dt><dd>${info.contextLen} tokens, ${info.window}-token attention window</dd></div>
       <div><dt>Vocabulary</dt><dd>${info.vocabSize} tokens</dd></div>
-      <div><dt>Training steps</dt><dd>${formatCount(info.step)}</dd></div>
+      <div><dt>Training steps</dt><dd>${info.step.toLocaleString()}</dd></div>
       <div><dt>Generating on</dt><dd>${escapeHtml(info.device || 'CPU')}</dd></div>
     </dl>`;
   updateGuidance();
@@ -730,7 +730,7 @@ const lossHistory = [];
 onStream('train-progress', (progress) => {
   setProgress('train-progress-bar', progress.fractionDone);
   $('train-stats').textContent =
-    `step ${formatCount(progress.step)} · loss ${progress.smoothedLoss.toFixed(3)} · ` +
+    `step ${progress.step.toLocaleString()} · loss ${progress.smoothedLoss.toFixed(3)} · ` +
     `${progress.tokensPerSecond.toFixed(0)} tokens/s · ${formatDuration(progress.elapsedSeconds)} elapsed`;
   setTitleProgress('Fine-tuning', progress.fractionDone);
   lossHistory.push(progress.smoothedLoss);
@@ -752,7 +752,7 @@ onStream('train-sample', ({ step, loss, text }) => {
     block.append(head, body);
     box.replaceChildren(block);
   }
-  block.firstElementChild.textContent = `step ${formatCount(step)}` +
+  block.firstElementChild.textContent = `step ${step.toLocaleString()}` +
     (typeof loss === 'number' ? ` \u00b7 loss ${loss.toFixed(3)}` : '');
   block.lastElementChild.textContent = text;
 });
