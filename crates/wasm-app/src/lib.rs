@@ -67,6 +67,9 @@ struct Inner {
     /// `sync_from_gpu` when something needs it here.
     weights: ModelWeights,
     step: u64,
+    /// The seed the model was built from, so a rebuild at a new
+    /// vocabulary size starts from the same place.
+    seed: u64,
     /// Batch sampling only — which sequences to train on, not any part
     /// of the arithmetic.
     rng: Rng,
@@ -228,6 +231,7 @@ impl WasmLLM {
             config: checkpoint.config,
             weights: checkpoint.weights,
             step: checkpoint.step,
+            seed: 1,
             rng: Rng::seed_from_u64(1),
             corpus: Corpus::with_tokenizer(checkpoint.tokenizer),
             gpu: None,
@@ -273,6 +277,7 @@ impl WasmLLM {
             config,
             weights: ModelWeights::init(&config, seed as u64),
             step: 0,
+            seed: seed as u64,
             rng: Rng::seed_from_u64(seed as u64),
             corpus: Corpus::with_tokenizer(tokenizer),
             gpu: None,
@@ -590,6 +595,40 @@ impl WasmLLM {
 
     pub fn total_tokens(&self) -> f64 {
         self.0.borrow().corpus.total_tokens() as f64
+    }
+
+    /// Learn a BPE vocabulary from the loaded sources and re-encode them
+    /// with it. Returns the new vocabulary size, or 0 when there is no
+    /// text yet.
+    ///
+    /// Must happen before a model is created: the vocabulary size fixes
+    /// the embedding table. Without it every token is one byte, which
+    /// costs about four times the tokens - and therefore four times the
+    /// training time - for the same text.
+    pub fn learn_vocabulary(&self, target_vocab_size: u32) -> u32 {
+        let inner = &mut *self.0.borrow_mut();
+        let current = inner.corpus.tokenizer().vocab_size() as u32;
+        // A trained model's weights are indexed by the vocabulary that
+        // trained them: changing it would make every token id mean
+        // something else.
+        if inner.step > 0 || inner.pretrained {
+            return current;
+        }
+        let Some(size) = inner.corpus.learn_vocabulary(target_vocab_size as usize) else {
+            return current;
+        };
+        // The embedding table is one row per token, so a new vocabulary
+        // is a new model. It has not been trained yet, so nothing is lost.
+        inner.config.vocab_size = size;
+        inner.weights = ModelWeights::init(&inner.config, inner.seed);
+        // Both the uploaded generation weights and the resident training
+        // state belong to the old shape.
+        inner.gpu = None;
+        size as u32
+    }
+
+    pub fn vocab_size(&self) -> u32 {
+        self.0.borrow().corpus.tokenizer().vocab_size() as u32
     }
 
     /// Whether a training step can run: enough source text to fill a

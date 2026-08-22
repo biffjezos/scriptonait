@@ -500,6 +500,25 @@ const handlers = {
     return result;
   },
 
+  /// Learn a BPE vocabulary from the loaded sources, then rebuild the
+  /// (untrained) model and its GPU state around it.
+  async 'learn-vocabulary'({ targetVocabSize = 4096 }) {
+    const before = llm.vocab_size();
+    const started = performance.now();
+    const size = llm.learn_vocabulary(targetVocabSize);
+    if (size === before) {
+      log(`vocabulary unchanged (${size} tokens) - a trained model keeps the one it learned with`);
+      return { vocabSize: size, changed: false };
+    }
+    log(
+      `learned a ${size}-token vocabulary from your sources in ` +
+        `${(performance.now() - started).toFixed(0)} ms (was ${before}); ` +
+        'the model was rebuilt around it',
+    );
+    await initGpu();
+    return { vocabSize: size, changed: true, model: describeModel() };
+  },
+
   async train(payload) {
     // Training is GPU work. Without a device there is nothing to fall
     // back to, so say which of the two reasons stopped it.

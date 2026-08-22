@@ -924,6 +924,14 @@ $('train-btn').addEventListener('click', async () => {
         }),
       );
       await syncAllSources();
+      // Learn the vocabulary from the text now, while the model is still
+      // untrained: one token per byte costs about four times the tokens,
+      // and therefore four times the training time, for the same text.
+      // The embedding table is one row per token, so this has to happen
+      // before training starts, and it rebuilds the model.
+      $('train-stats').textContent = 'Learning a vocabulary from your text…';
+      const learned = await call('learn-vocabulary', { targetVocabSize: 4096 }, [], 0);
+      if (learned && learned.model) renderModel(learned.model);
     }
 
     const fromScratch = model && !model.pretrained;
