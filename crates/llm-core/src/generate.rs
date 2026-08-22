@@ -25,6 +25,16 @@ pub fn generate(
     seed: u64,
 ) -> String {
     let mut tokens = tokenizer::encode(prompt);
+    // An empty prompt would otherwise leave `tokens` empty, so the very
+    // first window is empty too and the loop below exits before generating
+    // anything (see `window.is_empty()`). BOS is what every training
+    // window actually starts with (`tokenizer::wrap_with_boundaries`), so
+    // it's a real, trained "start of document" signal to condition on
+    // instead of an arbitrary filler token - and `decode` drops it from
+    // the output, so it never shows up in the generated text.
+    if tokens.is_empty() {
+        tokens.push(tokenizer::BOS);
+    }
     let mut rng = Rng::seed_from_u64(seed);
     let vocab = config.vocab_size();
 
@@ -121,9 +131,13 @@ mod tests {
 
     #[test]
     fn empty_prompt_still_generates() {
+        // Regression test: an empty prompt used to leave `tokens` empty,
+        // so the generation loop's first window was empty too and it
+        // exited immediately - silently returning "" instead of actually
+        // generating anything (see the BOS-seeding fix above).
         let config = tiny_config();
         let weights = ModelWeights::init(&config, 3);
-        let out = generate(&weights, &config, "", 4, 0.7, 5);
-        assert!(out.len() <= 4);
+        let out = generate(&weights, &config, "", 4, 0.0, 5);
+        assert!(!out.is_empty(), "empty prompt should still produce output");
     }
 }
