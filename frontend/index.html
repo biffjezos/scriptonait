@@ -15,9 +15,23 @@
     </p>
     <!-- The status line is the first thing on the page on purpose: the
          old version left you guessing whether anything was happening. -->
-    <div id="model-status" class="model-status loading">
-      <span id="model-status-text">Loading the model…</span>
+    <div id="model-status" class="model-status absent">
+      <span id="model-status-text">No model loaded.</span>
       <div class="progress" id="model-progress" hidden><div class="bar" id="model-progress-bar"></div></div>
+      <div class="row">
+        <button id="load-model-btn" type="button">Load the writing model (18 MB)</button>
+        <label class="file-btn">
+          Load a model file
+          <input type="file" id="import-input" accept=".ckpt,.bin" hidden />
+        </label>
+      </div>
+      <p class="hint">
+        Nothing is downloaded until you press that. It fetches one file —
+        <code>model/scriptonait.ckpt</code>, from this site — which is the
+        model trained on the public-domain books listed in
+        <code>corpus/manifest.tsv</code>. You can also add your own
+        material below and use it without any model at all.
+      </p>
     </div>
   </header>
 
@@ -179,10 +193,6 @@
       <div id="model-details" class="model-details"></div>
       <div class="row">
         <button id="export-btn" type="button" class="secondary">Download this model</button>
-        <label class="file-btn">
-          Load a model file
-          <input type="file" id="import-input" accept=".ckpt,.bin" hidden />
-        </label>
       </div>
       <p class="hint">
         A model file carries its own tokenizer, so it's the only thing you

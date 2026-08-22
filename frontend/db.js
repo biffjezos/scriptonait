@@ -115,6 +115,17 @@ function newId() {
 // what those tags were a crude stand-in for. `tags` stays in the record
 // shape so databases written by the old version still load.
 
+/// Store a record the caller already built, id and all.
+///
+/// The caller owns the id because the caller owns the list: the page
+/// keeps its sources in memory and shows them immediately, and this is
+/// only how they survive a reload. If this minted its own id the two
+/// copies would disagree about what to remove.
+export async function putSource(record) {
+  await withStore(SOURCES_STORE, 'readwrite', (store) => store.put(record));
+  return record;
+}
+
 export async function addSource({ title, kind, rawText, sourceUrl = null, tags = {} }) {
   const now = Date.now();
   const record = { id: newId(), title, kind, rawText, sourceUrl, tags, createdAt: now, updatedAt: now };
