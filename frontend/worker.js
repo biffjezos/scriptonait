@@ -33,12 +33,12 @@ function post(type, payload = {}) {
   self.postMessage({ type, ...payload });
 }
 
-function fail(id, error) {
+function fail(rid, error) {
   // The stack travels with the message. "Cannot read properties of
   // undefined" is useless on its own; the same error with a frame in it
   // names the call that did it, and the page shows both.
   post('error', {
-    id,
+    rid,
     message: error && error.message ? error.message : String(error),
     stack: (error && error.stack) || '',
   });
@@ -345,26 +345,30 @@ const handlers = {
 };
 
 self.onmessage = async (event) => {
-  const { id, type, ...payload } = event.data || {};
+  // `rid` is the request id and `payload` is the message's own data.
+  // They are separate fields because they used to be spread into one
+  // object, where a payload key called `id` silently replaced the
+  // request id.
+  const { rid, type, payload = {} } = event.data || {};
   const handler = handlers[type];
   if (!handler) {
-    fail(id, new Error(`unknown message ${type}`));
+    fail(rid, new Error(`unknown message ${type}`));
     return;
   }
   // Everything except `stop` needs a model; saying so beats a wasm panic.
   if (!llm && !['load-model', 'create-model', 'import-checkpoint', 'parse-prompt', 'stop'].includes(type)) {
-    fail(id, new Error('no model loaded yet'));
+    fail(rid, new Error('no model loaded yet'));
     return;
   }
   try {
     const result = await handler(payload);
     if (result && result.bytes instanceof ArrayBuffer) {
       // Transfer rather than copy: an exported checkpoint is tens of MB.
-      self.postMessage({ type: 'result', id, result }, [result.bytes]);
+      self.postMessage({ type: 'result', rid, result }, [result.bytes]);
     } else {
-      post('result', { id, result });
+      post('result', { rid, result });
     }
   } catch (error) {
-    fail(id, error);
+    fail(rid, error);
   }
 };

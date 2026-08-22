@@ -9,35 +9,104 @@
 <body>
   <header>
     <h1>Scriptonait</h1>
-    <p class="tagline">
-      A small transformer that writes screenplays, novels and allegories,
-      running entirely in your browser.
-    </p>
-    <!-- The status line is the first thing on the page on purpose: the
-         old version left you guessing whether anything was happening. -->
+    <p class="tagline">Train a model on your writing. All local.</p>
+
     <div id="model-status" class="model-status absent">
-      <span id="model-status-text">No model loaded.</span>
+      <span id="model-status-text">No model yet.</span>
       <div class="progress" id="model-progress" hidden><div class="bar" id="model-progress-bar"></div></div>
-      <div class="row">
-        <button id="load-model-btn" type="button">Load the writing model (18 MB)</button>
-        <label class="file-btn">
-          Load a model file
-          <input type="file" id="import-input" accept=".ckpt,.bin" hidden />
-        </label>
-      </div>
-      <p class="hint">
-        Nothing is downloaded until you press that. It fetches one file —
-        <code>model/scriptonait.ckpt</code>, from this site — which is the
-        model trained on the public-domain books listed in
-        <code>corpus/manifest.tsv</code>. You can also add your own
-        material below and use it without any model at all.
-      </p>
     </div>
+
+    <!-- One sentence saying what to do next, for whatever state the page
+         is in. Everything below is reachable at any time; this is what
+         stops you having to guess which part applies right now. -->
+    <p id="next-step" class="next-step"></p>
   </header>
 
   <main>
+    <section class="panel" id="material-panel">
+      <h2>1. Add your writing</h2>
+      <div class="input-group">
+        <label for="file-input">Upload text files</label>
+        <input type="file" id="file-input" multiple accept=".txt,.md,.markdown,.fountain,.text" />
+      </div>
+
+      <div class="input-group">
+        <label for="paste-input">Or paste some in</label>
+        <textarea id="paste-input" rows="4" placeholder="Paste a scene, chapter, or excerpt…"></textarea>
+        <div class="row">
+          <input type="text" id="paste-title" placeholder="Name for this piece" />
+          <button id="add-paste-btn" type="button">Add</button>
+        </div>
+      </div>
+
+      <div class="input-group">
+        <label for="url-input">Or fetch a URL</label>
+        <div class="row">
+          <input type="url" id="url-input" placeholder="https://example.com/script.html" />
+          <button id="add-url-btn" type="button">Fetch</button>
+        </div>
+        <p class="hint">Most sites block this. Paste instead.</p>
+      </div>
+
+      <div id="sources-list" class="sources-list"></div>
+      <p id="corpus-stats" class="corpus-stats"></p>
+      <div id="story-state" class="story-state" hidden></div>
+    </section>
+
+    <section class="panel" id="train-panel">
+      <h2>2. Train a model on it</h2>
+      <p id="train-explains" class="hint"></p>
+
+      <div class="row">
+        <button id="train-btn" type="button" disabled>Train a model on my writing</button>
+        <button id="train-stop-btn" type="button" class="secondary" hidden>Stop</button>
+        <label class="file-btn">
+          Open a model file
+          <input type="file" id="import-input" accept=".ckpt,.bin" hidden />
+        </label>
+      </div>
+
+      <div id="train-status" class="job-status" hidden>
+        <div class="progress"><div class="bar" id="train-progress-bar"></div></div>
+        <p id="train-stats" class="stats"></p>
+      </div>
+      <canvas id="loss-chart" width="640" height="140" hidden></canvas>
+
+      <details class="advanced">
+        <summary>Training settings</summary>
+        <div class="settings-grid">
+          <label>Effort
+            <select id="train-effort">
+              <option value="0.25">Gentle — leaves the machine usable</option>
+              <option value="0.5" selected>Balanced</option>
+              <option value="1">Full speed — will make things sluggish</option>
+            </select>
+          </label>
+          <label>Steps
+            <input type="number" id="train-steps" value="500" min="0" max="1000000" />
+          </label>
+          <label>Batch size
+            <input type="number" id="train-batch" value="2" min="1" max="32" />
+          </label>
+          <label>Learning rate
+            <input type="number" id="train-lr" value="0" min="0" max="0.01" step="0.00001" />
+          </label>
+        </div>
+        <p class="hint">0 = pick automatically.</p>
+        <p class="hint">New model shape:</p>
+        <div class="settings-grid">
+          <label>Layers <input type="number" id="cfg-layers" value="4" min="1" max="12" /></label>
+          <label>Hidden size <input type="number" id="cfg-hidden" value="192" min="16" max="768" step="16" /></label>
+          <label>Heads <input type="number" id="cfg-heads" value="6" min="1" max="16" /></label>
+          <label>KV heads <input type="number" id="cfg-kv-heads" value="2" min="1" max="16" /></label>
+          <label>Context <input type="number" id="cfg-context" value="512" min="32" max="2048" step="32" /></label>
+          <label>Attention window <input type="number" id="cfg-window" value="256" min="32" max="2048" step="32" /></label>
+        </div>
+      </details>
+    </section>
+
     <section class="panel" id="write-panel">
-      <h2>Write something</h2>
+      <h2>3. Write something</h2>
       <textarea id="prompt-input" rows="3"
         placeholder="Write a 700 word novel about two people in space related to Plato's allegory of the cave"></textarea>
 
@@ -51,6 +120,17 @@
         <label class="checkbox-label">
           <input type="checkbox" id="notify-toggle" />
           Notify me when it's done
+        </label>
+      </div>
+
+      <div class="row">
+        <label class="checkbox-label">
+          <input type="checkbox" id="use-story-state" />
+          Remind it who and where already exist
+        </label>
+        <label class="checkbox-label">
+          <input type="checkbox" id="use-retrieval" />
+          Give it similar scenes from your writing
         </label>
       </div>
 
@@ -81,150 +161,23 @@
             <input type="number" id="opt-seed" value="0" min="0" />
           </label>
         </div>
-        <p class="hint">
-          Temperature 0 is greedy and repeatable. Top-k and top-p cut the
-          long tail of unlikely tokens, which is what keeps a small model's
-          sentences from derailing.
-        </p>
+        <p class="hint">Temperature 0 = repeatable.</p>
       </details>
     </section>
 
-    <details class="panel" id="material-panel">
-      <summary><h2>Use your own material</h2></summary>
-      <p class="hint">
-        Add scripts, chapters or notes. They're used two ways: as context
-        for what you ask for, and — if you want — as fine-tuning data.
-        Everything stays in your browser.
-      </p>
-
-      <div class="input-group">
-        <label for="paste-input">Paste text</label>
-        <textarea id="paste-input" rows="4" placeholder="Paste a scene, chapter, or excerpt…"></textarea>
-        <div class="row">
-          <input type="text" id="paste-title" placeholder="Title for this source" />
-          <button id="add-paste-btn" type="button">Add</button>
-        </div>
-      </div>
-
-      <div class="input-group">
-        <label for="file-input">Or upload plain-text files</label>
-        <input type="file" id="file-input" multiple accept=".txt,.md,.markdown,.fountain,.text" />
-      </div>
-
-      <div class="input-group">
-        <label for="url-input">Or fetch a URL</label>
-        <div class="row">
-          <input type="url" id="url-input" placeholder="https://example.com/script.html" />
-          <button id="add-url-btn" type="button">Fetch</button>
-        </div>
-        <p class="hint">
-          Most sites don't allow cross-origin fetches, so this fails often.
-          When it does, copy the text and paste it instead — that isn't a
-          bug in this page.
-        </p>
-      </div>
-
-      <div id="sources-list" class="sources-list"></div>
-      <p id="corpus-stats" class="corpus-stats"></p>
-      <div id="story-state" class="story-state" hidden></div>
-
-      <div class="row">
-        <label class="checkbox-label">
-          <input type="checkbox" id="use-story-state" />
-          Remind the model who and where already exist
-        </label>
-        <label class="checkbox-label">
-          <input type="checkbox" id="use-retrieval" />
-          Give it the most similar scenes from your sources
-        </label>
-      </div>
-    </details>
-
-    <details class="panel" id="finetune-panel">
-      <summary><h2>Fine-tune on your material</h2></summary>
-      <p class="hint">
-        Optional, and the slowest thing on this page: this is real
-        training — forward pass, backward pass, optimizer — and it runs on
-        your CPU even when generation is running on your GPU, because
-        only the generation kernels are written in WGSL.
-      </p>
-      <p class="hint">
-        It does not train a model from nothing. The model this page loads
-        was already trained, on a GitHub Actions runner, from the
-        public-domain books and plays listed in
-        <code>corpus/manifest.tsv</code> — hours of it, off your machine.
-        Fine-tuning bends that model a little toward whatever you add
-        above.
-      </p>
-
-      <div class="settings-grid">
-        <label>Effort
-          <select id="train-effort">
-            <option value="0.25">Gentle — leaves the machine usable</option>
-            <option value="0.5" selected>Balanced</option>
-            <option value="1">Full speed — will make things sluggish</option>
-          </select>
-        </label>
-        <label>Steps
-          <input type="number" id="train-steps" value="200" min="0" max="100000" />
-        </label>
-        <label>Batch size
-          <input type="number" id="train-batch" value="2" min="1" max="32" />
-        </label>
-        <label>Learning rate
-          <input type="number" id="train-lr" value="0.00005" min="0" max="0.01" step="0.00001" />
-        </label>
-      </div>
-
-      <div class="row">
-        <button id="train-btn" type="button" disabled>Start fine-tuning</button>
-        <button id="train-stop-btn" type="button" class="secondary" hidden>Stop</button>
-      </div>
-
-      <div id="train-status" class="job-status" hidden>
-        <div class="progress"><div class="bar" id="train-progress-bar"></div></div>
-        <p id="train-stats" class="stats"></p>
-      </div>
-      <canvas id="loss-chart" width="640" height="140" hidden></canvas>
-    </details>
-
     <details class="panel" id="model-panel">
-      <summary><h2>The model</h2></summary>
+      <summary><h2>About your model</h2></summary>
       <div id="model-details" class="model-details"></div>
       <div class="row">
-        <button id="export-btn" type="button" class="secondary">Download this model</button>
+        <button id="export-btn" type="button" class="secondary">Save this model to a file</button>
       </div>
-      <p class="hint">
-        A model file carries its own tokenizer, so it's the only thing you
-        need to keep. Fine-tuned copies save from here.
-      </p>
-      <details class="advanced">
-        <summary>Start over with an untrained model</summary>
-        <p class="hint">
-          Trains from scratch on your own sources only. Expect it to take a
-          long time and to write badly until it has seen a lot of text —
-          this is the path the shipped model exists to save you from.
-        </p>
-        <div class="settings-grid">
-          <label>Layers <input type="number" id="cfg-layers" value="4" min="1" max="12" /></label>
-          <label>Hidden size <input type="number" id="cfg-hidden" value="192" min="16" max="768" step="16" /></label>
-          <label>Heads <input type="number" id="cfg-heads" value="6" min="1" max="16" /></label>
-          <label>KV heads <input type="number" id="cfg-kv-heads" value="2" min="1" max="16" /></label>
-          <label>Context <input type="number" id="cfg-context" value="512" min="32" max="2048" step="32" /></label>
-          <label>Attention window <input type="number" id="cfg-window" value="256" min="32" max="2048" step="32" /></label>
-        </div>
-        <button id="create-model-btn" type="button" class="secondary">Create an untrained model</button>
-      </details>
+      <p class="hint">One file. Reopen it in step 2.</p>
     </details>
   </main>
 
   <footer>
     <p id="error-banner" class="warning" hidden></p>
-    <p class="hint">
-      Everything runs locally. The model is a few million parameters — it
-      picks up voice, format and structure, not long-range plot. See the
-      README for what that means in practice.
-    </p>
+    <p class="hint">Runs locally. Nothing uploaded or downloaded.</p>
   </footer>
 
   <script type="module" src="app.js"></script>
