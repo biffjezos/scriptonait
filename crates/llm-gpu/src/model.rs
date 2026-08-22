@@ -503,12 +503,26 @@ async fn read_back(ctx: &GpuContext, buffer: &wgpu::Buffer, len: usize) -> Resul
     slice.map_async(wgpu::MapMode::Read, move |result| {
         let _ = sender.send(result);
     });
-    ctx.device.poll(wgpu::PollType::Wait).map_err(|e| format!("device poll failed: {e}"))?;
+
+    // In a browser there is nothing to poll: the page's event loop is
+    // what drives the mapping to completion, and wgpu's blocking wait
+    // isn't available on wasm anyway. Natively the device has to be
+    // pumped, and nothing in this repo builds this crate natively today
+    // — CI compiles it only for wasm32, through wasm-pack — so that arm
+    // is a courtesy for anyone who tries.
+    #[cfg(not(target_arch = "wasm32"))]
+    let _ = ctx.device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None });
+    #[cfg(target_arch = "wasm32")]
+    let _ = ctx;
+
     receiver
         .await
-        .map_err(|_| "readback was dropped".to_string())?
+        .map_err(|_| "the readback was dropped before it completed".to_string())?
         .map_err(|e| format!("readback failed: {e}"))?;
-    let data = slice.get_mapped_range();
+
+    let data = slice
+        .get_mapped_range()
+        .map_err(|e| format!("mapping the readback buffer failed: {e}"))?;
     let out: Vec<f32> = bytemuck::cast_slice(&data)[..len].to_vec();
     drop(data);
     buffer.unmap();
