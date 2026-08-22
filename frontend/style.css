@@ -62,68 +62,15 @@ h1 {
   margin-top: 1rem;
 }
 
-.webgpu-status {
-  padding: 0.6rem 0.9rem;
-  border-radius: 6px;
-  margin-top: 1rem;
-  border: 1px solid var(--border);
-  color: var(--text-dim);
-}
 
-.webgpu-status.enabled {
-  background: color-mix(in srgb, var(--accent) 12%, transparent);
-  border-color: var(--accent);
-  color: var(--accent);
-}
 
-.webgpu-status.fallback {
-  background: color-mix(in srgb, var(--danger) 12%, transparent);
-  border-color: var(--danger);
-  color: var(--danger);
-}
 
-.gpu-details {
-  margin-top: 0.5rem;
-  font-size: 0.85rem;
-  color: var(--text-dim);
-}
 
-.gpu-details summary {
-  cursor: pointer;
-  color: var(--accent);
-}
 
-.gpu-details-table {
-  margin-top: 0.5rem;
-  border-collapse: collapse;
-  width: 100%;
-}
 
-.gpu-details-table th,
-.gpu-details-table td {
-  text-align: left;
-  padding: 0.25rem 0.6rem 0.25rem 0;
-  border-bottom: 1px solid var(--border);
-  font-weight: normal;
-}
 
-.gpu-details-table th {
-  color: var(--text-dim);
-  white-space: nowrap;
-}
 
-.gpu-details-table td {
-  font-family: var(--mono);
-  color: var(--text);
-}
 
-.gpu-details-note {
-  margin-top: 0.6rem;
-  padding: 0.5rem 0.7rem;
-  border: 1px dashed var(--border);
-  border-radius: 6px;
-  font-size: 0.8rem;
-}
 
 main {
   max-width: 760px;
@@ -256,14 +203,6 @@ button.secondary,
   gap: 0.5rem !important;
 }
 
-.size-estimate {
-  font-family: var(--mono);
-  font-size: 0.85rem;
-  background: var(--bg);
-  border: 1px dashed var(--border);
-  border-radius: 6px;
-  padding: 0.5rem 0.75rem;
-}
 
 .sources-list {
   display: flex;
@@ -364,30 +303,9 @@ button.secondary,
   margin-top: 0.75rem;
 }
 
-.train-samples {
-  margin-top: 0.75rem;
-}
 
-.train-samples .sample {
-  background: var(--bg);
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  padding: 0.5rem 0.75rem;
-}
 
-.train-samples .sample .step-label {
-  font-family: var(--mono);
-  font-size: 0.75rem;
-  color: var(--text-dim);
-  margin-bottom: 0.25rem;
-}
 
-.train-samples .sample .text {
-  white-space: pre-wrap;
-  word-break: break-word;
-  font-family: var(--mono);
-  font-size: 0.85rem;
-}
 
 .generate-output {
   white-space: pre-wrap;
@@ -413,4 +331,183 @@ footer {
   max-width: 760px;
   margin: 0 auto;
   padding: 0 1.5rem 3rem;
+}
+
+
+/* ---------------------------------------------------------------------
+   Status, progress and streaming output.
+
+   These carry the weight of the rewrite: the complaint that started it
+   was not that the model was wrong, it was that nothing on the page ever
+   said what was happening.
+   --------------------------------------------------------------------- */
+
+.model-status {
+  margin: 0.75rem 0 0;
+  padding: 0.6rem 0.85rem;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--panel-bg);
+  font-size: 0.92rem;
+}
+
+.model-status.loading {
+  border-color: var(--accent);
+}
+
+.model-status.ready {
+  border-color: #3f7d4a;
+}
+
+.model-status.absent {
+  border-color: var(--danger);
+}
+
+.progress {
+  height: 4px;
+  margin-top: 0.5rem;
+  border-radius: 2px;
+  background: var(--border);
+  overflow: hidden;
+}
+
+.progress .bar {
+  height: 100%;
+  width: 0%;
+  background: var(--accent);
+  transition: width 120ms linear;
+}
+
+.job-status {
+  margin: 0.75rem 0;
+}
+
+.stats {
+  margin: 0.4rem 0 0;
+  color: var(--text-dim);
+  font-family: var(--mono);
+  font-size: 0.82rem;
+}
+
+.output {
+  margin-top: 1rem;
+  padding: 1rem;
+  max-height: 28rem;
+  overflow-y: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--panel-bg);
+  font-family: var(--mono);
+  font-size: 0.86rem;
+  line-height: 1.6;
+}
+
+/* What the prompt was understood to ask for. */
+.understood {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+  align-items: center;
+  margin: 0.6rem 0;
+}
+
+.understood-label {
+  color: var(--text-dim);
+  font-size: 0.8rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.chip {
+  padding: 0.15rem 0.55rem;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--panel-bg);
+  font-size: 0.8rem;
+}
+
+/* Panels are <details> now, so the heading has to sit in the summary. */
+details.panel > summary {
+  cursor: pointer;
+  list-style: none;
+}
+
+details.panel > summary::-webkit-details-marker {
+  display: none;
+}
+
+details.panel > summary h2 {
+  display: inline-block;
+  margin: 0;
+}
+
+details.panel > summary::before {
+  content: '▸ ';
+  color: var(--text-dim);
+}
+
+details.panel[open] > summary::before {
+  content: '▾ ';
+}
+
+.advanced {
+  margin-top: 1rem;
+  font-size: 0.92rem;
+}
+
+.advanced summary {
+  cursor: pointer;
+  color: var(--text-dim);
+}
+
+.model-details dl {
+  margin: 0;
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 0.5rem 1rem;
+}
+
+.model-details dl > div {
+  border-bottom: 1px solid var(--border);
+  padding-bottom: 0.35rem;
+}
+
+.model-details dt {
+  color: var(--text-dim);
+  font-size: 0.78rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.model-details dd {
+  margin: 0.1rem 0 0;
+  font-family: var(--mono);
+}
+
+.story-state {
+  margin-top: 0.75rem;
+  padding: 0.75rem;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  font-size: 0.9rem;
+}
+
+select {
+  padding: 0.4rem;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--panel-bg);
+  color: var(--text);
+  font-family: inherit;
+}
+
+#loss-chart {
+  margin-top: 0.75rem;
+  width: 100%;
+  max-width: 100%;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--panel-bg);
 }

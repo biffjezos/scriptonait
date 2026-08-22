@@ -1,219 +1,213 @@
-<!doctype html>
+<!DOCTYPE html>
 <html lang="en">
 <head>
-<meta charset="utf-8" />
-<meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>Scriptonait — a tiny WebGPU LLM for scripts &amp; stories</title>
-<link rel="stylesheet" href="style.css" />
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Scriptonait</title>
+  <link rel="stylesheet" href="style.css" />
 </head>
 <body>
-<header>
-  <h1>Scriptonait</h1>
-  <p class="tagline">
-    A small transformer, trained from scratch on your own film scripts, stories, or books —
-    entirely in your browser, generation accelerated by WebGPU.
-  </p>
-  <p id="webgpu-status" class="webgpu-status"></p>
-  <details id="gpu-details" class="gpu-details" hidden>
-    <summary>GPU details</summary>
-    <div id="gpu-details-content"></div>
-  </details>
-</header>
+  <header>
+    <h1>Scriptonait</h1>
+    <p class="tagline">
+      A small transformer that writes screenplays, novels and allegories,
+      running entirely in your browser.
+    </p>
+    <!-- The status line is the first thing on the page on purpose: the
+         old version left you guessing whether anything was happening. -->
+    <div id="model-status" class="model-status loading">
+      <span id="model-status-text">Loading the model…</span>
+      <div class="progress" id="model-progress" hidden><div class="bar" id="model-progress-bar"></div></div>
+    </div>
+  </header>
 
-<main>
-  <section id="sources-panel" class="panel">
-    <h2>1. Training sources</h2>
+  <main>
+    <section class="panel" id="write-panel">
+      <h2>Write something</h2>
+      <textarea id="prompt-input" rows="3"
+        placeholder="Write a 700 word novel about two people in space related to Plato's allegory of the cave"></textarea>
 
-    <div class="source-inputs">
-      <div class="input-group">
-        <label for="url-input">Add from a URL</label>
-        <div class="row">
-          <input type="url" id="url-input" placeholder="https://example.com/script.html" />
-          <button id="add-url-btn" type="button">Fetch &amp; add</button>
+      <!-- What the prompt was understood to mean, echoed back. A prompt
+           that was misread should be visibly misread. -->
+      <div id="understood" class="understood" hidden></div>
+
+      <div class="row">
+        <button id="generate-btn" type="button" disabled>Write it</button>
+        <button id="stop-btn" type="button" class="secondary" hidden>Stop</button>
+        <label class="checkbox-label">
+          <input type="checkbox" id="notify-toggle" />
+          Notify me when it's done
+        </label>
+      </div>
+
+      <div id="generate-status" class="job-status" hidden>
+        <div class="progress"><div class="bar" id="generate-progress-bar"></div></div>
+        <p id="generate-stats" class="stats"></p>
+      </div>
+
+      <pre id="output" class="output" hidden></pre>
+      <div id="qa-notes" class="qa-notes" hidden></div>
+
+      <details class="advanced">
+        <summary>Sampling settings</summary>
+        <div class="settings-grid">
+          <label>Temperature
+            <input type="number" id="opt-temperature" value="0.9" min="0" max="2" step="0.05" />
+          </label>
+          <label>Top-k
+            <input type="number" id="opt-top-k" value="40" min="0" max="500" />
+          </label>
+          <label>Top-p
+            <input type="number" id="opt-top-p" value="0.95" min="0.05" max="1" step="0.01" />
+          </label>
+          <label>Repetition penalty
+            <input type="number" id="opt-repetition" value="1.1" min="1" max="2" step="0.05" />
+          </label>
+          <label>Seed
+            <input type="number" id="opt-seed" value="0" min="0" />
+          </label>
         </div>
         <p class="hint">
-          Only works when the site allows cross-origin fetches (CORS) — most don't. If it
-          fails, copy the text and use "Paste text" below instead.
+          Temperature 0 is greedy and repeatable. Top-k and top-p cut the
+          long tail of unlikely tokens, which is what keeps a small model's
+          sentences from derailing.
         </p>
-      </div>
+      </details>
+    </section>
 
-      <div class="input-group">
-        <label for="file-input">Upload files</label>
-        <input type="file" id="file-input" multiple accept=".txt,.md,.markdown,.fountain,.text" />
-        <p class="hint">Plain-text formats only (.txt, .md, .fountain, ...) — not .pdf or .docx.</p>
-      </div>
+    <details class="panel" id="material-panel">
+      <summary><h2>Use your own material</h2></summary>
+      <p class="hint">
+        Add scripts, chapters or notes. They're used two ways: as context
+        for what you ask for, and — if you want — as fine-tuning data.
+        Everything stays in your browser.
+      </p>
 
       <div class="input-group">
         <label for="paste-input">Paste text</label>
-        <textarea id="paste-input" rows="4" placeholder="Paste a scene, chapter, or excerpt..."></textarea>
+        <textarea id="paste-input" rows="4" placeholder="Paste a scene, chapter, or excerpt…"></textarea>
         <div class="row">
           <input type="text" id="paste-title" placeholder="Title for this source" />
-          <button id="add-paste-btn" type="button">Add pasted text</button>
+          <button id="add-paste-btn" type="button">Add</button>
         </div>
       </div>
 
       <div class="input-group">
-        <label>Tags for sources added next (optional)</label>
+        <label for="file-input">Or upload plain-text files</label>
+        <input type="file" id="file-input" multiple accept=".txt,.md,.markdown,.fountain,.text" />
+      </div>
+
+      <div class="input-group">
+        <label for="url-input">Or fetch a URL</label>
         <div class="row">
-          <input type="text" id="source-genre-tag" placeholder="Genre, e.g. sci-fi" />
-          <input type="text" id="source-tone-tag" placeholder="Tone, e.g. dark" />
+          <input type="url" id="url-input" placeholder="https://example.com/script.html" />
+          <button id="add-url-btn" type="button">Fetch</button>
         </div>
         <p class="hint">
-          Prepended to a source's text as "[GENRE: ...] [TONE: ...]" so the model can learn to
-          associate the tag with what follows. Applies to URL/file/paste adds below; edit a
-          source afterward to change its tags.
+          Most sites don't allow cross-origin fetches, so this fails often.
+          When it does, copy the text and paste it instead — that isn't a
+          bug in this page.
         </p>
       </div>
-    </div>
 
-    <div id="sources-list" class="sources-list">
-      <p class="empty-hint">No sources yet — add one above to start building your training corpus.</p>
-    </div>
-    <p id="corpus-stats" class="corpus-stats"></p>
-  </section>
+      <div id="sources-list" class="sources-list"></div>
+      <p id="corpus-stats" class="corpus-stats"></p>
+      <div id="story-state" class="story-state" hidden></div>
 
-  <section id="settings-panel" class="panel">
-    <h2>2. Model shape</h2>
-    <div class="row">
-      <button id="suggest-settings-btn" type="button" class="secondary">
-        Suggest settings from loaded sources
-      </button>
-    </div>
-    <p id="suggest-settings-status" class="hint"></p>
-    <div class="settings-grid">
-      <label>Layers
-        <input type="number" id="cfg-layers" value="4" min="1" max="16" />
-      </label>
-      <label>Nodes (hidden size)
-        <input type="number" id="cfg-hidden" value="128" min="16" max="1024" step="16" />
-      </label>
-      <label>Attention heads
-        <input type="number" id="cfg-heads" value="4" min="1" max="32" />
-      </label>
-      <label>Context length
-        <input type="number" id="cfg-context" value="256" min="16" max="4096" step="16" />
-      </label>
-      <label>Attention window
-        <input type="number" id="cfg-window" value="256" min="16" max="4096" step="16" />
-      </label>
-    </div>
-    <p class="hint">
-      "Nodes" is the model's width — bigger learns more, costs more memory.
-      Attention window smaller than context length uses cheaper sliding-window
-      attention, good for long scripts/books; leave it equal to context length for
-      plain full attention.
-    </p>
-    <p id="size-estimate" class="size-estimate"></p>
-    <button id="create-model-btn" type="button">Create model</button>
-    <p id="model-status" class="hint"></p>
-  </section>
-
-  <section id="train-panel" class="panel" hidden>
-    <h2>3. Train</h2>
-    <div class="settings-grid">
-      <label>Batch size
-        <input type="number" id="cfg-batch" value="4" min="1" max="64" />
-      </label>
-      <label>Learning rate
-        <input type="number" id="cfg-lr" value="0.01" min="0.0001" max="1" step="0.001" />
-      </label>
-      <label class="checkbox-label">
-        <input type="checkbox" id="train-use-gpu" checked disabled /> Train on WebGPU (falls back to CPU if unavailable)
-      </label>
-      <label class="checkbox-label">
-        <input type="checkbox" id="train-sample-toggle" /> Generate a sample every
-      </label>
-      <label>Steps
-        <input type="number" id="train-sample-every" value="200" min="1" max="100000" />
-      </label>
-      <label>Sample prompt (optional)
-        <input type="text" id="train-sample-prompt" placeholder="Start a scene or sentence..." />
-      </label>
-    </div>
-    <div class="row">
-      <button id="start-train-btn" type="button">Start training</button>
-      <button id="stop-train-btn" type="button" disabled>Stop</button>
-      <button id="debug-compare-gradient-btn" type="button" hidden>Compare GPU vs CPU gradient (debug)</button>
-    </div>
-    <p id="train-status" class="hint"></p>
-    <p id="train-perf" class="hint"></p>
-    <canvas id="loss-chart" width="640" height="140"></canvas>
-    <div id="train-samples" class="train-samples"></div>
-  </section>
-
-  <section id="generate-panel" class="panel" hidden>
-    <h2>4. Generate</h2>
-    <textarea id="prompt-input" rows="3" placeholder="Start a scene or sentence..."></textarea>
-    <div class="settings-grid">
-      <label>New tokens
-        <input type="number" id="gen-max-tokens" value="200" min="1" max="2000" />
-      </label>
-      <label>Temperature
-        <input type="number" id="gen-temp" value="0.8" min="0" max="2" step="0.05" />
-      </label>
-      <label>Genre tag (optional)
-        <input type="text" id="gen-genre-tag" placeholder="e.g. sci-fi" />
-      </label>
-      <label>Tone tag (optional)
-        <input type="text" id="gen-tone-tag" placeholder="e.g. dark" />
-      </label>
-      <label>Target word count (optional)
-        <input type="number" id="gen-target-words" min="0" placeholder="0 = no target" />
-      </label>
-      <label class="checkbox-label">
-        <input type="checkbox" id="gen-use-gpu" checked disabled /> Use WebGPU acceleration
-      </label>
-      <label class="checkbox-label">
-        <input type="checkbox" id="gen-use-story-state" /> Remind the model of characters/locations so far
-      </label>
-      <label class="checkbox-label">
-        <input type="checkbox" id="gen-use-retrieval" /> Use similar scenes from your sources as context
-      </label>
-    </div>
-    <div class="row">
-      <button id="generate-btn" type="button">Generate</button>
-      <button id="preview-retrieval-btn" type="button" class="secondary">Preview retrieved context</button>
-      <button id="debug-compare-btn" type="button" hidden>Compare GPU vs CPU (debug)</button>
-    </div>
-    <p id="gpu-status" class="hint"></p>
-    <div id="retrieval-preview" class="retrieval-preview" hidden></div>
-    <pre id="generate-output" class="generate-output"></pre>
-    <div id="qa-notes" class="qa-notes"></div>
-    <details id="effective-prompt-details" hidden>
-      <summary>Full prompt sent to the model (tags/story-state/retrieval + your prompt)</summary>
-      <pre id="effective-prompt" class="generate-output"></pre>
+      <div class="row">
+        <label class="checkbox-label">
+          <input type="checkbox" id="use-story-state" />
+          Remind the model who and where already exist
+        </label>
+        <label class="checkbox-label">
+          <input type="checkbox" id="use-retrieval" />
+          Give it the most similar scenes from your sources
+        </label>
+      </div>
     </details>
-  </section>
 
-  <section id="save-panel" class="panel" hidden>
-    <h2>5. Save / load</h2>
-    <div class="row">
-      <input type="text" id="save-name" placeholder="Checkpoint name" />
-      <button id="save-model-btn" type="button">Save checkpoint</button>
-    </div>
-    <div class="row">
-      <select id="load-model-select"></select>
-      <button id="load-model-btn" type="button">Load</button>
-      <button id="delete-model-btn" type="button">Delete</button>
-    </div>
-    <div class="row">
-      <button id="download-weights-btn" type="button">Download weights (.bin)</button>
-      <label class="file-btn">
-        Import weights
-        <input type="file" id="upload-weights-input" accept=".bin" hidden />
-      </label>
-    </div>
-  </section>
-</main>
+    <details class="panel" id="finetune-panel">
+      <summary><h2>Fine-tune on your material</h2></summary>
+      <p class="hint">
+        Optional, and slower than everything else on this page — it's real
+        training, running on your CPU. The shipped model was trained on a
+        server for hours; this bends it a little toward your text.
+      </p>
 
-<footer>
-  <p class="hint">
-    Everything runs locally in your browser — sources and checkpoints stay on your
-    device (IndexedDB). Nothing is uploaded anywhere except a URL fetch you
-    explicitly trigger yourself.
-  </p>
-</footer>
+      <div class="settings-grid">
+        <label>Effort
+          <select id="train-effort">
+            <option value="0.25">Gentle — leaves the machine usable</option>
+            <option value="0.5" selected>Balanced</option>
+            <option value="1">Full speed — will make things sluggish</option>
+          </select>
+        </label>
+        <label>Steps
+          <input type="number" id="train-steps" value="200" min="0" max="100000" />
+        </label>
+        <label>Batch size
+          <input type="number" id="train-batch" value="2" min="1" max="32" />
+        </label>
+        <label>Learning rate
+          <input type="number" id="train-lr" value="0.00005" min="0" max="0.01" step="0.00001" />
+        </label>
+      </div>
 
-<script type="module" src="app.js"></script>
+      <div class="row">
+        <button id="train-btn" type="button" disabled>Start fine-tuning</button>
+        <button id="train-stop-btn" type="button" class="secondary" hidden>Stop</button>
+      </div>
+
+      <div id="train-status" class="job-status" hidden>
+        <div class="progress"><div class="bar" id="train-progress-bar"></div></div>
+        <p id="train-stats" class="stats"></p>
+      </div>
+      <canvas id="loss-chart" width="640" height="140" hidden></canvas>
+    </details>
+
+    <details class="panel" id="model-panel">
+      <summary><h2>The model</h2></summary>
+      <div id="model-details" class="model-details"></div>
+      <div class="row">
+        <button id="export-btn" type="button" class="secondary">Download this model</button>
+        <label class="file-btn">
+          Load a model file
+          <input type="file" id="import-input" accept=".ckpt,.bin" hidden />
+        </label>
+      </div>
+      <p class="hint">
+        A model file carries its own tokenizer, so it's the only thing you
+        need to keep. Fine-tuned copies save from here.
+      </p>
+      <details class="advanced">
+        <summary>Start over with an untrained model</summary>
+        <p class="hint">
+          Trains from scratch on your own sources only. Expect it to take a
+          long time and to write badly until it has seen a lot of text —
+          this is the path the shipped model exists to save you from.
+        </p>
+        <div class="settings-grid">
+          <label>Layers <input type="number" id="cfg-layers" value="4" min="1" max="12" /></label>
+          <label>Hidden size <input type="number" id="cfg-hidden" value="192" min="16" max="768" step="16" /></label>
+          <label>Heads <input type="number" id="cfg-heads" value="6" min="1" max="16" /></label>
+          <label>KV heads <input type="number" id="cfg-kv-heads" value="2" min="1" max="16" /></label>
+          <label>Context <input type="number" id="cfg-context" value="512" min="32" max="2048" step="32" /></label>
+          <label>Attention window <input type="number" id="cfg-window" value="256" min="32" max="2048" step="32" /></label>
+        </div>
+        <button id="create-model-btn" type="button" class="secondary">Create an untrained model</button>
+      </details>
+    </details>
+  </main>
+
+  <footer>
+    <p id="error-banner" class="warning" hidden></p>
+    <p class="hint">
+      Everything runs locally. The model is a few million parameters — it
+      picks up voice, format and structure, not long-range plot. See the
+      README for what that means in practice.
+    </p>
+  </footer>
+
+  <script type="module" src="app.js"></script>
 </body>
 </html>

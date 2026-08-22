@@ -1,1167 +1,600 @@
+// Main-thread UI. All the expensive work is in worker.js; this file is
+// about telling the user what is happening.
+//
+// That is the actual feature here. The previous version reported a loss
+// number and nothing else, so a job that took twenty minutes was
+// indistinguishable from a job that had crashed. Now every long operation
+// has: a progress bar, a throughput figure, an elapsed time, a stop
+// button, a title-bar indicator for when the tab is in the background,
+// and — if you ask for it — a notification when it finishes.
+
 import * as db from './db.js';
 
-const el = (id) => document.getElementById(id);
+const worker = new Worker('./worker.js', { type: 'module' });
 
-const worker = new Worker('worker.js', { type: 'module' });
+// --- Worker plumbing ---------------------------------------------------
+// Requests are promise-shaped; streaming updates arrive out-of-band and
+// are dispatched to whatever handler is currently interested.
 
-// --- App state -----------------------------------------------------------
+let nextRequestId = 1;
+const pending = new Map();
+const streamHandlers = new Map();
 
-let modelCreated = false;
-let modelConfig = null;
-let editingSourceId = null;
-let lossHistory = [];
-let stepMsHistory = [];
-const STEP_MS_WINDOW = 20;
-let training = false;
-
-// --- Wake lock -------------------------------------------------------------
-// Training/generation can run for hours; without this the OS treats the tab
-// as idle and lets the screen (and often the whole machine) go to sleep
-// mid-run, same as any video player would request a wake lock to avoid.
-// Reference-counted so training and a concurrent generate() don't stomp on
-// each other's release.
-let wakeLock = null;
-let activeWakeJobs = 0;
-
-async function acquireWakeLock() {
-  if (wakeLock || !('wakeLock' in navigator)) return;
-  try {
-    wakeLock = await navigator.wakeLock.request('screen');
-    wakeLock.addEventListener('release', () => {
-      wakeLock = null;
-    });
-  } catch {
-    // Request can fail (tab not visible, low battery, etc.) - harmless;
-    // the visibilitychange listener below retries once the tab is visible.
-  }
+function call(type, payload = {}, transfer = []) {
+  const id = nextRequestId++;
+  return new Promise((resolve, reject) => {
+    pending.set(id, { resolve, reject });
+    worker.postMessage({ id, type, ...payload }, transfer);
+  });
 }
 
-function beginWakeJob() {
-  activeWakeJobs += 1;
-  acquireWakeLock();
+function onStream(type, handler) {
+  streamHandlers.set(type, handler);
 }
-
-function endWakeJob() {
-  activeWakeJobs = Math.max(0, activeWakeJobs - 1);
-  if (activeWakeJobs === 0 && wakeLock) {
-    wakeLock.release();
-  }
-}
-
-document.addEventListener('visibilitychange', () => {
-  // A wake lock is auto-released whenever the tab is hidden - re-acquire
-  // it once visible again if a job is still supposed to be running.
-  if (activeWakeJobs > 0 && document.visibilityState === 'visible') {
-    acquireWakeLock();
-  }
-});
-
-const webgpuBrowserSupported = 'gpu' in navigator;
-
-// This app's own limit, not a hardware one: llm-gpu's attention kernel
-// uses a fixed-size local array (MAX_WINDOW = 256u in attention.wgsl),
-// and the backward pass needs a dense [heads, context, context] cache
-// per layer sized off it - must match llm_gpu::MAX_GPU_WINDOW exactly.
-// Real GPUs (see the details panel below) support far larger buffers and
-// workgroups than this; it's a simplification in how this app's shaders
-// are written, not something the hardware is short on.
-const GPU_MAX_CONTEXT = 256;
-
-function setWebGpuStatus(text, cls) {
-  const banner = el('webgpu-status');
-  banner.textContent = text;
-  banner.className = 'webgpu-status' + (cls ? ` ${cls}` : '');
-}
-
-// Independent of the worker's own GpuContext (used for actual
-// training/generation) - requesting an adapter just to read its info/
-// limits doesn't need a device at all, so this can populate immediately
-// on page load regardless of whether a model has been created yet.
-// GpuContext::new() requests `required_limits: adapter.limits()` (the
-// full set, not a reduced one), so what's shown here matches what
-// training actually gets to use.
-async function loadGpuDetails() {
-  if (!webgpuBrowserSupported) return;
-  try {
-    const adapter = await navigator.gpu.requestAdapter();
-    if (!adapter) return;
-    const info = adapter.info ?? (adapter.requestAdapterInfo ? await adapter.requestAdapterInfo() : null);
-    const limits = adapter.limits;
-
-    const rows = [];
-    if (info) {
-      rows.push(['Vendor', info.vendor || 'unknown']);
-      rows.push(['Architecture', info.architecture || 'unknown']);
-      rows.push(['Device', info.device || 'unknown']);
-      rows.push(['Description', info.description || '(none)']);
-    }
-    rows.push(['Type', adapter.isFallbackAdapter ? 'Software (fallback)' : 'Hardware']);
-    // The limits actually relevant to this app's compute shaders - not
-    // the full ~30-entry spec table, just what could plausibly constrain
-    // (or explain slow) training here.
-    rows.push(['Max compute invocations / workgroup', limits.maxComputeInvocationsPerWorkgroup.toLocaleString()]);
-    rows.push([
-      'Max workgroup size (X / Y / Z)',
-      `${limits.maxComputeWorkgroupSizeX} / ${limits.maxComputeWorkgroupSizeY} / ${limits.maxComputeWorkgroupSizeZ}`,
-    ]);
-    rows.push(['Max storage buffer binding', formatBytes(limits.maxStorageBufferBindingSize)]);
-    rows.push(['Max buffer size', formatBytes(limits.maxBufferSize)]);
-    rows.push(['Max compute workgroup storage', formatBytes(limits.maxComputeWorkgroupStorageSize)]);
-
-    const container = el('gpu-details-content');
-    container.innerHTML = '';
-    const table = document.createElement('table');
-    table.className = 'gpu-details-table';
-    for (const [label, value] of rows) {
-      const tr = document.createElement('tr');
-      const th = document.createElement('th');
-      th.textContent = label;
-      const td = document.createElement('td');
-      td.textContent = value;
-      tr.append(th, td);
-      table.appendChild(tr);
-    }
-    container.appendChild(table);
-
-    // Deliberately separate from the table above: everything in it comes
-    // from the hardware/driver; this comes from this app's own shaders,
-    // not your GPU, so labeling it as just another "limit" row would
-    // wrongly suggest the GPU itself is what's capping this.
-    const note = document.createElement('p');
-    note.className = 'gpu-details-note';
-    note.textContent =
-      `This app's own context/attention-window limit: ${GPU_MAX_CONTEXT} tokens — not a hardware limit, ` +
-      `a fixed-size array in this app's attention shader. Your GPU's own limits above are all far higher.`;
-    container.appendChild(note);
-
-    el('gpu-details').hidden = false;
-  } catch (err) {
-    // Non-fatal - this is a "nice to have" diagnostic, not required for
-    // the app to function, so a failure here shouldn't surface as an error.
-    console.warn('Could not read GPU adapter details:', err);
-  }
-}
-
-loadGpuDetails();
-
-if (!webgpuBrowserSupported) {
-  setWebGpuStatus(
-    'WebGPU: not available in this browser (navigator.gpu is undefined) — training and ' +
-      'generation will use CPU (slower, but works everywhere). Try a recent Chrome or Edge for GPU acceleration.',
-    'fallback'
-  );
-} else {
-  setWebGpuStatus('WebGPU: available — will be used automatically once a model is created.', '');
-}
-
-// --- Worker <-> UI wiring --------------------------------------------------
 
 worker.onmessage = (event) => {
-  const msg = event.data;
-  switch (msg.type) {
-    case 'ready':
-      break;
-
-    case 'modelCreated': {
-      modelCreated = true;
-      el('model-status').textContent =
-        `Model ready — ${Math.round(msg.paramCount).toLocaleString()} parameters ` +
-        `(${formatBytes(msg.memoryInference)} inference / ${formatBytes(msg.memoryTraining)} training).`;
-      el('train-panel').hidden = false;
-      el('generate-panel').hidden = false;
-      el('save-panel').hidden = false;
-      const gpuUsable = msg.gpuSupported && webgpuBrowserSupported;
-      el('gen-use-gpu').disabled = !gpuUsable;
-      el('train-use-gpu').disabled = !gpuUsable;
-      if (!gpuUsable) {
-        // Both checkboxes start checked in the HTML (GPU is the default
-        // preference) - disabling alone leaves a disabled checkbox still
-        // reporting .checked === true, which would silently send
-        // useGpu: true to the worker for a config the GPU backend can't
-        // actually handle. Force them off too.
-        el('gen-use-gpu').checked = false;
-        el('train-use-gpu').checked = false;
-      }
-      if (!msg.gpuSupported) {
-        el('gpu-status').textContent =
-          'This attention window is larger than the simple GPU kernel supports — generation will use the CPU path only.';
-        setWebGpuStatus(
-          "WebGPU: this model's context/attention window is too large for the GPU backend — using CPU for this model.",
-          'fallback'
-        );
-      } else if (webgpuBrowserSupported) {
-        // Default to GPU: request a device right away rather than waiting
-        // for the user to toggle a checkbox, so "Use WebGPU acceleration"/
-        // "Train on WebGPU" being checked by default actually works the
-        // first time someone clicks Generate/Start training.
-        setWebGpuStatus('WebGPU: initializing device…', '');
-        worker.postMessage({ type: 'initGpu' });
-      }
-      pushAllSourcesToWorker();
-      break;
+  const { type, id } = event.data;
+  if (type === 'result') {
+    const entry = pending.get(id);
+    if (entry) {
+      pending.delete(id);
+      entry.resolve(event.data.result);
     }
-
-    case 'sourceStats':
-    case 'sourceRemoved': {
-      refreshCorpusStatsFromWorker(msg);
-      break;
-    }
-
-    case 'trainProgress': {
-      lossHistory.push(msg.loss);
-      if (lossHistory.length > 400) lossHistory.shift();
-      const lrText = msg.lr !== undefined ? ` — lr ${msg.lr.toExponential(2)}` : '';
-      el('train-status').textContent = `Step ${Math.round(msg.step).toLocaleString()} — loss ${msg.loss.toFixed(4)}${lrText}`;
-      if (msg.stepMs !== undefined) {
-        stepMsHistory.push(msg.stepMs);
-        if (stepMsHistory.length > STEP_MS_WINDOW) stepMsHistory.shift();
-        const avgMs = stepMsHistory.reduce((a, b) => a + b, 0) / stepMsHistory.length;
-        // Each report can cover several steps (the worker coalesces them),
-        // so this is an average over recent steps, not over reports.
-        let perfText = `≈${avgMs.toFixed(0)} ms/step (recent average)`;
-        if (msg.batchSize && modelConfig?.contextLen) {
-          const tokensPerSec = (msg.batchSize * modelConfig.contextLen * 1000) / avgMs;
-          perfText += ` — ≈${Math.round(tokensPerSec).toLocaleString()} tokens/sec`;
-        }
-        el('train-perf').textContent = perfText;
-      }
-      scheduleLossChart();
-      break;
-    }
-
-    case 'trainStalled': {
-      training = false;
-      setTrainingButtons(false);
-      endWakeJob();
-      el('train-status').textContent = msg.message;
-      break;
-    }
-
-    case 'trainSample': {
-      // Overwritten each time, not appended - this is a live "how's it
-      // doing right now" window, not a history.
-      const container = el('train-samples');
-      container.innerHTML = '';
-      const entry = document.createElement('div');
-      entry.className = 'sample';
-      const label = document.createElement('div');
-      label.className = 'step-label';
-      label.textContent = `Step ${Math.round(msg.step).toLocaleString()}`;
-      const text = document.createElement('div');
-      text.className = 'text';
-      text.textContent = msg.text;
-      entry.append(label, text);
-      container.appendChild(entry);
-      break;
-    }
-
-    case 'trainFallback': {
-      // Non-fatal: the worker downgraded this run to CPU (e.g. GPU was
-      // requested for a config the GPU backend can't handle) - training
-      // still proceeds normally right after this, just not on GPU.
-      el('train-status').textContent = msg.message;
-      el('train-use-gpu').checked = false;
-      break;
-    }
-
-    case 'trainStopped': {
-      training = false;
-      setTrainingButtons(false);
-      endWakeJob();
-      el('train-status').textContent = `Stopped at step ${Math.round(msg.step).toLocaleString()}.`;
-      break;
-    }
-
-    case 'generateResult': {
-      el('generate-output').textContent = msg.text;
-      el('generate-btn').disabled = false;
-      endWakeJob();
-      renderQaNotes(msg.qaNotes || []);
-      el('effective-prompt').textContent = msg.effectivePrompt || '';
-      el('effective-prompt-details').hidden = !msg.effectivePrompt;
-      break;
-    }
-
-    case 'retrievalPreview': {
-      renderRetrievalPreview(msg.chunks || []);
-      el('preview-retrieval-btn').disabled = false;
-      break;
-    }
-
-    case 'gpuReady': {
-      setWebGpuStatus('WebGPU: enabled — training and generation run on the GPU.', 'enabled');
-      el('gen-use-gpu').disabled = false;
-      el('gen-use-gpu').checked = true;
-      el('train-use-gpu').disabled = false;
-      el('train-use-gpu').checked = true;
-      el('gpu-status').textContent = 'WebGPU device ready.';
-      el('debug-compare-btn').hidden = false;
-      el('debug-compare-gradient-btn').hidden = false;
-      if (msg.adapter) {
-        // Which adapter the browser actually chose is the first thing
-        // worth knowing when training is slower than expected: a software
-        // fallback runs the same kernels orders of magnitude slower than
-        // real hardware.
-        el('gpu-status').textContent = msg.isSoftware
-          ? `WebGPU device: ${msg.adapter}. Training will be extremely slow — this is a software renderer, not a real GPU. CPU training is likely faster.`
-          : `WebGPU device: ${msg.adapter}`;
-      }
-      break;
-    }
-
-    case 'gpuUnavailable': {
-      setWebGpuStatus(`WebGPU: unavailable (${msg.message}) — using CPU.`, 'fallback');
-      el('gen-use-gpu').checked = false;
-      el('gen-use-gpu').disabled = true;
-      el('train-use-gpu').checked = false;
-      el('train-use-gpu').disabled = true;
-      el('gpu-status').textContent = `WebGPU unavailable: ${msg.message} — using CPU generation instead.`;
-      break;
-    }
-
-    case 'debugCompareResult': {
-      el('gpu-status').textContent =
-        `GPU vs CPU max logit difference: ${msg.maxDiff.toExponential(3)} ` +
-        (msg.maxDiff < 0.01 ? '(looks correct)' : '(unexpectedly large — GPU output may be wrong)');
-      break;
-    }
-
-    case 'debugCompareGradientResult': {
-      el('train-status').textContent =
-        `GPU vs CPU max embedding-gradient difference: ${msg.maxDiff.toExponential(3)} ` +
-        (msg.maxDiff < 0.01 ? '(looks correct)' : '(unexpectedly large — GPU training may be wrong)');
-      break;
-    }
-
-    case 'weightsImported': {
-      el('model-status').textContent = `Weights imported (step reset to ${msg.step}).`;
-      break;
-    }
-
-    case 'weightsExported':
-      // Handled by a one-off listener registered at the call site (the
-      // download and save-checkpoint buttons each need to do something
-      // different with the exported bytes) — nothing to do here.
-      break;
-
-    case 'benchmarkProgress':
-    case 'benchmarkResult':
-      // Handled by a one-off listener registered at the suggest-settings
-      // call site — nothing to do here.
-      break;
-
-    case 'error': {
-      console.error(`[worker:${msg.context}]`, msg.message);
-      alert(`${msg.context}: ${msg.message}`);
-      // Reset whichever button might have triggered this (harmless if it
-      // wasn't the one that failed).
-      el('generate-btn').disabled = false;
-      el('preview-retrieval-btn').disabled = false;
-      if (msg.context === 'generate') endWakeJob();
-      if (msg.context === 'train_step') {
-        training = false;
-        setTrainingButtons(false);
-        endWakeJob();
-      }
-      break;
-    }
-
-    default:
-      console.warn('unhandled worker message', msg);
-  }
-};
-
-function refreshCorpusStatsFromWorker(msg) {
-  el('corpus-stats').textContent =
-    `${msg.numSources} source${msg.numSources === 1 ? '' : 's'} loaded into the model, ` +
-    `${Math.round(msg.totalTokens).toLocaleString()} training tokens total.`;
-}
-
-function setTrainingButtons(isTraining) {
-  el('start-train-btn').disabled = isTraining;
-  el('stop-train-btn').disabled = !isTraining;
-  // These share the GpuModel's scratch buffers with the training loop -
-  // running one while training is active races both operations against
-  // each other (see the matching worker-side guard). Disable instead of
-  // relying on the worker to just reject the message.
-  el('debug-compare-btn').disabled = isTraining;
-  el('debug-compare-gradient-btn').disabled = isTraining;
-}
-
-function renderQaNotes(notes) {
-  const container = el('qa-notes');
-  container.innerHTML = '';
-  for (const note of notes) {
-    const div = document.createElement('div');
-    const isWarning = note.startsWith('[WARNING]');
-    div.className = `note${isWarning ? ' warning' : ''}`;
-    div.textContent = note;
-    container.appendChild(div);
-  }
-}
-
-function renderRetrievalPreview(chunks) {
-  const container = el('retrieval-preview');
-  container.innerHTML = '';
-  container.hidden = chunks.length === 0;
-  for (const chunk of chunks) {
-    const div = document.createElement('div');
-    div.className = 'chunk';
-    div.textContent = chunk;
-    container.appendChild(div);
-  }
-}
-
-// --- Sources ---------------------------------------------------------------
-
-async function pushAllSourcesToWorker() {
-  const sources = await db.listSources();
-  for (const src of sources) {
-    worker.postMessage({
-      type: 'upsertSource',
-      id: src.id,
-      rawText: src.rawText,
-      isHtml: src.kind === 'url',
-      tags: src.tags,
-    });
-  }
-}
-
-function currentSourceTags() {
-  return {
-    genre: el('source-genre-tag').value.trim(),
-    tone: el('source-tone-tag').value.trim(),
-  };
-}
-
-async function addSourceRecord({ title, kind, rawText, sourceUrl = null }) {
-  if (!rawText || !rawText.trim()) return;
-  const tags = currentSourceTags();
-  const record = await db.addSource({ title, kind, rawText, sourceUrl, tags });
-  if (modelCreated) {
-    worker.postMessage({
-      type: 'upsertSource',
-      id: record.id,
-      rawText: record.rawText,
-      isHtml: kind === 'url',
-      tags: record.tags,
-    });
-  }
-  await refreshSourcesList();
-}
-
-async function refreshSourcesList() {
-  const sources = await db.listSources();
-  const container = el('sources-list');
-  container.innerHTML = '';
-
-  if (sources.length === 0) {
-    const p = document.createElement('p');
-    p.className = 'empty-hint';
-    p.textContent = 'No sources yet — add one above to start building your training corpus.';
-    container.appendChild(p);
-    el('corpus-stats').textContent = '';
     return;
   }
-
-  for (const src of sources) {
-    container.appendChild(src.id === editingSourceId ? renderSourceEditor(src) : renderSourceRow(src));
-  }
-
-  if (!modelCreated) {
-    // This is a raw character count straight from the stored text - it
-    // will not match the "N training tokens" figure shown once a model
-    // exists (that one comes from the worker after cleaning/tokenizing:
-    // whitespace and HTML get stripped, and byte-level tokens don't map
-    // 1:1 to JS string characters for anything non-ASCII). Both numbers
-    // are correct; they're just measuring different things at different
-    // points in the pipeline, not a discrepancy in the source data.
-    const totalChars = sources.reduce((sum, s) => sum + s.rawText.length, 0);
-    el('corpus-stats').textContent =
-      `${sources.length} source${sources.length === 1 ? '' : 's'}, ${totalChars.toLocaleString()} ` +
-      'characters (raw) — create a model above to see the actual training token count.';
-  }
-}
-
-function renderSourceRow(src) {
-  const item = document.createElement('div');
-  item.className = 'source-item';
-
-  const meta = document.createElement('div');
-  meta.className = 'meta';
-  const title = document.createElement('div');
-  title.className = 'title';
-  const badge = document.createElement('span');
-  badge.className = 'kind-badge';
-  badge.textContent = src.kind;
-  title.append(badge, src.title);
-  const stats = document.createElement('div');
-  stats.className = 'stats';
-  const tagBits = [];
-  if (src.tags?.genre) tagBits.push(`genre: ${src.tags.genre}`);
-  if (src.tags?.tone) tagBits.push(`tone: ${src.tags.tone}`);
-  const tagText = tagBits.length ? ` — ${tagBits.join(', ')}` : '';
-  stats.textContent = `${src.rawText.length.toLocaleString()} characters${tagText}`;
-  meta.append(title, stats);
-
-  const actions = document.createElement('div');
-  actions.className = 'actions row';
-  const editBtn = document.createElement('button');
-  editBtn.type = 'button';
-  editBtn.className = 'secondary';
-  editBtn.textContent = 'Edit';
-  editBtn.addEventListener('click', () => {
-    editingSourceId = src.id;
-    refreshSourcesList();
-  });
-  const delBtn = document.createElement('button');
-  delBtn.type = 'button';
-  delBtn.className = 'secondary';
-  delBtn.textContent = 'Delete';
-  delBtn.addEventListener('click', async () => {
-    await db.deleteSource(src.id);
-    if (modelCreated) worker.postMessage({ type: 'removeSource', id: src.id });
-    await refreshSourcesList();
-  });
-  actions.append(editBtn, delBtn);
-
-  item.append(meta, actions);
-  return item;
-}
-
-function renderSourceEditor(src) {
-  const item = document.createElement('div');
-  item.className = 'source-item';
-  const wrap = document.createElement('div');
-  wrap.style.flex = '1';
-
-  const titleInput = document.createElement('input');
-  titleInput.type = 'text';
-  titleInput.value = src.title;
-  titleInput.style.width = '100%';
-  titleInput.style.marginBottom = '0.4rem';
-
-  const ta = document.createElement('textarea');
-  ta.rows = 6;
-  ta.value = src.rawText;
-
-  const tagRow = document.createElement('div');
-  tagRow.className = 'row';
-  tagRow.style.margin = '0.4rem 0';
-  const genreInput = document.createElement('input');
-  genreInput.type = 'text';
-  genreInput.placeholder = 'Genre';
-  genreInput.value = src.tags?.genre || '';
-  const toneInput = document.createElement('input');
-  toneInput.type = 'text';
-  toneInput.placeholder = 'Tone';
-  toneInput.value = src.tags?.tone || '';
-  tagRow.append(genreInput, toneInput);
-
-  const btnRow = document.createElement('div');
-  btnRow.className = 'row';
-  btnRow.style.marginTop = '0.4rem';
-  const saveBtn = document.createElement('button');
-  saveBtn.type = 'button';
-  saveBtn.textContent = 'Save';
-  saveBtn.addEventListener('click', async () => {
-    const tags = { genre: genreInput.value.trim(), tone: toneInput.value.trim() };
-    const updated = await db.updateSource(src.id, { title: titleInput.value.trim() || src.title, rawText: ta.value, tags });
-    editingSourceId = null;
-    if (modelCreated) {
-      worker.postMessage({
-        type: 'upsertSource',
-        id: updated.id,
-        rawText: updated.rawText,
-        isHtml: updated.kind === 'url',
-        tags: updated.tags,
-      });
+  if (type === 'error') {
+    const entry = pending.get(id);
+    if (entry) {
+      pending.delete(id);
+      entry.reject(new Error(event.data.message));
+    } else {
+      showError(event.data.message);
     }
-    await refreshSourcesList();
-  });
-  const cancelBtn = document.createElement('button');
-  cancelBtn.type = 'button';
-  cancelBtn.className = 'secondary';
-  cancelBtn.textContent = 'Cancel';
-  cancelBtn.addEventListener('click', () => {
-    editingSourceId = null;
-    refreshSourcesList();
-  });
-  btnRow.append(saveBtn, cancelBtn);
+    return;
+  }
+  const handler = streamHandlers.get(type);
+  if (handler) handler(event.data);
+};
 
-  wrap.append(titleInput, ta, tagRow, btnRow);
-  item.append(wrap);
-  return item;
+worker.onerror = (event) => showError(event.message || 'the worker failed');
+
+// --- Small helpers -----------------------------------------------------
+
+const $ = (id) => document.getElementById(id);
+
+function showError(message) {
+  const banner = $('error-banner');
+  banner.textContent = message;
+  banner.hidden = false;
 }
 
-el('add-url-btn').addEventListener('click', async () => {
-  const url = el('url-input').value.trim();
-  if (!url) return;
-  el('add-url-btn').disabled = true;
-  try {
-    const res = await fetch(url);
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const text = await res.text();
-    await addSourceRecord({ title: url, kind: 'url', rawText: text, sourceUrl: url });
-    el('url-input').value = '';
-  } catch (err) {
-    alert(
-      `Could not fetch that URL — this is almost always the site blocking cross-origin ` +
-      `requests (CORS), not a bug here. Copy the text and use "Paste text" instead.\n\n${err}`
-    );
-  } finally {
-    el('add-url-btn').disabled = false;
+function clearError() {
+  $('error-banner').hidden = true;
+}
+
+function formatCount(n) {
+  if (n >= 1e6) return `${(n / 1e6).toFixed(2)}M`;
+  if (n >= 1e3) return `${(n / 1e3).toFixed(1)}k`;
+  return String(Math.round(n));
+}
+
+function formatDuration(seconds) {
+  if (!isFinite(seconds) || seconds < 0) return '—';
+  if (seconds < 60) return `${seconds.toFixed(0)}s`;
+  const m = Math.floor(seconds / 60);
+  const s = Math.round(seconds % 60);
+  return `${m}m${String(s).padStart(2, '0')}s`;
+}
+
+function setProgress(barId, fraction) {
+  const clamped = Math.max(0, Math.min(1, fraction || 0));
+  $(barId).style.width = `${(clamped * 100).toFixed(1)}%`;
+}
+
+// --- Title-bar and notifications --------------------------------------
+//
+// A background tab shows only its title, so that's where progress goes
+// when the page isn't visible. Notifications need a user gesture to ask
+// for permission, so the checkbox asks when it's ticked rather than on
+// page load — an unprompted permission dialog is exactly the thing
+// everyone has learned to dismiss.
+
+const BASE_TITLE = document.title;
+
+function setTitleProgress(label, fraction) {
+  if (!label) {
+    document.title = BASE_TITLE;
+    return;
+  }
+  const percent = fraction > 0 ? ` ${(fraction * 100).toFixed(0)}%` : '';
+  document.title = `${label}${percent} — ${BASE_TITLE}`;
+}
+
+$('notify-toggle').addEventListener('change', async (event) => {
+  if (!event.target.checked) return;
+  if (!('Notification' in window)) {
+    event.target.checked = false;
+    showError("this browser doesn't support notifications");
+    return;
+  }
+  if (Notification.permission === 'default') {
+    const result = await Notification.requestPermission();
+    if (result !== 'granted') {
+      event.target.checked = false;
+      showError('notifications were blocked — the page will still show progress');
+    }
+  } else if (Notification.permission === 'denied') {
+    event.target.checked = false;
+    showError('notifications are blocked for this site in your browser settings');
   }
 });
 
-el('file-input').addEventListener('change', async (event) => {
-  const files = Array.from(event.target.files || []);
-  for (const file of files) {
+function notify(title, body) {
+  if (!$('notify-toggle').checked) return;
+  if (!('Notification' in window) || Notification.permission !== 'granted') return;
+  // Only worth interrupting for if the user isn't already looking at it.
+  if (document.visibilityState === 'visible') return;
+  try {
+    new Notification(title, { body, tag: 'scriptonait' });
+  } catch (error) {
+    // Some browsers refuse constructor notifications outside a service
+    // worker. Not worth surfacing — the in-page status still updated.
+  }
+}
+
+// --- Model state -------------------------------------------------------
+
+let model = null;
+let generating = false;
+let training = false;
+
+const MODEL_URL = './model/scriptonait.ckpt';
+
+function setModelStatus(state, text) {
+  const el = $('model-status');
+  el.className = `model-status ${state}`;
+  $('model-status-text').textContent = text;
+}
+
+function renderModel(info) {
+  model = info;
+  $('generate-btn').disabled = !info;
+  $('train-btn').disabled = !info;
+  if (!info) return;
+
+  const params = formatCount(info.params);
+  setModelStatus(
+    'ready',
+    info.pretrained
+      ? `Ready — ${params} parameters, trained for ${formatCount(info.step)} steps.`
+      : `Untrained model created (${params} parameters). It will write nonsense until you fine-tune it.`,
+  );
+  $('model-details').innerHTML = `
+    <dl>
+      <div><dt>Parameters</dt><dd>${params}</dd></div>
+      <div><dt>Layers</dt><dd>${info.layers}</dd></div>
+      <div><dt>Hidden size</dt><dd>${info.hidden}</dd></div>
+      <div><dt>Heads</dt><dd>${info.heads} (${info.kvHeads} key/value)</dd></div>
+      <div><dt>Context</dt><dd>${info.contextLen} tokens, ${info.window}-token attention window</dd></div>
+      <div><dt>Vocabulary</dt><dd>${info.vocabSize} tokens</dd></div>
+      <div><dt>Training steps</dt><dd>${formatCount(info.step)}</dd></div>
+    </dl>`;
+  $('corpus-stats').textContent = info.sources
+    ? `${info.sources} source${info.sources === 1 ? '' : 's'}, ${formatCount(info.corpusTokens)} tokens`
+    : 'No sources added yet.';
+}
+
+onStream('download-progress', ({ received, total }) => {
+  $('model-progress').hidden = false;
+  const fraction = total > 0 ? received / total : 0;
+  setProgress('model-progress-bar', fraction);
+  const mb = (received / 1e6).toFixed(1);
+  const totalMb = total > 0 ? ` of ${(total / 1e6).toFixed(1)}` : '';
+  setModelStatus('loading', `Downloading the model — ${mb}${totalMb} MB`);
+  setTitleProgress('Loading', fraction);
+});
+
+async function loadModel() {
+  try {
+    const info = await call('load-model', { url: MODEL_URL });
+    $('model-progress').hidden = true;
+    setTitleProgress(null);
+    renderModel(info);
+  } catch (error) {
+    $('model-progress').hidden = true;
+    setTitleProgress(null);
+    setModelStatus(
+      'absent',
+      'No pretrained model is published for this site yet. You can still ' +
+        'load a model file, or create an untrained one, under "The model".',
+    );
+    $('model-panel').open = true;
+  }
+}
+
+// --- Prompt understanding ---------------------------------------------
+
+let parseTimer = null;
+
+$('prompt-input').addEventListener('input', () => {
+  clearTimeout(parseTimer);
+  // Debounced: this is a round trip to the worker on every keystroke
+  // otherwise, and it's only there to reassure.
+  parseTimer = setTimeout(updateUnderstanding, 250);
+});
+
+async function updateUnderstanding() {
+  const prompt = $('prompt-input').value.trim();
+  const box = $('understood');
+  if (!prompt) {
+    box.hidden = true;
+    return;
+  }
+  try {
+    const parsed = await call('parse-prompt', { prompt });
+    const chips = [];
+    chips.push(`<span class="chip">${parsed.form === 'any' ? 'form: your choice' : parsed.form}</span>`);
+    if (parsed.targetWords) chips.push(`<span class="chip">${parsed.targetWords} words</span>`);
+    if (parsed.subject) chips.push(`<span class="chip">about: ${escapeHtml(parsed.subject)}</span>`);
+    if (parsed.reference) chips.push(`<span class="chip">echoing: ${escapeHtml(parsed.reference)}</span>`);
+    box.innerHTML = `<span class="understood-label">Understood as</span>${chips.join('')}`;
+    box.hidden = false;
+  } catch (error) {
+    box.hidden = true;
+  }
+}
+
+function escapeHtml(text) {
+  return text.replace(/[&<>"']/g, (c) => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
+  })[c]);
+}
+
+// --- Generating --------------------------------------------------------
+
+let targetWords = 0;
+
+onStream('generate-piece', ({ piece }) => {
+  const output = $('output');
+  output.hidden = false;
+  output.textContent += piece;
+  // Only follow the text if the user hasn't scrolled up to read.
+  const nearBottom = output.scrollHeight - output.scrollTop - output.clientHeight < 40;
+  if (nearBottom) output.scrollTop = output.scrollHeight;
+});
+
+onStream('generate-progress', ({ words, tokens, elapsedSeconds, tokensPerSecond }) => {
+  const fraction = targetWords > 0 ? words / targetWords : 0;
+  setProgress('generate-progress-bar', fraction);
+  const of = targetWords > 0 ? ` of ${targetWords}` : '';
+  $('generate-stats').textContent =
+    `${words} words${of} · ${tokens} tokens · ${tokensPerSecond.toFixed(0)} tokens/s · ${formatDuration(elapsedSeconds)}`;
+  setTitleProgress('Writing', fraction);
+});
+
+$('generate-btn').addEventListener('click', async () => {
+  if (generating) return;
+  const prompt = $('prompt-input').value.trim();
+  if (!prompt) {
+    showError('type what you want written first');
+    return;
+  }
+  clearError();
+  generating = true;
+  $('generate-btn').disabled = true;
+  $('stop-btn').hidden = false;
+  $('generate-status').hidden = false;
+  $('qa-notes').hidden = true;
+  $('output').textContent = '';
+  setProgress('generate-progress-bar', 0);
+  $('generate-stats').textContent = 'Starting…';
+
+  const parsed = await call('parse-prompt', { prompt });
+  targetWords = parsed.targetWords;
+
+  try {
+    const result = await call('generate', {
+      prompt,
+      temperature: Number($('opt-temperature').value),
+      topK: Number($('opt-top-k').value),
+      topP: Number($('opt-top-p').value),
+      repetitionPenalty: Number($('opt-repetition').value),
+      seed: Number($('opt-seed').value) || Math.floor(Math.random() * 1e9),
+      useStoryState: $('use-story-state').checked,
+      useRetrieval: $('use-retrieval').checked,
+    });
+    setProgress('generate-progress-bar', 1);
+    const why = {
+      'end-of-text': 'the model ended the piece',
+      length: 'reached the length you asked for',
+      stopped: 'stopped',
+    }[result.stopReason] || result.stopReason;
+    $('generate-stats').textContent =
+      `${result.wordCount} words in ${formatDuration(result.elapsedSeconds)} · ` +
+      `${result.tokensPerSecond.toFixed(0)} tokens/s · ${why}`;
+    renderNotes(result.notes);
+    notify('Your piece is ready', `${result.wordCount} words — ${why}.`);
+  } catch (error) {
+    showError(error.message);
+  } finally {
+    generating = false;
+    $('generate-btn').disabled = false;
+    $('stop-btn').hidden = true;
+    setTitleProgress(null);
+  }
+});
+
+$('stop-btn').addEventListener('click', () => call('stop'));
+
+function renderNotes(notes) {
+  const box = $('qa-notes');
+  if (!notes || notes.length === 0) {
+    box.hidden = true;
+    return;
+  }
+  box.innerHTML = notes
+    .map((note) => {
+      const warning = note.startsWith('[WARNING]');
+      const text = note.replace(/^\[(INFO|WARNING)\]\s*/, '');
+      return `<p class="note${warning ? ' warning' : ''}">${escapeHtml(text)}</p>`;
+    })
+    .join('');
+  box.hidden = false;
+}
+
+// --- Sources -----------------------------------------------------------
+
+async function refreshSources() {
+  const sources = await db.listSources();
+  const list = $('sources-list');
+  if (sources.length === 0) {
+    list.innerHTML = '<p class="empty-hint">Nothing added yet.</p>';
+  } else {
+    list.innerHTML = sources
+      .map(
+        (source) => `
+        <div class="source-item" data-id="${source.id}">
+          <div class="meta">
+            <span class="title">${escapeHtml(source.title)}</span>
+            <span class="kind-badge">${source.kind}</span>
+          </div>
+          <button type="button" class="secondary remove-source" data-id="${source.id}">Remove</button>
+        </div>`,
+      )
+      .join('');
+    for (const button of list.querySelectorAll('.remove-source')) {
+      button.addEventListener('click', async () => {
+        await db.deleteSource(button.dataset.id);
+        renderModel(await call('remove-source', { id: button.dataset.id }));
+        await refreshSources();
+        await refreshStoryState();
+      });
+    }
+  }
+  $('train-btn').disabled = !model || sources.length === 0;
+}
+
+async function addSource({ title, kind, rawText, sourceUrl = null }) {
+  clearError();
+  const record = await db.addSource({ title, kind, rawText, sourceUrl });
+  const result = await call('upsert-source', {
+    id: record.id,
+    text: rawText,
+    isHtml: kind === 'url',
+  });
+  renderModel(result.model);
+  await refreshSources();
+  await refreshStoryState();
+}
+
+async function refreshStoryState() {
+  const box = $('story-state');
+  try {
+    const state = await call('story-state');
+    if (!state.characters.length && !state.locations.length) {
+      box.hidden = true;
+      return;
+    }
+    const parts = [];
+    if (state.characters.length) parts.push(`<strong>Characters:</strong> ${escapeHtml(state.characters.join(', '))}`);
+    if (state.locations.length) parts.push(`<strong>Locations:</strong> ${escapeHtml(state.locations.join(', '))}`);
+    if (state.sceneCount) parts.push(`<strong>Scenes:</strong> ${state.sceneCount}`);
+    box.innerHTML = `${parts.join('<br />')}<p class="hint">Found by looking at line shapes, not by understanding the text — unusual formatting can fool it.</p>`;
+    box.hidden = false;
+  } catch (error) {
+    box.hidden = true;
+  }
+}
+
+$('add-paste-btn').addEventListener('click', async () => {
+  const text = $('paste-input').value.trim();
+  if (!text) return;
+  const title = $('paste-title').value.trim() || `Pasted ${new Date().toLocaleString()}`;
+  await addSource({ title, kind: 'paste', rawText: text });
+  $('paste-input').value = '';
+  $('paste-title').value = '';
+});
+
+$('file-input').addEventListener('change', async (event) => {
+  for (const file of event.target.files) {
     const text = await file.text();
-    await addSourceRecord({ title: file.name, kind: 'file', rawText: text, sourceUrl: null });
+    await addSource({ title: file.name, kind: 'file', rawText: text });
   }
   event.target.value = '';
 });
 
-el('add-paste-btn').addEventListener('click', async () => {
-  const text = el('paste-input').value;
-  const title = el('paste-title').value.trim() || `Pasted text — ${new Date().toLocaleString()}`;
-  await addSourceRecord({ title, kind: 'paste', rawText: text, sourceUrl: null });
-  el('paste-input').value = '';
-  el('paste-title').value = '';
-});
-
-// --- Model shape / size estimate -------------------------------------------
-
-const VOCAB_SIZE = 259; // 256 bytes + PAD/BOS/EOS — must match llm-core's tokenizer::VOCAB_SIZE
-
-function currentConfig() {
-  return {
-    numLayers: parseInt(el('cfg-layers').value, 10),
-    hiddenDim: parseInt(el('cfg-hidden').value, 10),
-    numHeads: parseInt(el('cfg-heads').value, 10),
-    contextLen: parseInt(el('cfg-context').value, 10),
-    localWindow: parseInt(el('cfg-window').value, 10),
-  };
-}
-
-// Mirrors llm-core's config.rs `param_count`/`activation_bytes`/
-// `memory_bytes`/`default_ffn_dim` exactly, so the estimate updates live
-// while adjusting settings, before a model exists.
-//
-// `activationBytes` is the one that matters for "can this config actually
-// run": the attention cache is layers x heads x context x window floats,
-// which at a long context is far larger than every weight in the model
-// put together. Leaving it out of the estimate is what let the UI present
-// a config needing tens of GB as a 3 GB one.
-function estimateParamsAndMemory(cfg) {
-  const ffnDim = Math.ceil((cfg.hiddenDim * 8) / 3 / 32) * 32;
-  const embedding = VOCAB_SIZE * cfg.hiddenDim;
-  const perLayerPle = VOCAB_SIZE * cfg.hiddenDim;
-  const perLayerAttn = cfg.hiddenDim + 4 * cfg.hiddenDim * cfg.hiddenDim;
-  const perLayerMlp = cfg.hiddenDim + 3 * cfg.hiddenDim * ffnDim;
-  const perLayer = perLayerPle + perLayerAttn + perLayerMlp;
-  const params = embedding + cfg.numLayers * perLayer + cfg.hiddenDim;
-  const inferenceBytes = params * 4;
-
-  const t = cfg.contextLen || 0;
-  const h = cfg.hiddenDim;
-  const band = Math.min(cfg.localWindow || t, t);
-  const perLayerAct = 8 * t * h + 2 * t * ffnDim + (cfg.numHeads || 1) * t * band + 2 * t;
-  const sharedAct = 3 * t * h + 2 * t * VOCAB_SIZE + 6 * t * h + 3 * t * ffnDim;
-  const activationBytes = (cfg.numLayers * perLayerAct + sharedAct) * 4;
-
-  const trainingBytes = inferenceBytes * 4 + activationBytes;
-  return { params, inferenceBytes, activationBytes, trainingBytes };
-}
-
-function formatBytes(bytes) {
-  if (bytes < 1024) return `${Math.round(bytes)} B`;
-  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
-  if (bytes < 1024 * 1024 * 1024) return `${(bytes / 1024 / 1024).toFixed(2)} MB`;
-  return `${(bytes / 1024 / 1024 / 1024).toFixed(2)} GB`;
-}
-
-// Mirrors llm-core's config.rs `MAX_TRAINING_BYTES`: past this, a wasm32
-// heap can't hold the run at all, so `WasmLLM::new` rejects the config
-// outright. The softer threshold below it is where training still fits
-// but starts crowding a normal machine's RAM.
-const MAX_TRAINING_BYTES = 2 * 1024 * 1024 * 1024;
-const HEAVY_TRAINING_BYTES = 512 * 1024 * 1024;
-
-function configTooLarge(cfg) {
-  const { trainingBytes } = estimateParamsAndMemory(cfg);
-  return trainingBytes > MAX_TRAINING_BYTES;
-}
-
-function updateSizeEstimate() {
-  const cfg = currentConfig();
-  if (!cfg.hiddenDim || !cfg.numLayers || !cfg.numHeads || !cfg.contextLen) return;
-  if (cfg.hiddenDim % cfg.numHeads !== 0) {
-    el('size-estimate').textContent = `Heads (${cfg.numHeads}) must evenly divide nodes (${cfg.hiddenDim}).`;
-    return;
-  }
-  const { params, inferenceBytes, activationBytes, trainingBytes } = estimateParamsAndMemory(cfg);
-  let text =
-    `≈ ${Math.round(params).toLocaleString()} parameters — ${formatBytes(inferenceBytes)} for inference, ` +
-    `${formatBytes(trainingBytes)} while training ` +
-    `(${formatBytes(inferenceBytes * 4)} weights + optimizer, ${formatBytes(activationBytes)} activations).`;
-  if (trainingBytes > MAX_TRAINING_BYTES) {
-    text += ` ✕ Too large to train in a browser tab (limit ${formatBytes(MAX_TRAINING_BYTES)}) — ` +
-      'lower the context length or attention window first; the activation cost scales with both.';
-  } else if (trainingBytes > HEAVY_TRAINING_BYTES) {
-    text += ' ⚠ Heavy — this will use a noticeable share of the machine\'s RAM while training.';
-  }
-  el('size-estimate').textContent = text;
-}
-
-['cfg-layers', 'cfg-hidden', 'cfg-heads', 'cfg-context', 'cfg-window'].forEach((id) => {
-  el(id).addEventListener('input', updateSizeEstimate);
-});
-
-// --- Settings suggestion ---------------------------------------------
-
-// Target ~2.3 parameters per training token: this is small-scale
-// interactive training, where the model sees the corpus many times over
-// many epochs rather than one Chinchilla-style pass, so it's tuned for
-// "enough capacity to actually learn spelling and local structure" rather
-// than one-epoch data efficiency. Clamped regardless of corpus size so a
-// tiny corpus doesn't get an unusably small model and a huge one doesn't
-// get a model too large to train in a browser tab.
-const PARAMS_PER_TOKEN = 2.3;
-const MIN_SUGGESTED_PARAMS = 1_000_000;
-const MAX_SUGGESTED_PARAMS = 40_000_000;
-// Without WebGPU every step runs on one wasm thread, where step time
-// scales about linearly with parameter count: a few million parameters is
-// already seconds per step, and the 40M ceiling above is minutes per step
-// - a suggestion that reads as a recommendation and behaves like a hang.
-// Corpus size is no argument for a model this machine can't train, so the
-// CPU-only suggestion is capped and says why.
-const MAX_CPU_SUGGESTED_PARAMS = 3_000_000;
-const MAX_CPU_SUGGESTED_BATCH = 4;
-
-function suggestNumLayers(totalTokens) {
-  if (totalTokens < 500_000) return 4;
-  if (totalTokens < 3_000_000) return 6;
-  if (totalTokens < 15_000_000) return 8;
-  return 10;
-}
-
-function suggestBatchSize(totalTokens) {
-  if (totalTokens < 100_000) return 4;
-  if (totalTokens < 1_000_000) return 8;
-  return 16;
-}
-
-// Picks the smallest-error hidden size (in steps of 32) for the given
-// layer count by search rather than a closed-form solve, since the real
-// parameter formula isn't cleanly invertible (ffnDim rounds up to a
-// multiple of 32). numHeads doesn't affect the parameter count at all
-// (Q/K/V/O are hiddenDim×hiddenDim regardless of how many heads split
-// it), so it's irrelevant here and picked separately below.
-function suggestHiddenDim(numLayers, targetParams) {
-  let best = 64;
-  let bestDiff = Infinity;
-  for (let h = 64; h <= 1536; h += 32) {
-    const { params } = estimateParamsAndMemory({ numLayers, hiddenDim: h, numHeads: 1 });
-    const diff = Math.abs(params - targetParams);
-    if (diff < bestDiff) {
-      bestDiff = diff;
-      best = h;
-    }
-  }
-  return best;
-}
-
-// Closest number of heads to a 64-wide head_dim (a common convention)
-// that still evenly divides hiddenDim with an even head_dim (required for
-// RoPE) — see the create-model-btn handler's own validation of this.
-function suggestNumHeads(hiddenDim) {
-  const target = Math.max(1, Math.round(hiddenDim / 64));
-  for (let delta = 0; delta <= hiddenDim; delta++) {
-    for (const h of [target - delta, target + delta]) {
-      if (h >= 1 && hiddenDim % h === 0 && (hiddenDim / h) % 2 === 0) {
-        return h;
-      }
-    }
-  }
-  return 1;
-}
-
-function suggestSettings(totalTokens, { gpuAvailable = true } = {}) {
-  const ceiling = gpuAvailable ? MAX_SUGGESTED_PARAMS : MAX_CPU_SUGGESTED_PARAMS;
-  const targetParams = Math.min(ceiling, Math.max(MIN_SUGGESTED_PARAMS, totalTokens * PARAMS_PER_TOKEN));
-  const numLayers = gpuAvailable ? suggestNumLayers(totalTokens) : Math.min(4, suggestNumLayers(totalTokens));
-  const hiddenDim = suggestHiddenDim(numLayers, targetParams);
-  const batchSize = gpuAvailable
-    ? suggestBatchSize(totalTokens)
-    : Math.min(MAX_CPU_SUGGESTED_BATCH, suggestBatchSize(totalTokens));
-  return {
-    numLayers,
-    hiddenDim,
-    numHeads: suggestNumHeads(hiddenDim),
-    cappedForCpu: !gpuAvailable && totalTokens * PARAMS_PER_TOKEN > MAX_CPU_SUGGESTED_PARAMS,
-    // Always the GPU backend's max: longer context helps this kind of
-    // text, and nothing about corpus size argues for giving it up when
-    // the GPU backend can handle the full 256 anyway.
-    contextLen: GPU_MAX_CONTEXT,
-    localWindow: GPU_MAX_CONTEXT,
-    batchSize,
-    lr: 0.003,
-    sampleEveryN: 250,
-  };
-}
-
-function applySuggestion(suggestion) {
-  el('cfg-layers').value = suggestion.numLayers;
-  el('cfg-hidden').value = suggestion.hiddenDim;
-  el('cfg-heads').value = suggestion.numHeads;
-  el('cfg-context').value = suggestion.contextLen;
-  el('cfg-window').value = suggestion.localWindow;
-  el('cfg-batch').value = suggestion.batchSize;
-  el('cfg-lr').value = suggestion.lr;
-  el('train-sample-every').value = suggestion.sampleEveryN;
-  updateSizeEstimate();
-}
-
-// A handful of depth/width tradeoffs that all target the same parameter
-// budget (half the baseline layer count, the baseline itself, and double
-// it — each re-solved for hidden size via suggestHiddenDim) - benchmarked
-// for real below rather than guessed at, since raw compute scales with
-// hidden size squared but GPU dispatch-call overhead scales with layer
-// count alone, and which one actually dominates depends on the GPU.
-function benchmarkCandidateShapes(baselineLayers, targetParams) {
-  const layerOptions = [...new Set([Math.max(2, Math.round(baselineLayers / 2)), baselineLayers, Math.min(24, baselineLayers * 2)])];
-  return layerOptions.map((numLayers) => {
-    const hiddenDim = suggestHiddenDim(numLayers, targetParams);
-    return {
-      numLayers,
-      hiddenDim,
-      numHeads: suggestNumHeads(hiddenDim),
-      contextLen: GPU_MAX_CONTEXT,
-      localWindow: GPU_MAX_CONTEXT,
-    };
-  });
-}
-
-el('suggest-settings-btn').addEventListener('click', async () => {
-  el('suggest-settings-btn').disabled = true;
+$('add-url-btn').addEventListener('click', async () => {
+  const url = $('url-input').value.trim();
+  if (!url) return;
   try {
-    const sources = await db.listSources();
-    if (sources.length === 0) {
-      el('suggest-settings-status').textContent =
-        'Add at least one source first — there is nothing to size a model against yet.';
-      return;
-    }
-    // Byte count, not character count: the tokenizer is byte-level (one
-    // token per UTF-8 byte), so this is what actually determines training
-    // token count — source.rawText.length would undercount any non-ASCII
-    // text.
-    const encoder = new TextEncoder();
-    const totalTokens = sources.reduce((sum, s) => sum + encoder.encode(s.rawText).length, 0);
-    const suggestion = suggestSettings(totalTokens, { gpuAvailable: webgpuBrowserSupported });
-    const sourceWord = `${sources.length} source${sources.length === 1 ? '' : 's'}, ≈${Math.round(totalTokens).toLocaleString()} training tokens`;
-
-    if (!webgpuBrowserSupported) {
-      applySuggestion(suggestion);
-      el('suggest-settings-status').textContent =
-        `Suggested for ${sourceWord}: ${suggestion.numLayers} layers, ${suggestion.hiddenDim} nodes, ` +
-        `${suggestion.numHeads} heads, batch size ${suggestion.batchSize}, learning rate ${suggestion.lr} ` +
-        `(no WebGPU in this browser${suggestion.cappedForCpu
-          ? ', so this is capped to a size single-threaded CPU training can actually get through — ' +
-            'your corpus would support a larger model on a WebGPU-capable browser'
-          : ", so the shape wasn't benchmarked — sized by corpus alone"}).`;
-      return;
-    }
-
-    const targetParams = Math.min(MAX_SUGGESTED_PARAMS, Math.max(MIN_SUGGESTED_PARAMS, totalTokens * PARAMS_PER_TOKEN));
-    const candidates = benchmarkCandidateShapes(suggestion.numLayers, targetParams);
-    el('suggest-settings-status').textContent = `Benchmarking ${candidates.length} model shapes on your GPU for this corpus…`;
-
-    const results = await new Promise((resolve) => {
-      const handler = (event) => {
-        if (event.data.type === 'benchmarkProgress') {
-          const c = event.data.config;
-          el('suggest-settings-status').textContent =
-            `Benchmarking shape ${event.data.index + 1} of ${event.data.total} (${c.numLayers} layers, ${c.hiddenDim} nodes)…`;
-        } else if (event.data.type === 'benchmarkResult') {
-          worker.removeEventListener('message', handler);
-          resolve(event.data.results);
-        }
-      };
-      worker.addEventListener('message', handler);
-      worker.postMessage({ type: 'benchmarkConfigs', configs: candidates, batchSize: suggestion.batchSize, lr: suggestion.lr });
-    });
-
-    const timed = results.filter((r) => r.medianStepMs !== undefined);
-    if (timed.length === 0) {
-      applySuggestion(suggestion);
-      el('suggest-settings-status').textContent =
-        `Suggested for ${sourceWord}: ${suggestion.numLayers} layers, ${suggestion.hiddenDim} nodes ` +
-        `(couldn't benchmark on GPU: ${results[0]?.error || 'unknown error'} — sized by corpus alone).`;
-      return;
-    }
-    const best = timed.reduce((a, b) => (b.medianStepMs < a.medianStepMs ? b : a));
-    applySuggestion({ ...suggestion, numLayers: best.config.numLayers, hiddenDim: best.config.hiddenDim, numHeads: best.config.numHeads });
-
-    const summary = timed.map((r) => `${r.config.numLayers}L/${r.config.hiddenDim}H: ${r.medianStepMs.toFixed(0)}ms/step`).join(', ');
-    el('suggest-settings-status').textContent =
-      `Fastest of ${timed.length} shapes benchmarked on your GPU for ${sourceWord}: ` +
-      `${best.config.numLayers} layers, ${best.config.hiddenDim} nodes, ${best.config.numHeads} heads ` +
-      `(${best.medianStepMs.toFixed(0)}ms/step). Tried: ${summary}.`;
-  } finally {
-    el('suggest-settings-btn').disabled = false;
+    const response = await fetch(url);
+    if (!response.ok) throw new Error(`the server answered ${response.status}`);
+    const text = await response.text();
+    await addSource({ title: url, kind: 'url', rawText: text, sourceUrl: url });
+    $('url-input').value = '';
+  } catch (error) {
+    showError(`couldn't fetch that URL (${error.message}). Most sites block cross-origin fetches — paste the text instead.`);
   }
 });
 
-el('create-model-btn').addEventListener('click', () => {
-  const cfg = currentConfig();
-  if (cfg.hiddenDim % cfg.numHeads !== 0) {
-    alert(`Attention heads (${cfg.numHeads}) must evenly divide nodes (${cfg.hiddenDim}).`);
-    return;
-  }
-  if ((cfg.hiddenDim / cfg.numHeads) % 2 !== 0) {
-    alert(`Nodes / heads (${cfg.hiddenDim / cfg.numHeads}) must be even (needed for rotary position embeddings).`);
-    return;
-  }
-  if (configTooLarge(cfg)) {
-    const { trainingBytes } = estimateParamsAndMemory(cfg);
-    alert(
-      `This shape needs about ${formatBytes(trainingBytes)} to train, more than a browser tab can address ` +
-      `(${formatBytes(MAX_TRAINING_BYTES)}).\n\nMost of that is the attention cache — layers x heads x ` +
-      'context length x attention window — so lowering the context length or the attention window ' +
-      'shrinks it fastest.'
-    );
-    return;
-  }
-  modelConfig = cfg;
-  lossHistory = [];
-  el('create-model-btn').disabled = true;
-  el('create-model-btn').textContent = 'Creating…';
-  worker.postMessage({ type: 'createModel', config: cfg });
-  setTimeout(() => {
-    el('create-model-btn').disabled = false;
-    el('create-model-btn').textContent = 'Re-create model (resets training)';
-  }, 300);
+// --- Fine-tuning -------------------------------------------------------
+
+const lossHistory = [];
+
+onStream('train-progress', (progress) => {
+  setProgress('train-progress-bar', progress.fractionDone);
+  $('train-stats').textContent =
+    `step ${formatCount(progress.step)} · loss ${progress.smoothedLoss.toFixed(3)} · ` +
+    `${progress.tokensPerSecond.toFixed(0)} tokens/s · ${formatDuration(progress.elapsedSeconds)} elapsed`;
+  setTitleProgress('Fine-tuning', progress.fractionDone);
+  lossHistory.push(progress.smoothedLoss);
+  drawLossChart();
 });
 
-// --- Training ----------------------------------------------------------
-
-el('start-train-btn').addEventListener('click', () => {
+$('train-btn').addEventListener('click', async () => {
+  if (training) return;
+  clearError();
   training = true;
-  setTrainingButtons(true);
-  beginWakeJob();
-  el('train-samples').innerHTML = '';
-  stepMsHistory = [];
-  el('train-perf').textContent = '';
-  worker.postMessage({
-    type: 'startTraining',
-    batchSize: parseInt(el('cfg-batch').value, 10),
-    lr: parseFloat(el('cfg-lr').value),
-    useGpu: el('train-use-gpu').checked,
-    sampleEveryN: el('train-sample-toggle').checked ? parseInt(el('train-sample-every').value, 10) : 0,
-    samplePrompt: el('train-sample-prompt').value,
-  });
+  lossHistory.length = 0;
+  $('train-btn').disabled = true;
+  $('train-stop-btn').hidden = false;
+  $('train-status').hidden = false;
+  $('loss-chart').hidden = false;
+  $('train-stats').textContent = 'Starting…';
+
+  try {
+    const result = await call('train', {
+      batchSize: Number($('train-batch').value),
+      learningRate: Number($('train-lr').value),
+      maxSteps: Number($('train-steps').value),
+      effort: Number($('train-effort').value),
+    });
+    if (result.stopReason === 'no-data') {
+      showError('there isn\'t enough source text yet to fill even one context window — add more.');
+    } else {
+      setProgress('train-progress-bar', 1);
+      $('train-stats').textContent =
+        `${result.steps} steps in ${formatDuration(result.elapsedSeconds)} · final loss ${(result.loss ?? NaN).toFixed(3)}`;
+      notify('Fine-tuning finished', `${result.steps} steps, loss ${(result.loss ?? NaN).toFixed(3)}.`);
+    }
+    if (result.model) renderModel(result.model);
+  } catch (error) {
+    showError(error.message);
+  } finally {
+    training = false;
+    $('train-btn').disabled = false;
+    $('train-stop-btn').hidden = true;
+    setTitleProgress(null);
+  }
 });
 
-el('stop-train-btn').addEventListener('click', () => {
-  worker.postMessage({ type: 'stopTraining' });
-});
-
-// Training posts progress far faster than a screen refreshes; redrawing
-// the chart synchronously on every message meant the main thread spent
-// its time on canvas work it would never display. One redraw per frame,
-// at most.
-let lossChartPending = false;
-function scheduleLossChart() {
-  if (lossChartPending) return;
-  lossChartPending = true;
-  requestAnimationFrame(() => {
-    lossChartPending = false;
-    drawLossChart();
-  });
-}
+$('train-stop-btn').addEventListener('click', () => call('stop'));
 
 function drawLossChart() {
-  const canvas = el('loss-chart');
+  const canvas = $('loss-chart');
   const ctx = canvas.getContext('2d');
   const { width, height } = canvas;
   ctx.clearRect(0, 0, width, height);
   if (lossHistory.length < 2) return;
 
-  const max = Math.max(...lossHistory);
   const min = Math.min(...lossHistory);
-  const range = Math.max(max - min, 1e-6);
-  const styles = getComputedStyle(document.documentElement);
-  ctx.strokeStyle = styles.getPropertyValue('--accent').trim() || '#7a4b2a';
+  const max = Math.max(...lossHistory);
+  const span = max - min || 1;
+  ctx.strokeStyle = '#7aa2f7';
   ctx.lineWidth = 2;
   ctx.beginPath();
   lossHistory.forEach((loss, i) => {
     const x = (i / (lossHistory.length - 1)) * width;
-    const y = height - ((loss - min) / range) * (height - 10) - 5;
+    const y = height - ((loss - min) / span) * (height - 12) - 6;
     if (i === 0) ctx.moveTo(x, y);
     else ctx.lineTo(x, y);
   });
   ctx.stroke();
+  ctx.fillStyle = '#8891a8';
+  ctx.font = '11px system-ui, sans-serif';
+  ctx.fillText(max.toFixed(3), 4, 12);
+  ctx.fillText(min.toFixed(3), 4, height - 4);
 }
 
-// --- Generation ----------------------------------------------------------
+// --- Saving and loading models ----------------------------------------
 
-el('gen-use-gpu').addEventListener('change', () => {
-  if (el('gen-use-gpu').checked) {
-    setWebGpuStatus('WebGPU: initializing device…', '');
-    el('gpu-status').textContent = 'Initializing WebGPU…';
-    worker.postMessage({ type: 'initGpu' });
-  }
-});
-
-function currentGenerationTags() {
-  return {
-    genre: el('gen-genre-tag').value.trim(),
-    tone: el('gen-tone-tag').value.trim(),
-  };
-}
-
-el('generate-btn').addEventListener('click', () => {
-  const prompt = el('prompt-input').value;
-  el('generate-btn').disabled = true;
-  beginWakeJob();
-  el('generate-output').textContent = '';
-  renderQaNotes([]);
-  el('effective-prompt-details').hidden = true;
-  worker.postMessage({
-    type: 'generate',
-    prompt,
-    maxNewTokens: parseInt(el('gen-max-tokens').value, 10),
-    temperature: parseFloat(el('gen-temp').value),
-    useGpu: el('gen-use-gpu').checked,
-    tags: currentGenerationTags(),
-    useStoryState: el('gen-use-story-state').checked,
-    useRetrieval: el('gen-use-retrieval').checked,
-    retrievalK: 3,
-    targetWordCount: parseInt(el('gen-target-words').value, 10) || 0,
-    seed: Date.now(),
-  });
-});
-
-el('preview-retrieval-btn').addEventListener('click', () => {
-  const query = el('prompt-input').value;
-  if (!query.trim()) {
-    alert('Type a prompt first — retrieval searches your sources for scenes similar to it.');
-    return;
-  }
-  el('preview-retrieval-btn').disabled = true;
-  worker.postMessage({ type: 'previewRetrieval', query, k: 3 });
-});
-
-el('debug-compare-btn').addEventListener('click', () => {
-  worker.postMessage({ type: 'debugCompareGpuCpu', prompt: el('prompt-input').value || 'hello' });
-});
-
-el('debug-compare-gradient-btn').addEventListener('click', () => {
-  worker.postMessage({ type: 'debugCompareGpuCpuGradient', prompt: el('prompt-input').value || 'hello' });
-});
-
-// --- Save / load -----------------------------------------------------------
-
-function downloadWeights(bytes, step) {
+$('export-btn').addEventListener('click', async () => {
+  const { bytes } = await call('export-checkpoint');
   const blob = new Blob([bytes], { type: 'application/octet-stream' });
   const url = URL.createObjectURL(blob);
-  const a = document.createElement('a');
-  a.href = url;
-  a.download = `scriptonait-weights-step${Math.round(step)}.bin`;
-  a.click();
+  const link = document.createElement('a');
+  link.href = url;
+  link.download = 'scriptonait.ckpt';
+  link.click();
   URL.revokeObjectURL(url);
-}
-
-el('download-weights-btn').addEventListener('click', () => {
-  const handler = (event) => {
-    if (event.data.type !== 'weightsExported') return;
-    worker.removeEventListener('message', handler);
-    downloadWeights(event.data.bytes, event.data.step);
-  };
-  worker.addEventListener('message', handler);
-  worker.postMessage({ type: 'exportWeights' });
 });
 
-el('upload-weights-input').addEventListener('change', async (event) => {
-  const file = event.target.files && event.target.files[0];
+$('import-input').addEventListener('change', async (event) => {
+  const file = event.target.files[0];
   if (!file) return;
-  const bytes = new Uint8Array(await file.arrayBuffer());
-  worker.postMessage({ type: 'importWeights', bytes }, [bytes.buffer]);
+  clearError();
+  setModelStatus('loading', `Loading ${file.name}…`);
+  try {
+    const buffer = await file.arrayBuffer();
+    renderModel(await call('import-checkpoint', { bytes: buffer }, [buffer]));
+  } catch (error) {
+    showError(`that file didn't load: ${error.message}`);
+    setModelStatus('absent', 'No model loaded.');
+  }
   event.target.value = '';
 });
 
-async function refreshModelSelect() {
-  const models = await db.listModels();
-  const select = el('load-model-select');
-  select.innerHTML = '';
-  if (models.length === 0) {
-    const opt = document.createElement('option');
-    opt.textContent = 'No saved checkpoints';
-    opt.disabled = true;
-    select.appendChild(opt);
-    return;
+$('create-model-btn').addEventListener('click', async () => {
+  clearError();
+  setModelStatus('loading', 'Creating an untrained model…');
+  try {
+    renderModel(
+      await call('create-model', {
+        layers: Number($('cfg-layers').value),
+        hidden: Number($('cfg-hidden').value),
+        heads: Number($('cfg-heads').value),
+        kvHeads: Number($('cfg-kv-heads').value),
+        contextLen: Number($('cfg-context').value),
+        window: Number($('cfg-window').value),
+        seed: Math.floor(Math.random() * 1e9),
+      }),
+    );
+    // A fresh model has an empty corpus; re-feed whatever is stored.
+    for (const source of await db.listSources()) {
+      await call('upsert-source', { id: source.id, text: source.rawText, isHtml: source.kind === 'url' });
+    }
+    await refreshSources();
+    await refreshStoryState();
+  } catch (error) {
+    showError(error.message);
+    setModelStatus('absent', 'No model loaded.');
   }
-  for (const m of models) {
-    const opt = document.createElement('option');
-    opt.value = m.id;
-    opt.textContent = `${m.name} (step ${m.step}, ${new Date(m.createdAt).toLocaleString()})`;
-    select.appendChild(opt);
-  }
-}
-
-el('save-model-btn').addEventListener('click', () => {
-  const name = el('save-name').value.trim();
-  if (!name) {
-    alert('Give this checkpoint a name first.');
-    return;
-  }
-  if (!modelConfig) {
-    alert('Create a model first.');
-    return;
-  }
-  const handler = (event) => {
-    if (event.data.type !== 'weightsExported') return;
-    worker.removeEventListener('message', handler);
-    db.saveModel({ name, config: modelConfig, weightBytes: event.data.bytes.buffer, step: event.data.step })
-      .then(refreshModelSelect);
-  };
-  worker.addEventListener('message', handler);
-  worker.postMessage({ type: 'exportWeights' });
 });
 
-el('load-model-btn').addEventListener('click', async () => {
-  const id = el('load-model-select').value;
-  if (!id) return;
-  const record = await db.getModel(id);
-  if (!record) return;
-  modelConfig = record.config;
-  el('cfg-layers').value = record.config.numLayers;
-  el('cfg-hidden').value = record.config.hiddenDim;
-  el('cfg-heads').value = record.config.numHeads;
-  el('cfg-context').value = record.config.contextLen;
-  el('cfg-window').value = record.config.localWindow;
-  updateSizeEstimate();
+// --- Start -------------------------------------------------------------
 
-  worker.postMessage({ type: 'createModel', config: record.config });
-  const handler = (event) => {
-    if (event.data.type !== 'modelCreated') return;
-    worker.removeEventListener('message', handler);
-    worker.postMessage({ type: 'importWeights', bytes: new Uint8Array(record.weightBytes) });
-  };
-  worker.addEventListener('message', handler);
-});
-
-el('delete-model-btn').addEventListener('click', async () => {
-  const id = el('load-model-select').value;
-  if (!id) return;
-  await db.deleteModel(id);
-  await refreshModelSelect();
-});
-
-// --- Init --------------------------------------------------------------
-
-updateSizeEstimate();
-refreshSourcesList();
-refreshModelSelect();
+(async function start() {
+  await refreshSources();
+  await loadModel();
+  // Sources persist across reloads, so hand them back to the freshly
+  // loaded model — it has no memory of them.
+  for (const source of await db.listSources()) {
+    try {
+      await call('upsert-source', { id: source.id, text: source.rawText, isHtml: source.kind === 'url' });
+    } catch (error) {
+      // A model that failed to load will reject these; the banner
+      // already says so.
+      break;
+    }
+  }
+  if (model) {
+    // The source count and token total changed while those were being
+    // re-fed, so ask the worker for the current numbers.
+    try {
+      renderModel(await call('model-info'));
+    } catch (error) {
+      /* the banner already says the model didn't load */
+    }
+  }
+  await refreshStoryState();
+})();
