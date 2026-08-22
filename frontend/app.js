@@ -221,7 +221,10 @@ function updateGuidance() {
   const words = sources.reduce((sum, s) => sum + (s.rawText || '').length, 0);
   const enoughText = words > 4000;
 
-  $('train-btn').disabled = training || sources.length === 0;
+  // Training is GPU work and has no CPU path: with no device the button
+  // is not something to press and find out.
+  const canTrain = !model || model.usingGpu;
+  $('train-btn').disabled = training || sources.length === 0 || (model && !model.usingGpu);
   $('generate-btn').disabled = generating || !model;
 
   $('train-btn').textContent = model
@@ -229,14 +232,16 @@ function updateGuidance() {
     : 'Train a model on my writing';
 
   const explains = $('train-explains');
-  explains.textContent = !model
-    ? 'New model, from scratch. Slow — hours, not minutes.'
-    : model.pretrained
-      ? 'Nudges the loaded model toward your writing.'
-      : 'Continues where it stopped.';
+  explains.textContent = !canTrain
+    ? 'Training needs WebGPU. This browser did not give the page a GPU.'
+    : !model
+      ? 'New model, from scratch, trained on your GPU.'
+      : model.pretrained
+        ? 'Nudges the loaded model toward your writing.'
+        : 'Continues where it stopped.';
 
   if (training) {
-    step.textContent = 'Training. Stop any time — progress is kept.';
+    step.textContent = 'Training on your GPU. Stop any time — progress is kept.';
   } else if (generating) {
     step.textContent = 'Writing…';
   } else if (!model && sources.length === 0) {
@@ -245,6 +250,8 @@ function updateGuidance() {
     step.textContent = `Only ${formatCount(words)} characters. Add more, then train.`;
   } else if (!model) {
     step.textContent = 'Step 2: train.';
+  } else if (!canTrain) {
+    step.textContent = 'No WebGPU here, so this model can write but not train.';
   } else if (model.step < 500) {
     step.textContent = 'Barely trained. Keep training, or try step 3.';
   } else {
@@ -276,9 +283,11 @@ function renderModel(info) {
   // enclosing pair rather than stripping brackets blindly, which left
   // the parentheses unbalanced.
   const device = (info.device || '').trim().replace(/^\((.*)\)$/, '$1').trim();
+  // Training only ever happens on the GPU, so a machine without one is
+  // told that here rather than when it presses Train.
   const where = info.usingGpu
-    ? `writing on your GPU${device ? ` (${device})` : ''}`
-    : 'writing on the CPU — this browser has no WebGPU';
+    ? `training and writing on your GPU${device ? ` (${device})` : ''}`
+    : 'no WebGPU in this browser — it can write on the CPU, but not train';
   setModelStatus(
     'ready',
     info.step > 0
@@ -294,7 +303,7 @@ function renderModel(info) {
       <div><dt>Context</dt><dd>${info.contextLen} tokens, ${info.window}-token attention window</dd></div>
       <div><dt>Vocabulary</dt><dd>${info.vocabSize} tokens</dd></div>
       <div><dt>Training steps</dt><dd>${info.step.toLocaleString()}</dd></div>
-      <div><dt>Generating on</dt><dd>${escapeHtml(info.device || 'CPU')}</dd></div>
+      <div><dt>Training and generating on</dt><dd>${escapeHtml(info.device || 'no GPU — cannot train')}</dd></div>
     </dl>`;
   updateGuidance();
 }
@@ -874,7 +883,13 @@ $('train-btn').addEventListener('click', async () => {
       sampleWords: 40,
     }, [], 0);
 
-    if (result.stopReason === 'no-data') {
+    if (result.stopReason === 'no-gpu') {
+      showError(
+        'Training runs on your GPU, and this browser did not give the page one. ' +
+          'Try a browser with WebGPU (Chrome or Edge 113+, Safari 18+), or enable it in ' +
+          "your browser's flags.",
+      );
+    } else if (result.stopReason === 'no-data') {
       showError('Not enough text to train on. Add more in step 1.');
     } else {
       setProgress('train-progress-bar', 1);

@@ -1,13 +1,17 @@
 //! WebGPU inference for llm-core models, via `wgpu` and WGSL compute
 //! shaders.
 //!
-//! Generation is what runs here. The prompt is prefilled by llm-core's
-//! gradient-checked CPU forward pass and its keys and values uploaded;
-//! every token after that is decoded on the GPU. `model.rs`'s header
-//! explains why the split falls there.
+//! Both training and generation run here.
 //!
-//! Training is not here. It runs natively, off the user's machine
-//! entirely — see `crates/llm-train`.
+//! `trainer.rs` is the training loop: forward, backward and AdamW as WGSL
+//! kernels, with the weights, gradients and Adam moments resident in GPU
+//! memory. A step reads back one small buffer — the loss and the
+//! gradient norm — and nothing else.
+//!
+//! `model.rs` is generation. The prompt is prefilled by llm-core's
+//! gradient-checked CPU forward pass and its keys and values uploaded;
+//! every token after that is decoded on the GPU. That file's header
+//! explains why the split falls there.
 //!
 //! ## Confidence
 //!
@@ -23,6 +27,8 @@
 mod buffers;
 mod context;
 mod model;
+mod trainer;
 
 pub use context::{GpuContext, Kernel, ParamsPool};
 pub use model::{supports, GpuModel, MAX_HEAD_DIM};
+pub use trainer::{supports_training, GpuStepReport, GpuTrainer};

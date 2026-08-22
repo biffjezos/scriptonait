@@ -1,25 +1,23 @@
-//! The browser's view of the model: one `WasmLLM` class over `llm-core`.
+//! The browser's view of the model: one `WasmLLM` class over `llm-core`
+//! and `llm-gpu`.
 //!
-//! What the browser does now is *inference*. The model that ships with
-//! the page was trained natively in CI (see `.github/workflows/pretrain.yml`
-//! and `crates/llm-train`) and arrives as a single checkpoint file
-//! carrying its own tokenizer, so the page's first job is to load it
-//! rather than to start a training loop and ask the user to wait.
+//! **Training runs on the GPU of the machine that opened the page, and
+//! nowhere else.** `train_step` samples a batch of token ids out of the
+//! user's own sources and hands it to `llm_gpu::GpuTrainer`, which does
+//! the forward pass, the backward pass and the AdamW update in WGSL,
+//! with the weights, gradients and optimizer moments resident in GPU
+//! memory. There is no CPU training path to fall back to: without
+//! WebGPU the page says so and does not train.
 //!
-//! Fine-tuning on your own text is still here — `upsert_source` plus
-//! `train_step` — but it's the secondary path, it's opt-in, and the
-//! caller controls its pace (see `worker.js`, which yields between steps
-//! against a time budget so a training run can't take over the machine).
+//! Generation runs on the GPU too, once `init_gpu` has uploaded the
+//! weights; the prompt prefill is the one piece still on the CPU,
+//! because that forward pass is the gradient-checked reference the GPU
+//! kernels are written against.
 //!
-//! Generation runs on the GPU when the browser has WebGPU, and on the
-//! CPU when it doesn't. That is a fact about the machine, not a setting:
-//! there is no toggle, the page just says which one it got.
-//!
-//! The two paths share their prompt handling, their sampling and their
-//! stopping rule (`llm_core::instruct::LengthGuard`) — what differs is
-//! only where the arithmetic happens. Both prefill on the CPU, because
-//! that forward pass is the gradient-checked one; the GPU takes over
-//! for the per-token decode, which is where the time goes.
+//! The trained weights live on the GPU between steps. They come back
+//! across the bus only when something actually needs them on this side —
+//! exporting a checkpoint, or generating — which `sync_from_gpu` does
+//! once, not per step.
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -32,14 +30,22 @@ use llm_core::corpus::Corpus;
 use llm_core::generate::{SamplingConfig, StopReason};
 use llm_core::instruct;
 use llm_core::tokenizer::Tokenizer;
-use llm_core::train::{TrainConfig, Trainer};
+use llm_core::model::ModelWeights;
+use llm_core::rng::Rng;
+use llm_core::train::TrainConfig;
 
-/// A ready WebGPU device plus this model's weights uploaded to it.
+/// A ready WebGPU device, this model's weights uploaded to it for
+/// generation, and — once training starts — the resident training state.
 struct GpuBackend {
     ctx: Rc<llm_gpu::GpuContext>,
     model: llm_gpu::GpuModel,
-    /// Training step the uploaded weights came from, so fine-tuning
-    /// invalidates them instead of generating from stale ones.
+    /// Allocated on the first training step, not at init: it holds the
+    /// gradients, both Adam moments and every layer's activations, which
+    /// is several times the model's own size and pointless to reserve
+    /// for a session that only generates.
+    trainer: Option<llm_gpu::GpuTrainer>,
+    /// Training step the uploaded generation weights came from, so
+    /// training invalidates them instead of generating from stale ones.
     uploaded_at_step: u64,
     summary: String,
     is_software: bool,
@@ -55,7 +61,15 @@ fn js_err(msg: impl std::fmt::Display) -> JsValue {
 }
 
 struct Inner {
-    trainer: Trainer,
+    config: ModelConfig,
+    /// The host-side copy. Authoritative until the first training step;
+    /// after that the GPU's copy is, and this one is refreshed by
+    /// `sync_from_gpu` when something needs it here.
+    weights: ModelWeights,
+    step: u64,
+    /// Batch sampling only — which sequences to train on, not any part
+    /// of the arithmetic.
+    rng: Rng,
     corpus: Corpus,
     gpu: Option<GpuBackend>,
     train: TrainConfig,
@@ -207,9 +221,11 @@ impl WasmLLM {
     /// get wrong and nothing to configure.
     pub fn from_checkpoint(bytes: &[u8]) -> Result<WasmLLM, JsValue> {
         let checkpoint = Checkpoint::from_bytes(bytes).map_err(js_err)?;
-        let trainer = Trainer::resume(checkpoint.config, checkpoint.weights, checkpoint.step, 1);
         Ok(WasmLLM(Rc::new(RefCell::new(Inner {
-            trainer,
+            config: checkpoint.config,
+            weights: checkpoint.weights,
+            step: checkpoint.step,
+            rng: Rng::seed_from_u64(1),
             corpus: Corpus::with_tokenizer(checkpoint.tokenizer),
             gpu: None,
             // Fine-tuning a trained model wants a small, flat learning
@@ -251,7 +267,10 @@ impl WasmLLM {
         };
         config.validate().map_err(js_err)?;
         Ok(WasmLLM(Rc::new(RefCell::new(Inner {
-            trainer: Trainer::new(config, seed as u64),
+            config,
+            weights: ModelWeights::init(&config, seed as u64),
+            step: 0,
+            rng: Rng::seed_from_u64(seed as u64),
             corpus: Corpus::with_tokenizer(tokenizer),
             gpu: None,
             train: TrainConfig::default(),
@@ -263,7 +282,7 @@ impl WasmLLM {
 
     pub fn info(&self) -> ModelInfo {
         let inner = self.0.borrow();
-        let config = inner.trainer.config;
+        let config = inner.config;
         ModelInfo {
             layers: config.num_layers as u32,
             hidden: config.hidden_dim as u32,
@@ -273,14 +292,14 @@ impl WasmLLM {
             window: config.effective_window() as u32,
             vocab_size: config.vocab_size as u32,
             params: config.param_count() as f64,
-            step: inner.trainer.step as f64,
+            step: inner.step as f64,
             pretrained: inner.pretrained,
         }
     }
 
     /// Rough memory estimate in bytes; see `ModelConfig::memory_bytes`.
     pub fn memory_bytes(&self, training: bool) -> f64 {
-        self.0.borrow().trainer.config.memory_bytes(training) as f64
+        self.0.borrow().config.memory_bytes(training) as f64
     }
 
     // --- Prompt understanding -------------------------------------------
@@ -294,12 +313,12 @@ impl WasmLLM {
     ///
     /// Call once after loading a model. Returns a short description of
     /// what the browser actually gave us — a device name, or why there
-    /// isn't one. Failure is normal and is not an error: browsers
-    /// without WebGPU exist, and the CPU path is always there.
+    /// isn't one. Generation survives a failure here (it finishes on the
+    /// CPU); training does not, because there is no CPU training path.
     pub async fn init_gpu(&self) -> Result<String, JsValue> {
         let (config, weights) = {
             let inner = self.0.borrow();
-            (inner.trainer.config, inner.trainer.weights.clone())
+            (inner.config, inner.weights.clone())
         };
         if !llm_gpu::supports(&config) {
             return Err(js_err("this model's shape is past what the GPU kernels handle"));
@@ -308,10 +327,11 @@ impl WasmLLM {
         let model = llm_gpu::GpuModel::upload(&ctx, &weights, &config).map_err(js_err)?;
         let summary = ctx.adapter_summary.clone();
         let is_software = ctx.is_software;
-        let step = self.0.borrow().trainer.step;
+        let step = self.0.borrow().step;
         self.0.borrow_mut().gpu = Some(GpuBackend {
             ctx,
             model,
+            trainer: None,
             uploaded_at_step: step,
             summary: summary.clone(),
             is_software,
@@ -364,12 +384,16 @@ impl WasmLLM {
             ..SamplingConfig::default()
         };
 
-        // The GPU path needs the weights to match what was uploaded; a
-        // fine-tuning run since then invalidates them, and re-uploading
-        // mid-generation would be worse than just using the CPU.
+        // Training since the last generation left the current weights on
+        // the GPU's training buffers; bring them across and re-upload
+        // them for decoding. Doing it here, once, is why a training step
+        // itself never pays for a weight transfer. A failure is not
+        // fatal: generation falls back to the CPU below.
+        let _ = self.sync_from_gpu().await;
+
         let gpu_is_current = {
             let inner = self.0.borrow();
-            inner.gpu.as_ref().is_some_and(|g| g.uploaded_at_step == inner.trainer.step)
+            inner.gpu.as_ref().is_some_and(|g| g.uploaded_at_step == inner.step)
         };
         if gpu_is_current {
             match self.generate_on_gpu(&request, &sampling, on_token).await {
@@ -405,8 +429,8 @@ impl WasmLLM {
     ) -> GenerationResult {
         let inner = self.0.borrow();
         let response = instruct::generate_response(
-            &inner.trainer.weights,
-            &inner.trainer.config,
+            &inner.weights,
+            &inner.config,
             inner.corpus.tokenizer(),
             request,
             sampling,
@@ -431,7 +455,7 @@ impl WasmLLM {
             let inner = self.0.borrow();
             let tokenizer = inner.corpus.tokenizer().clone();
             let prompt_tokens = request.to_prompt_tokens(&tokenizer);
-            (inner.trainer.weights.clone(), inner.trainer.config, tokenizer, prompt_tokens)
+            (inner.weights.clone(), inner.config, tokenizer, prompt_tokens)
         };
 
         let (mut logits, cache) = llm_core::model::prefill(&weights, &config, &prompt_tokens);
@@ -530,11 +554,21 @@ impl WasmLLM {
         self.0.borrow().corpus.total_tokens() as f64
     }
 
-    /// Whether there's enough source text to fine-tune on at all.
+    /// Whether a training step can run: enough source text to fill a
+    /// context window, and a GPU to run it on.
     pub fn can_train(&self) -> bool {
         let inner = &mut *self.0.borrow_mut();
-        let context_len = inner.trainer.config.context_len;
+        if inner.gpu.is_none() {
+            return false;
+        }
+        let context_len = inner.config.context_len;
         inner.corpus.can_sample(context_len)
+    }
+
+    /// Whether this browser gave us a device to train on at all. The
+    /// page uses this to explain itself when `can_train` is false.
+    pub fn has_gpu(&self) -> bool {
+        self.0.borrow().gpu.is_some()
     }
 
     pub fn story_characters(&self) -> Vec<String> {
@@ -601,21 +635,139 @@ impl WasmLLM {
             .collect()
     }
 
-    // --- Fine-tuning -----------------------------------------------------
+    // --- Training --------------------------------------------------------
 
-    /// One training step over the current sources. Returns `undefined`
-    /// if there isn't enough text yet to fill a single context window.
-    pub fn train_step(&self, batch_size: u32) -> Option<StepReport> {
+    /// One training step over the current sources, on the GPU.
+    ///
+    /// Errors when there is no WebGPU device: this is the whole training
+    /// path, not an accelerated version of another one. Returns
+    /// `undefined` when there isn't enough text yet to fill a single
+    /// context window.
+    ///
+    /// The batch is sampled here — which windows of the user's text to
+    /// train on — and handed over as token ids. Everything after that
+    /// (forward, loss, backward, AdamW) happens in WGSL, and the weights
+    /// stay in GPU memory between steps.
+    pub async fn train_step(&self, batch_size: u32) -> Result<Option<StepReport>, JsValue> {
+        let (config, train, step, batch) = {
+            let inner = &mut *self.0.borrow_mut();
+            if inner.gpu.is_none() {
+                return Err(js_err(
+                    "training needs WebGPU, and this browser did not give us a device",
+                ));
+            }
+            let context_len = inner.config.context_len;
+            let Some(batch) =
+                inner.corpus.sample_batch(batch_size as usize, context_len, &mut inner.rng)
+            else {
+                return Ok(None);
+            };
+            (inner.config, inner.train, inner.step, batch)
+        };
+        let lr = train.lr_at(step);
+
+        // The resident trainer is moved out of `self` for the duration of
+        // the step. Holding a `RefCell` borrow across an `await` would
+        // panic the moment the page called any other method while the GPU
+        // was still working — and the page does exactly that, because the
+        // Stop button has to be answered mid-step.
+        let (ctx, mut trainer) = {
+            let inner = &mut *self.0.borrow_mut();
+            let gpu = inner.gpu.as_mut().expect("checked above");
+            (Rc::clone(&gpu.ctx), gpu.trainer.take())
+        };
+        if trainer.is_none() {
+            let weights = self.0.borrow().weights.clone();
+            match llm_gpu::GpuTrainer::new(&ctx, &config, &weights, batch.context_len) {
+                Ok(fresh) => trainer = Some(fresh),
+                Err(err) => return Err(js_err(err)),
+            }
+        }
+        let mut trainer = trainer.expect("created above");
+        let result = trainer
+            .train_step(&ctx, &batch.inputs, &batch.targets, lr, train.weight_decay, train.grad_clip)
+            .await;
+        {
+            let inner = &mut *self.0.borrow_mut();
+            if let Some(gpu) = inner.gpu.as_mut() {
+                gpu.trainer = Some(trainer);
+            }
+        }
+        let report = result.map_err(js_err)?;
+
         let inner = &mut *self.0.borrow_mut();
-        let train = inner.train;
-        let report = inner.trainer.train_step_with(&mut inner.corpus, batch_size as usize, &train)?;
-        Some(StepReport {
+        inner.step += 1;
+        Ok(Some(StepReport {
             loss: report.loss,
             lr: report.lr,
             grad_norm: report.grad_norm,
             tokens: report.tokens as u32,
-            step: inner.trainer.step as f64,
-        })
+            step: inner.step as f64,
+        }))
+    }
+
+    /// Bring the trained weights back from the GPU and re-upload them to
+    /// the generation path.
+    ///
+    /// Called before anything that reads the weights on this side —
+    /// generating, exporting a checkpoint — rather than after every
+    /// step: the weights are megabytes, a step is milliseconds, and
+    /// between steps nothing here needs to see them.
+    pub async fn sync_from_gpu(&self) -> Result<(), JsValue> {
+        let (ctx, trainer) = {
+            let inner = &mut *self.0.borrow_mut();
+            let step = inner.step;
+            let Some(gpu) = inner.gpu.as_mut() else { return Ok(()) };
+            if gpu.uploaded_at_step == step || gpu.trainer.is_none() {
+                return Ok(());
+            }
+            (Rc::clone(&gpu.ctx), gpu.trainer.take())
+        };
+        let trainer = trainer.expect("checked above");
+        let downloaded = trainer.download_weights(&ctx).await;
+        {
+            let inner = &mut *self.0.borrow_mut();
+            if let Some(gpu) = inner.gpu.as_mut() {
+                gpu.trainer = Some(trainer);
+            }
+        }
+        let weights = downloaded.map_err(js_err)?;
+
+        let config = self.0.borrow().config;
+        let model = llm_gpu::GpuModel::upload(&ctx, &weights, &config).map_err(js_err)?;
+        let inner = &mut *self.0.borrow_mut();
+        inner.weights = weights;
+        inner.pretrained = true;
+        let step = inner.step;
+        if let Some(gpu) = inner.gpu.as_mut() {
+            gpu.model = model;
+            gpu.uploaded_at_step = step;
+        }
+        Ok(())
+    }
+
+    /// The largest difference between this GPU forward pass and
+    /// `llm-core`'s gradient-checked CPU one, over the same tokens and
+    /// the same weights. Float rounding lands near `1e-3`; anything much
+    /// larger means a kernel is wrong. Nothing calls this in normal use —
+    /// it exists so a machine with a real GPU can check the kernels.
+    pub async fn debug_compare_forward(&self, tokens: Vec<u32>) -> Result<f32, JsValue> {
+        let (ctx, trainer) = {
+            let inner = &mut *self.0.borrow_mut();
+            let Some(gpu) = inner.gpu.as_mut() else {
+                return Err(js_err("no GPU device"));
+            };
+            (Rc::clone(&gpu.ctx), gpu.trainer.take())
+        };
+        let Some(mut trainer) = trainer else {
+            return Err(js_err("no training state on the GPU yet — run a step first"));
+        };
+        let result = trainer.debug_compare_forward(&ctx, &tokens).await;
+        let inner = &mut *self.0.borrow_mut();
+        if let Some(gpu) = inner.gpu.as_mut() {
+            gpu.trainer = Some(trainer);
+        }
+        result.map_err(js_err)
     }
 
     /// Override the fine-tuning learning rate.
@@ -624,7 +776,7 @@ impl WasmLLM {
     }
 
     pub fn step(&self) -> f64 {
-        self.0.borrow().trainer.step as f64
+        self.0.borrow().step as f64
     }
 
     // --- Saving and loading ----------------------------------------------
@@ -632,16 +784,20 @@ impl WasmLLM {
     /// The current model as a checkpoint — tokenizer included, so it can
     /// be loaded back by `from_checkpoint` with nothing else alongside
     /// it. bf16, since this is for saving and sharing rather than for
-    /// resuming a pretraining run.
-    pub fn export_checkpoint(&self) -> Vec<u8> {
+    /// resuming a training run.
+    ///
+    /// Async because the trained weights live on the GPU: this is one of
+    /// the two places that pulls them back across the bus.
+    pub async fn export_checkpoint(&self) -> Result<Vec<u8>, JsValue> {
+        self.sync_from_gpu().await?;
         let inner = self.0.borrow();
-        Checkpoint {
-            config: inner.trainer.config,
-            weights: inner.trainer.weights.clone(),
+        let checkpoint = Checkpoint {
+            config: inner.config,
+            weights: inner.weights.clone(),
             tokenizer: inner.corpus.tokenizer().clone(),
-            step: inner.trainer.step,
-        }
-        .to_bytes_with(WeightDtype::Bf16)
+            step: inner.step,
+        };
+        Ok(checkpoint.to_bytes_with(WeightDtype::Bf16))
     }
 
     /// Replace this model's weights, shape and tokenizer from a
@@ -650,9 +806,14 @@ impl WasmLLM {
     pub fn import_checkpoint(&self, bytes: &[u8]) -> Result<(), JsValue> {
         let checkpoint = Checkpoint::from_bytes(bytes).map_err(js_err)?;
         let mut inner = self.0.borrow_mut();
-        inner.trainer = Trainer::resume(checkpoint.config, checkpoint.weights, checkpoint.step, 1);
+        inner.config = checkpoint.config;
+        inner.weights = checkpoint.weights;
+        inner.step = checkpoint.step;
         inner.corpus.set_tokenizer(checkpoint.tokenizer);
         inner.pretrained = true;
+        // Both the uploaded generation weights and any resident training
+        // state belong to the model that was just replaced.
+        inner.gpu = None;
         Ok(())
     }
 }

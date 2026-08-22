@@ -1,7 +1,9 @@
 // Rotary position embedding, applied in place to Q or K, per (row, head).
-// Mirrors ops::rope_apply_at (base 10000, pairs (2k, 2k+1)). Forward
-// rotation only: nothing backpropagates through generation, so the
-// inverse this used to carry had no caller.
+// Mirrors ops::rope_apply_at (base 10000, pairs (2k, 2k+1)).
+//
+// `inverse` rotates the other way, which is what the backward pass needs:
+// RoPE is an orthogonal rotation, so the gradient wrt its input is the
+// same rotation by the negative angle.
 struct Params {
     t_len: u32,
     heads: u32,
@@ -10,6 +12,11 @@ struct Params {
     // the current length when decoding one token at a time, so a key
     // carries the rotation of the position it was written at.
     pos0: u32,
+    // 1 rotates by the negative angle (the backward pass), 0 forward.
+    inverse: u32,
+    _p0: u32,
+    _p1: u32,
+    _p2: u32,
 };
 
 @group(0) @binding(0) var<uniform> p: Params;
@@ -23,11 +30,15 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         return;
     }
     let half = p.head_dim / 2u;
+    var sign: f32 = 1.0;
+    if (p.inverse == 1u) {
+        sign = -1.0;
+    }
     let pos = f32(p.pos0 + t);
     let base = t * p.heads * p.head_dim + h * p.head_dim;
     for (var k: u32 = 0u; k < half; k = k + 1u) {
         let freq = 1.0 / pow(10000.0, 2.0 * f32(k) / f32(p.head_dim));
-        let angle = pos * freq;
+        let angle = sign * pos * freq;
         let c = cos(angle);
         let s = sin(angle);
         let a = x[base + 2u * k];
