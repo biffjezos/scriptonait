@@ -216,14 +216,16 @@ worker.onmessage = (event) => {
         stepMsHistory.push(msg.stepMs);
         if (stepMsHistory.length > STEP_MS_WINDOW) stepMsHistory.shift();
         const avgMs = stepMsHistory.reduce((a, b) => a + b, 0) / stepMsHistory.length;
-        let perfText = `≈${avgMs.toFixed(0)} ms/step (avg over last ${stepMsHistory.length})`;
+        // Each report can cover several steps (the worker coalesces them),
+        // so this is an average over recent steps, not over reports.
+        let perfText = `≈${avgMs.toFixed(0)} ms/step (recent average)`;
         if (msg.batchSize && modelConfig?.contextLen) {
           const tokensPerSec = (msg.batchSize * modelConfig.contextLen * 1000) / avgMs;
           perfText += ` — ≈${Math.round(tokensPerSec).toLocaleString()} tokens/sec`;
         }
         el('train-perf').textContent = perfText;
       }
-      drawLossChart();
+      scheduleLossChart();
       break;
     }
 
@@ -634,9 +636,15 @@ function currentConfig() {
   };
 }
 
-// Mirrors llm-core's config.rs `param_count`/`memory_bytes`/`default_ffn_dim`
-// exactly (verified equivalent for integer hidden_dim), so the estimate
-// updates live while adjusting settings, before a model exists.
+// Mirrors llm-core's config.rs `param_count`/`activation_bytes`/
+// `memory_bytes`/`default_ffn_dim` exactly, so the estimate updates live
+// while adjusting settings, before a model exists.
+//
+// `activationBytes` is the one that matters for "can this config actually
+// run": the attention cache is layers x heads x context x window floats,
+// which at a long context is far larger than every weight in the model
+// put together. Leaving it out of the estimate is what let the UI present
+// a config needing tens of GB as a 3 GB one.
 function estimateParamsAndMemory(cfg) {
   const ffnDim = Math.ceil((cfg.hiddenDim * 8) / 3 / 32) * 32;
   const embedding = VOCAB_SIZE * cfg.hiddenDim;
@@ -646,27 +654,56 @@ function estimateParamsAndMemory(cfg) {
   const perLayer = perLayerPle + perLayerAttn + perLayerMlp;
   const params = embedding + cfg.numLayers * perLayer + cfg.hiddenDim;
   const inferenceBytes = params * 4;
-  const trainingBytes = inferenceBytes * 4;
-  return { params, inferenceBytes, trainingBytes };
+
+  const t = cfg.contextLen || 0;
+  const h = cfg.hiddenDim;
+  const band = Math.min(cfg.localWindow || t, t);
+  const perLayerAct = 8 * t * h + 2 * t * ffnDim + (cfg.numHeads || 1) * t * band + 2 * t;
+  const sharedAct = 3 * t * h + 2 * t * VOCAB_SIZE + 6 * t * h + 3 * t * ffnDim;
+  const activationBytes = (cfg.numLayers * perLayerAct + sharedAct) * 4;
+
+  const trainingBytes = inferenceBytes * 4 + activationBytes;
+  return { params, inferenceBytes, activationBytes, trainingBytes };
 }
 
 function formatBytes(bytes) {
   if (bytes < 1024) return `${Math.round(bytes)} B`;
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
-  return `${(bytes / 1024 / 1024).toFixed(2)} MB`;
+  if (bytes < 1024 * 1024 * 1024) return `${(bytes / 1024 / 1024).toFixed(2)} MB`;
+  return `${(bytes / 1024 / 1024 / 1024).toFixed(2)} GB`;
+}
+
+// Mirrors llm-core's config.rs `MAX_TRAINING_BYTES`: past this, a wasm32
+// heap can't hold the run at all, so `WasmLLM::new` rejects the config
+// outright. The softer threshold below it is where training still fits
+// but starts crowding a normal machine's RAM.
+const MAX_TRAINING_BYTES = 2 * 1024 * 1024 * 1024;
+const HEAVY_TRAINING_BYTES = 512 * 1024 * 1024;
+
+function configTooLarge(cfg) {
+  const { trainingBytes } = estimateParamsAndMemory(cfg);
+  return trainingBytes > MAX_TRAINING_BYTES;
 }
 
 function updateSizeEstimate() {
   const cfg = currentConfig();
-  if (!cfg.hiddenDim || !cfg.numLayers || !cfg.numHeads) return;
+  if (!cfg.hiddenDim || !cfg.numLayers || !cfg.numHeads || !cfg.contextLen) return;
   if (cfg.hiddenDim % cfg.numHeads !== 0) {
     el('size-estimate').textContent = `Heads (${cfg.numHeads}) must evenly divide nodes (${cfg.hiddenDim}).`;
     return;
   }
-  const { params, inferenceBytes, trainingBytes } = estimateParamsAndMemory(cfg);
-  el('size-estimate').textContent =
+  const { params, inferenceBytes, activationBytes, trainingBytes } = estimateParamsAndMemory(cfg);
+  let text =
     `≈ ${Math.round(params).toLocaleString()} parameters — ${formatBytes(inferenceBytes)} for inference, ` +
-    `${formatBytes(trainingBytes)} while training.`;
+    `${formatBytes(trainingBytes)} while training ` +
+    `(${formatBytes(inferenceBytes * 4)} weights + optimizer, ${formatBytes(activationBytes)} activations).`;
+  if (trainingBytes > MAX_TRAINING_BYTES) {
+    text += ` ✕ Too large to train in a browser tab (limit ${formatBytes(MAX_TRAINING_BYTES)}) — ` +
+      'lower the context length or attention window first; the activation cost scales with both.';
+  } else if (trainingBytes > HEAVY_TRAINING_BYTES) {
+    text += ' ⚠ Heavy — this will use a noticeable share of the machine\'s RAM while training.';
+  }
+  el('size-estimate').textContent = text;
 }
 
 ['cfg-layers', 'cfg-hidden', 'cfg-heads', 'cfg-context', 'cfg-window'].forEach((id) => {
@@ -685,6 +722,14 @@ function updateSizeEstimate() {
 const PARAMS_PER_TOKEN = 2.3;
 const MIN_SUGGESTED_PARAMS = 1_000_000;
 const MAX_SUGGESTED_PARAMS = 40_000_000;
+// Without WebGPU every step runs on one wasm thread, where step time
+// scales about linearly with parameter count: a few million parameters is
+// already seconds per step, and the 40M ceiling above is minutes per step
+// - a suggestion that reads as a recommendation and behaves like a hang.
+// Corpus size is no argument for a model this machine can't train, so the
+// CPU-only suggestion is capped and says why.
+const MAX_CPU_SUGGESTED_PARAMS = 3_000_000;
+const MAX_CPU_SUGGESTED_BATCH = 4;
 
 function suggestNumLayers(totalTokens) {
   if (totalTokens < 500_000) return 4;
@@ -734,20 +779,25 @@ function suggestNumHeads(hiddenDim) {
   return 1;
 }
 
-function suggestSettings(totalTokens) {
-  const targetParams = Math.min(MAX_SUGGESTED_PARAMS, Math.max(MIN_SUGGESTED_PARAMS, totalTokens * PARAMS_PER_TOKEN));
-  const numLayers = suggestNumLayers(totalTokens);
+function suggestSettings(totalTokens, { gpuAvailable = true } = {}) {
+  const ceiling = gpuAvailable ? MAX_SUGGESTED_PARAMS : MAX_CPU_SUGGESTED_PARAMS;
+  const targetParams = Math.min(ceiling, Math.max(MIN_SUGGESTED_PARAMS, totalTokens * PARAMS_PER_TOKEN));
+  const numLayers = gpuAvailable ? suggestNumLayers(totalTokens) : Math.min(4, suggestNumLayers(totalTokens));
   const hiddenDim = suggestHiddenDim(numLayers, targetParams);
+  const batchSize = gpuAvailable
+    ? suggestBatchSize(totalTokens)
+    : Math.min(MAX_CPU_SUGGESTED_BATCH, suggestBatchSize(totalTokens));
   return {
     numLayers,
     hiddenDim,
     numHeads: suggestNumHeads(hiddenDim),
+    cappedForCpu: !gpuAvailable && totalTokens * PARAMS_PER_TOKEN > MAX_CPU_SUGGESTED_PARAMS,
     // Always the GPU backend's max: longer context helps this kind of
     // text, and nothing about corpus size argues for giving it up when
     // the GPU backend can handle the full 256 anyway.
     contextLen: GPU_MAX_CONTEXT,
     localWindow: GPU_MAX_CONTEXT,
-    batchSize: suggestBatchSize(totalTokens),
+    batchSize,
     lr: 0.003,
     sampleEveryN: 250,
   };
@@ -800,7 +850,7 @@ el('suggest-settings-btn').addEventListener('click', async () => {
     // text.
     const encoder = new TextEncoder();
     const totalTokens = sources.reduce((sum, s) => sum + encoder.encode(s.rawText).length, 0);
-    const suggestion = suggestSettings(totalTokens);
+    const suggestion = suggestSettings(totalTokens, { gpuAvailable: webgpuBrowserSupported });
     const sourceWord = `${sources.length} source${sources.length === 1 ? '' : 's'}, ≈${Math.round(totalTokens).toLocaleString()} training tokens`;
 
     if (!webgpuBrowserSupported) {
@@ -808,7 +858,10 @@ el('suggest-settings-btn').addEventListener('click', async () => {
       el('suggest-settings-status').textContent =
         `Suggested for ${sourceWord}: ${suggestion.numLayers} layers, ${suggestion.hiddenDim} nodes, ` +
         `${suggestion.numHeads} heads, batch size ${suggestion.batchSize}, learning rate ${suggestion.lr} ` +
-        `(no WebGPU in this browser, so the shape wasn't benchmarked — sized by corpus alone).`;
+        `(no WebGPU in this browser${suggestion.cappedForCpu
+          ? ', so this is capped to a size single-threaded CPU training can actually get through — ' +
+            'your corpus would support a larger model on a WebGPU-capable browser'
+          : ", so the shape wasn't benchmarked — sized by corpus alone"}).`;
       return;
     }
 
@@ -862,6 +915,16 @@ el('create-model-btn').addEventListener('click', () => {
     alert(`Nodes / heads (${cfg.hiddenDim / cfg.numHeads}) must be even (needed for rotary position embeddings).`);
     return;
   }
+  if (configTooLarge(cfg)) {
+    const { trainingBytes } = estimateParamsAndMemory(cfg);
+    alert(
+      `This shape needs about ${formatBytes(trainingBytes)} to train, more than a browser tab can address ` +
+      `(${formatBytes(MAX_TRAINING_BYTES)}).\n\nMost of that is the attention cache — layers x heads x ` +
+      'context length x attention window — so lowering the context length or the attention window ' +
+      'shrinks it fastest.'
+    );
+    return;
+  }
   modelConfig = cfg;
   lossHistory = [];
   el('create-model-btn').disabled = true;
@@ -895,6 +958,20 @@ el('start-train-btn').addEventListener('click', () => {
 el('stop-train-btn').addEventListener('click', () => {
   worker.postMessage({ type: 'stopTraining' });
 });
+
+// Training posts progress far faster than a screen refreshes; redrawing
+// the chart synchronously on every message meant the main thread spent
+// its time on canvas work it would never display. One redraw per frame,
+// at most.
+let lossChartPending = false;
+function scheduleLossChart() {
+  if (lossChartPending) return;
+  lossChartPending = true;
+  requestAnimationFrame(() => {
+    lossChartPending = false;
+    drawLossChart();
+  });
+}
 
 function drawLossChart() {
   const canvas = el('loss-chart');
