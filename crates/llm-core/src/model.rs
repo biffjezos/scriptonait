@@ -501,7 +501,7 @@ mod tests {
     use super::*;
 
     fn small_config() -> ModelConfig {
-        ModelConfig { num_layers: 2, hidden_dim: 8, num_heads: 2, context_len: 6, local_window: 6 }
+        ModelConfig { num_layers: 2, hidden_dim: 8, num_heads: 2, context_len: 6, local_window: 6, ..Default::default() }
     }
 
     fn total_loss(weights: &ModelWeights, config: &ModelConfig, tokens: &[u32], targets: &[u32]) -> f32 {

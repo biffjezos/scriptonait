@@ -10,7 +10,7 @@ use crate::config::ModelConfig;
 use crate::model::{self, ModelWeights};
 use crate::ops;
 use crate::rng::Rng;
-use crate::tokenizer;
+use crate::tokenizer::{self, Tokenizer};
 
 /// Sample a continuation for `prompt`. Returns the full decoded text
 /// (prompt + generated continuation) — the caller already has the prompt,
@@ -19,12 +19,13 @@ use crate::tokenizer;
 pub fn generate(
     weights: &ModelWeights,
     config: &ModelConfig,
+    tokenizer: &Tokenizer,
     prompt: &str,
     max_new_tokens: usize,
     temperature: f32,
     seed: u64,
 ) -> String {
-    let mut tokens = tokenizer::encode(prompt);
+    let mut tokens = tokenizer.encode(prompt);
     // An empty prompt would otherwise leave `tokens` empty, so the very
     // first window is empty too and the loop below exits before generating
     // anything (see `window.is_empty()`). BOS is what every training
@@ -55,7 +56,7 @@ pub fn generate(
         }
         tokens.push(next);
     }
-    tokenizer::decode(&tokens)
+    tokenizer.decode(&tokens)
 }
 
 /// Samples a token id from one row of logits (temperature `<= 0.0` means
@@ -86,15 +87,15 @@ mod tests {
     use super::*;
 
     fn tiny_config() -> ModelConfig {
-        ModelConfig { num_layers: 1, hidden_dim: 8, num_heads: 2, context_len: 16, local_window: 16 }
+        ModelConfig { num_layers: 1, hidden_dim: 8, num_heads: 2, context_len: 16, local_window: 16, ..Default::default() }
     }
 
     #[test]
     fn generate_is_deterministic_given_same_seed() {
         let config = tiny_config();
         let weights = ModelWeights::init(&config, 1);
-        let a = generate(&weights, &config, "hi", 10, 0.8, 123);
-        let b = generate(&weights, &config, "hi", 10, 0.8, 123);
+        let a = generate(&weights, &config, &Tokenizer::byte_level(), "hi", 10, 0.8, 123);
+        let b = generate(&weights, &config, &Tokenizer::byte_level(), "hi", 10, 0.8, 123);
         assert_eq!(a, b);
     }
 
@@ -104,7 +105,7 @@ mod tests {
         let config = tiny_config();
         let weights = ModelWeights::init(&config, 1);
         let prompt = "abc";
-        assert_eq!(generate(&weights, &config, prompt, 0, 1.0, 7), prompt);
+        assert_eq!(generate(&weights, &config, &Tokenizer::byte_level(), prompt, 0, 1.0, 7), prompt);
     }
 
     #[test]
@@ -115,7 +116,7 @@ mod tests {
         let config = tiny_config();
         let weights = ModelWeights::init(&config, 1);
         for budget in [1, 5, 20] {
-            let out = generate(&weights, &config, "abc", budget, 1.0, 7);
+            let out = generate(&weights, &config, &Tokenizer::byte_level(), "abc", budget, 1.0, 7);
             assert!(out.starts_with("abc"), "budget={budget} out={out:?}");
         }
     }
@@ -124,8 +125,8 @@ mod tests {
     fn temperature_zero_is_deterministic_across_seeds() {
         let config = tiny_config();
         let weights = ModelWeights::init(&config, 2);
-        let a = generate(&weights, &config, "hello", 8, 0.0, 1);
-        let b = generate(&weights, &config, "hello", 8, 0.0, 999);
+        let a = generate(&weights, &config, &Tokenizer::byte_level(), "hello", 8, 0.0, 1);
+        let b = generate(&weights, &config, &Tokenizer::byte_level(), "hello", 8, 0.0, 999);
         assert_eq!(a, b);
     }
 
@@ -137,7 +138,7 @@ mod tests {
         // generating anything (see the BOS-seeding fix above).
         let config = tiny_config();
         let weights = ModelWeights::init(&config, 3);
-        let out = generate(&weights, &config, "", 4, 0.0, 5);
+        let out = generate(&weights, &config, &Tokenizer::byte_level(), "", 4, 0.0, 5);
         assert!(!out.is_empty(), "empty prompt should still produce output");
     }
 }

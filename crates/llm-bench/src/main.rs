@@ -15,17 +15,18 @@ use std::time::Instant;
 use llm_core::config::ModelConfig;
 use llm_core::corpus::Corpus;
 use llm_core::train::Trainer;
+use llm_core::tokenizer::Tokenizer;
 use llm_core::{generate, model};
 
 fn shapes() -> Vec<(&'static str, ModelConfig)> {
     vec![
         (
             "tiny  (4L x 128)",
-            ModelConfig { num_layers: 4, hidden_dim: 128, num_heads: 4, context_len: 256, local_window: 256 },
+            ModelConfig { num_layers: 4, hidden_dim: 128, num_heads: 4, context_len: 256, local_window: 256, ..Default::default() },
         ),
         (
             "small (6L x 256)",
-            ModelConfig { num_layers: 6, hidden_dim: 256, num_heads: 8, context_len: 512, local_window: 256 },
+            ModelConfig { num_layers: 6, hidden_dim: 256, num_heads: 8, context_len: 512, local_window: 256, ..Default::default() },
         ),
     ]
 }
@@ -63,7 +64,9 @@ fn bench_generation(name: &str, config: &ModelConfig) {
     let weights = model::ModelWeights::init(config, 7);
     let new_tokens = 64;
     let start = Instant::now();
-    let out = generate::generate(&weights, config, "INT. SHIP - NIGHT", new_tokens, 0.8, 99);
+    let tokenizer = Tokenizer::byte_level();
+    let out =
+        generate::generate(&weights, config, &tokenizer, "INT. SHIP - NIGHT", new_tokens, 0.8, 99);
     let elapsed = start.elapsed().as_secs_f64();
     std::hint::black_box(out);
     println!("  gen    {name}    : {:>8.1} tok/s  ({new_tokens} new tokens)", new_tokens as f64 / elapsed);
@@ -78,9 +81,28 @@ fn sample_text() -> String {
         .repeat(200)
 }
 
+/// How much shorter a BPE encoding is than the byte-level one. Every
+/// factor here is a factor off both training time and generation time
+/// for the same amount of *text*, which is the unit that matters.
+fn report_tokenizer_compression() {
+    let text = sample_text();
+    let start = Instant::now();
+    let bpe = Tokenizer::train(&[&text], 2048);
+    let train_secs = start.elapsed().as_secs_f64();
+    let sample = "INT. CAVE - CONTINUOUS\n\nThe prisoners have been here since childhood.";
+    let bytes = sample.len();
+    let tokens = bpe.encode(sample).len();
+    println!(
+        "tokenizer: {} merges learned in {train_secs:.1}s; {bytes} bytes -> {tokens} tokens ({:.1}x shorter than byte level)",
+        bpe.num_merges(),
+        bytes as f64 / tokens as f64
+    );
+}
+
 fn main() {
     let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
     println!("cores: {cores}");
+    report_tokenizer_compression();
     for (name, config) in shapes() {
         println!("{name}  ({} params)", config.param_count());
         bench_training(name, &config, 1);

@@ -22,7 +22,7 @@
 //! small and cheap even as `context_len` is pushed up to fit a whole scene
 //! or chapter.
 
-use crate::tokenizer::VOCAB_SIZE;
+use crate::tokenizer::BASE_VOCAB_SIZE;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ModelConfig {
@@ -34,6 +34,12 @@ pub struct ModelConfig {
     pub num_heads: usize,
     /// Max sequence length the model is trained/run with.
     pub context_len: usize,
+    /// Size of the tokenizer's vocabulary, which fixes the embedding
+    /// table and the tied output head. It is not a free knob: it must
+    /// match the tokenizer the weights were trained with, or every token
+    /// id means something different. `BASE_VOCAB_SIZE` is plain byte
+    /// level (no merges learned).
+    pub vocab_size: usize,
     /// Sliding-window attention span (Mistral-style): each position only
     /// attends to the `local_window` tokens before it instead of the full
     /// causal history. Attention cost scales as `context_len * local_window`
@@ -51,6 +57,7 @@ impl Default for ModelConfig {
             num_heads: 4,
             context_len: 256,
             local_window: 256,
+            vocab_size: BASE_VOCAB_SIZE,
         }
     }
 }
@@ -128,6 +135,11 @@ impl ModelConfig {
         if self.local_window == 0 {
             return Err(ConfigError::TooSmall { field: "local_window", min: 1 });
         }
+        if self.vocab_size < BASE_VOCAB_SIZE {
+            // Below this the tokenizer's own byte alphabet doesn't fit,
+            // so some byte would have no embedding row at all.
+            return Err(ConfigError::TooSmall { field: "vocab_size", min: BASE_VOCAB_SIZE });
+        }
         if self.hidden_dim % self.num_heads != 0 {
             return Err(ConfigError::HeadsMustDivideHidden {
                 hidden_dim: self.hidden_dim,
@@ -161,7 +173,7 @@ impl ModelConfig {
     }
 
     pub fn vocab_size(&self) -> usize {
-        VOCAB_SIZE
+        self.vocab_size
     }
 
     /// Total trainable scalar parameters.
@@ -279,7 +291,7 @@ mod tests {
         // 1024 nodes, 16 heads, full 4096-token attention. Its activation
         // cache alone is ~20 GB, which used to be reported to the user as
         // "3.1 GB while training" and then simply killed the tab.
-        let cfg = ModelConfig { num_layers: 16, hidden_dim: 1024, num_heads: 16, context_len: 4096, local_window: 4096 };
+        let cfg = ModelConfig { num_layers: 16, hidden_dim: 1024, num_heads: 16, context_len: 4096, local_window: 4096, ..Default::default() };
         assert!(matches!(cfg.validate(), Err(ConfigError::TooLarge { .. })));
         assert!(ModelConfig::default().validate().is_ok());
     }
@@ -316,7 +328,7 @@ mod tests {
 
     #[test]
     fn small_config_stays_under_a_few_tens_of_mb() {
-        let cfg = ModelConfig { num_layers: 4, hidden_dim: 128, num_heads: 4, context_len: 256, local_window: 256 };
+        let cfg = ModelConfig { num_layers: 4, hidden_dim: 128, num_heads: 4, context_len: 256, local_window: 256, ..Default::default() };
         // Byte-level vocab keeps embedding/PLE tables tiny (tens of KB
         // each); the attention/MLP matrices dominate the weights, and the
         // per-step activation cache is the same order again at this

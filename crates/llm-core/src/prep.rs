@@ -1,7 +1,7 @@
 //! Text preparation: turns raw source text (pasted, uploaded, or fetched
 //! from a URL) into clean training text.
 
-use crate::tokenizer;
+use crate::tokenizer::Tokenizer;
 
 /// Very small, dependency-free HTML-to-text pass: drops `<script>`/`<style>`
 /// bodies entirely, strips all other tags, and decodes the handful of named
@@ -141,13 +141,17 @@ pub struct PreparedStats {
 }
 
 /// Clean raw source text and tokenize it in one step.
-pub fn prepare(raw: &str, is_html: bool) -> (String, Vec<u32>, PreparedStats) {
+pub fn prepare(
+    tokenizer: &Tokenizer,
+    raw: &str,
+    is_html: bool,
+) -> (String, Vec<u32>, PreparedStats) {
     let cleaned = if is_html {
         normalize_whitespace(&strip_html(raw))
     } else {
         normalize_whitespace(raw)
     };
-    let tokens = tokenizer::encode(&cleaned);
+    let tokens = tokenizer.encode(&cleaned);
     let stats = PreparedStats {
         char_count: cleaned.chars().count(),
         byte_count: cleaned.len(),
@@ -206,7 +210,7 @@ mod tests {
 
     #[test]
     fn prepare_end_to_end() {
-        let (text, tokens, stats) = prepare("<p>Hi   there</p>", true);
+        let (text, tokens, stats) = prepare(&Tokenizer::byte_level(), "<p>Hi   there</p>", true);
         assert_eq!(text, "Hi there");
         assert_eq!(tokens.len(), stats.token_count);
         assert_eq!(stats.byte_count, "Hi there".len());
@@ -215,7 +219,7 @@ mod tests {
 
     #[test]
     fn prepare_plain_text_is_not_html_stripped() {
-        let (text, _, _) = prepare("a < b and b > c", false);
+        let (text, _, _) = prepare(&Tokenizer::byte_level(), "a < b and b > c", false);
         assert_eq!(text, "a < b and b > c");
     }
 }

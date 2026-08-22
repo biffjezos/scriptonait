@@ -92,6 +92,9 @@ impl WasmLLM {
             num_heads: num_heads as usize,
             context_len: context_len as usize,
             local_window: local_window as usize,
+            // Byte level for now; step 8 replaces this constructor with
+            // one that loads the shipped tokenizer and takes its vocab.
+            vocab_size: llm_core::tokenizer::BASE_VOCAB_SIZE,
         };
         config.validate().map_err(js_err)?;
         let trainer = Trainer::new(config, seed as u64);
@@ -312,6 +315,7 @@ impl WasmLLM {
         llm_core::generate::generate(
             &inner.trainer.weights,
             &inner.trainer.config,
+            inner.corpus.tokenizer(),
             &prompt,
             max_new_tokens as usize,
             temperature,
@@ -369,7 +373,7 @@ impl WasmLLM {
     ) -> Result<String, JsValue> {
         let (ctx, model, config) = self.ensure_gpu_model().await?;
 
-        let mut tokens = llm_core::tokenizer::encode(&prompt);
+        let mut tokens = self.0.borrow().corpus.tokenizer().encode(&prompt);
         // See llm_core::generate::generate's matching comment: an empty
         // prompt needs a real seed token or the loop below exits before
         // generating anything.
@@ -393,7 +397,7 @@ impl WasmLLM {
             }
             tokens.push(next);
         }
-        Ok(llm_core::tokenizer::decode(&tokens))
+        Ok(self.0.borrow().corpus.tokenizer().decode(&tokens))
     }
 
     /// Dev/sanity-check tool: runs the *same* forward pass on both the
@@ -415,7 +419,7 @@ impl WasmLLM {
         let (ctx, model, config) = self.ensure_gpu_model().await?;
         let weights = read_gpu_weights(&ctx, &model, &config).await?;
 
-        let mut tokens = llm_core::tokenizer::encode(&prompt);
+        let mut tokens = self.0.borrow().corpus.tokenizer().encode(&prompt);
         if tokens.is_empty() {
             tokens.push(0);
         }
@@ -461,7 +465,7 @@ impl WasmLLM {
         let (ctx, model, config) = self.ensure_gpu_model().await?;
         let weights = read_gpu_weights(&ctx, &model, &config).await?;
 
-        let mut tokens = llm_core::tokenizer::encode(&prompt);
+        let mut tokens = self.0.borrow().corpus.tokenizer().encode(&prompt);
         if tokens.is_empty() {
             tokens.push(0);
         }
