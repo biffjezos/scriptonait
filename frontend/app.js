@@ -1041,6 +1041,12 @@ $('import-input').addEventListener('change', async (event) => {
 });
 
 
+// Profiling from the console: `scriptonait.profile()` runs one step per
+// command-buffer size and logs where the milliseconds go.
+window.scriptonait = {
+  profile: (batchSize = 2) => call('profile', { batchSize }, [], 0),
+};
+
 // --- Start -------------------------------------------------------------
 
 (async function start() {

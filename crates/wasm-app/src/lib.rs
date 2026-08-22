@@ -789,6 +789,81 @@ impl WasmLLM {
         }))
     }
 
+    /// Run one step with a device sync after each phase and report where
+    /// the milliseconds went, as JSON.
+    ///
+    /// `dispatches_per_submit` also sets how much work goes into each
+    /// command buffer for this step, which is the direct test of whether
+    /// a step is bound by per-submission cost or by arithmetic: if the
+    /// total falls as this rises, it was the submissions.
+    pub async fn profile_step(&self, batch_size: u32, dispatches_per_submit: u32) -> Result<String, JsValue> {
+        let (config, train, step, batch) = {
+            let inner = &mut *self.0.borrow_mut();
+            if inner.gpu.is_none() {
+                return Err(js_err("profiling needs a GPU device"));
+            }
+            let context_len = inner.config.context_len;
+            let Some(batch) =
+                inner.corpus.sample_batch(batch_size as usize, context_len, &mut inner.rng)
+            else {
+                return Err(js_err("not enough text to sample a batch"));
+            };
+            (inner.config, inner.train, inner.step, batch)
+        };
+        let lr = train.lr_at(step);
+
+        let (ctx, mut trainer) = {
+            let inner = &mut *self.0.borrow_mut();
+            let gpu = inner.gpu.as_mut().expect("checked above");
+            (Rc::clone(&gpu.ctx), gpu.trainer.take())
+        };
+        let mut trainer = match trainer.take() {
+            Some(existing) => existing,
+            None => {
+                let weights = self.0.borrow().weights.clone();
+                llm_gpu::GpuTrainer::new(&ctx, &config, &weights, batch.context_len).map_err(js_err)?
+            }
+        };
+        let previous = dispatches_per_submit.max(1);
+        trainer.set_dispatches_per_submit(previous);
+        let result = trainer
+            .profile_step(
+                &ctx,
+                &batch.inputs,
+                &batch.targets,
+                lr,
+                train.weight_decay,
+                train.grad_clip,
+            )
+            .await;
+        {
+            let inner = &mut *self.0.borrow_mut();
+            inner.step += 1;
+            if let Some(gpu) = inner.gpu.as_mut() {
+                gpu.trainer = Some(trainer);
+            }
+        }
+        let report = result.map_err(js_err)?;
+        let p = report.phase_ms.unwrap_or_default();
+        Ok(format!(
+            "{{\"dispatchesPerSubmit\":{},\"dispatches\":{},\"submits\":{},\"totalMs\":{:.1},\
+             \"zeroMs\":{:.1},\"forwardMs\":{:.1},\"lossMs\":{:.1},\"backwardMs\":{:.1},\
+             \"reduceMs\":{:.1},\"readbackMs\":{:.1},\"adamMs\":{:.1},\"tokens\":{}}}",
+            previous,
+            report.dispatches,
+            report.submits,
+            p.total,
+            p.zero,
+            p.forward,
+            p.loss,
+            p.backward,
+            p.reduce,
+            p.readback,
+            p.adam,
+            report.tokens,
+        ))
+    }
+
     /// Bring the trained weights back from the GPU and re-upload them to
     /// the generation path.
     ///

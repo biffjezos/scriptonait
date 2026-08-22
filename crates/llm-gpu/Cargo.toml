@@ -24,6 +24,10 @@ llm-core = { path = "../llm-core" }
 wgpu = ">=0.20"
 bytemuck = { version = "1", features = ["derive"] }
 futures-channel = "0.3"
+# std::time::Instant panics on wasm32-unknown-unknown; this is the same
+# API backed by performance.now() there and by std natively. Used only by
+# the profiler, which is what answers "which phase of a step is slow".
+web-time = "1"
 
 # Only used by the native dev/test binary (`examples/gpu_smoke_test.rs`) to
 # block on GPU futures; the wasm32 build (wasm-app) drives the same async
