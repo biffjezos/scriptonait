@@ -30,7 +30,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
-use llm_core::checkpoint::Checkpoint;
+use llm_core::checkpoint::{Checkpoint, WeightDtype};
 use llm_core::config::ModelConfig;
 use llm_core::corpus::Corpus;
 use llm_core::dataset::TokenDataset;
@@ -42,6 +42,8 @@ use llm_core::train::{TrainConfig, Trainer};
 struct Args {
     data: PathBuf,
     out: PathBuf,
+    /// Where to also write a bf16 copy for the browser to download.
+    web_out: Option<PathBuf>,
     resume: Option<PathBuf>,
     minutes: Option<f64>,
     steps: Option<u64>,
@@ -81,6 +83,8 @@ llm-train --data <dir> --out <file.ckpt> [options]
   --data <dir>         directory holding dataset.bin and tokenizer.tok
   --out <file>         checkpoint to write (optimizer state goes to
                        <file>.opt)
+  --web-out <file>     also write a bf16 copy here — half the bytes, for
+                       the browser to download
   --resume <file>      continue from this checkpoint instead of a fresh
                        model; the shape flags are then ignored, since the
                        checkpoint carries its own
@@ -105,6 +109,7 @@ impl Args {
     fn parse() -> Result<Args, String> {
         let mut data = None;
         let mut out = None;
+        let mut web_out = None;
         let mut resume = None;
         let mut minutes = None;
         let mut steps = None;
@@ -129,6 +134,7 @@ impl Args {
             match flag.as_str() {
                 "--data" => data = Some(PathBuf::from(value()?)),
                 "--out" => out = Some(PathBuf::from(value()?)),
+                "--web-out" => web_out = Some(PathBuf::from(value()?)),
                 "--resume" => resume = Some(PathBuf::from(value()?)),
                 "--minutes" => minutes = Some(num(value()?, "--minutes")?),
                 "--steps" => steps = Some(num(value()?, "--steps")? as u64),
@@ -159,6 +165,7 @@ impl Args {
         Ok(Args {
             data: data.ok_or(format!("--data is required\n\n{HELP}"))?,
             out: out.ok_or(format!("--out is required\n\n{HELP}"))?,
+            web_out,
             resume,
             minutes,
             steps,
@@ -318,7 +325,7 @@ fn run() -> Result<(), String> {
         });
 
         if !report.loss.is_finite() {
-            save(&trainer, &tokenizer, &args.out, &optimizer_path)?;
+            save(&trainer, &tokenizer, &args.out, &optimizer_path, args.web_out.as_deref())?;
             return Err(format!(
                 "loss went to {} at step {} — saved the last good checkpoint; \
                  lower --lr or --grad-clip and resume",
@@ -345,7 +352,7 @@ fn run() -> Result<(), String> {
         }
 
         if now.duration_since(last_save).as_secs_f64() >= args.save_every_secs {
-            save(&trainer, &tokenizer, &args.out, &optimizer_path)?;
+            save(&trainer, &tokenizer, &args.out, &optimizer_path, args.web_out.as_deref())?;
             println!("  saved {} at step {}", args.out.display(), trainer.step);
             last_save = now;
         }
@@ -355,7 +362,7 @@ fn run() -> Result<(), String> {
         }
     }
 
-    save(&trainer, &tokenizer, &args.out, &optimizer_path)?;
+    save(&trainer, &tokenizer, &args.out, &optimizer_path, args.web_out.as_deref())?;
     println!(
         "\ndone: {} steps this run ({} total), {:.1} minutes, loss {:.4}",
         steps_this_run,
@@ -443,6 +450,7 @@ fn save(
     tokenizer: &Tokenizer,
     out: &Path,
     optimizer_path: &Path,
+    web_out: Option<&Path>,
 ) -> Result<(), String> {
     if let Some(parent) = out.parent() {
         fs::create_dir_all(parent).map_err(|e| format!("creating {}: {e}", parent.display()))?;
@@ -454,6 +462,12 @@ fn save(
         step: trainer.step,
     };
     write_atomically(out, &checkpoint.to_bytes())?;
+    if let Some(web_out) = web_out {
+        if let Some(parent) = web_out.parent() {
+            fs::create_dir_all(parent).map_err(|e| format!("creating {}: {e}", parent.display()))?;
+        }
+        write_atomically(web_out, &checkpoint.to_bytes_with(WeightDtype::Bf16))?;
+    }
     write_atomically(optimizer_path, &trainer.optimizer_bytes())
 }
 

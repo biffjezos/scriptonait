@@ -1,9 +1,15 @@
 name: Build and deploy to GitHub Pages
 
-# This is where the actual Rust -> wasm build happens. It has to run here
-# (a GitHub Actions runner, with normal internet access) rather than in
-# the sandbox this project was originally developed in, which had no
-# route to crates.io, npmjs.org, or the wasm32 target installer at all.
+# This is where the actual Rust -> wasm build happens, and it is the
+# only place it happens. The browser downloads a compiled .wasm file and
+# instantiates it; nothing is compiled client-side, and there is no
+# toolchain on the page. `frontend/pkg/` is generated here and
+# deliberately not in git (see .gitignore).
+#
+# It has to run here rather than in this project's development sandbox,
+# which has no route to crates.io, npmjs.org, or the wasm32 target
+# installer — so this workflow is also the only compiler llm-gpu and
+# wasm-app ever see, which is why every push runs the build job.
 
 on:
   # Every push runs the `build` job (compile + test), regardless of
@@ -16,6 +22,8 @@ on:
   workflow_dispatch:
 
 permissions:
+  # `contents: read` is also what lets the build download the published
+  # model release asset.
   contents: read
   pages: write
   id-token: write
@@ -70,6 +78,24 @@ jobs:
         env:
           RUSTFLAGS: -C target-feature=+simd128
         run: wasm-pack build crates/wasm-app --release --target web --out-dir ../../frontend/pkg
+
+      - name: Fetch the pretrained model
+        # The model is a release asset, not a file in git: it's tens of
+        # MB and it's rewritten every training round, so committing it
+        # would bloat the history for no benefit. The site is packaged
+        # with whatever the latest round published.
+        #
+        # A missing model is not a build failure. The page handles it —
+        # it says so, and offers to train one in the browser instead.
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p frontend/model
+          if gh release download model-latest --pattern 'scriptonait.ckpt' --output frontend/model/scriptonait.ckpt; then
+            echo "shipping the pretrained model ($(wc -c < frontend/model/scriptonait.ckpt) bytes)"
+          else
+            echo "no pretrained model published yet — run the pretrain workflow"
+          fi
 
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v3
