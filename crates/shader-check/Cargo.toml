@@ -1,0 +1,26 @@
+# Standalone crate (its own workspace, like llm-gpu and wasm-app) whose
+# only job is to compile every WGSL shader in CI.
+#
+# Until this existed, nothing checked the shaders at all: llm-gpu embeds
+# them with `include_str!` (plain text, no compile-time parsing) and hands
+# them to `create_shader_module` at runtime, which on the web means the
+# browser compiles them the first time a user clicks "Train on WebGPU".
+# A typo in a .wgsl file therefore passed CI and shipped. This crate
+# parses and validates each shader with naga — the same front end wgpu
+# itself uses — so shader errors fail the build instead of the user.
+#
+# It deliberately does NOT depend on wgpu: naga alone builds in seconds,
+# so this check is cheap enough to run on every push.
+[workspace]
+
+[package]
+name = "shader-check"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[dev-dependencies]
+# Open lower bound, matching llm-gpu's wgpu dependency: whatever naga the
+# current wgpu release is built on is the one whose acceptance we care
+# about.
+naga = { version = ">=25", features = ["wgsl-in"] }
