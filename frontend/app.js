@@ -253,15 +253,21 @@ async function loadModel() {
     const info = await call('load-model', { bytes: bytes.buffer }, [bytes.buffer]);
     renderModel(info);
   } catch (error) {
-    setModelStatus(
-      'absent',
-      `${error.message}. You can still add your own material below, load a ` +
-        'model file, or create an untrained one under "The model".',
-    );
-    $('model-panel').open = true;
+    // Only claim there's no model if there still isn't one. A slow 404
+    // here used to land *after* the user had loaded a model file by
+    // hand and overwrite "Ready" with "no model published" — the page
+    // then looked broken while holding a perfectly good model.
+    if (!model) {
+      setModelStatus(
+        'absent',
+        `${error.message}. You can still add your own material below, load a ` +
+          'model file, or create an untrained one under "The model".',
+      );
+      $('model-panel').open = true;
+    }
   } finally {
     $('model-progress').hidden = true;
-    setTitleProgress(null);
+    if (!generating && !training) setTitleProgress(null);
   }
 }
 
