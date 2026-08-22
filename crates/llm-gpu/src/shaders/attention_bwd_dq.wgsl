@@ -1,6 +1,8 @@
-// dq[t, h] = sum_j d_score[h, t, j] * k[band_lo(t) + j, h / group]. Same
-// access pattern as the forward pass, so each dq row is written by
-// exactly one thread: a gather, no atomics.
+// dq[t, h] = sum_j d_score[h, t, j] * k[band_lo(t) + j, h / group].
+//
+// One workgroup of 64 threads per (row, head), each thread owning one
+// feature of the head and walking the window for it: a gather, so each
+// output is written by exactly one thread and no atomics are needed.
 struct Params {
     t_len: u32,
     heads: u32,
@@ -17,10 +19,15 @@ struct Params {
 @group(0) @binding(2) var<storage, read> k: array<f32>;
 @group(0) @binding(3) var<storage, read_write> dq: array<f32>;
 
-@compute @workgroup_size(8, 8, 1)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let t = gid.x;
-    let h = gid.y;
+const THREADS: u32 = 64u;
+
+@compute @workgroup_size(64)
+fn main(
+    @builtin(workgroup_id) wid: vec3<u32>,
+    @builtin(local_invocation_id) lid: vec3<u32>,
+) {
+    let t = wid.x;
+    let h = wid.y;
     if (t >= p.t_len || h >= p.heads) {
         return;
     }
@@ -30,21 +37,18 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let kvh = h / group;
     let base_t = t * hd + h * p.head_dim;
     let row = (h * p.t_len + t) * p.band;
-
     var lo: u32 = 0u;
     if (t + 1u > p.band) {
         lo = t + 1u - p.band;
     }
     let n = t - lo + 1u;
 
-    for (var d: u32 = 0u; d < p.head_dim; d = d + 1u) {
-        dq[base_t + d] = 0.0;
-    }
-    for (var j: u32 = 0u; j < n; j = j + 1u) {
-        let ds = d_score[row + j];
-        let base_k = (lo + j) * kvd + kvh * p.head_dim;
-        for (var d: u32 = 0u; d < p.head_dim; d = d + 1u) {
-            dq[base_t + d] = dq[base_t + d] + ds * k[base_k + d];
+    for (var d: u32 = lid.x; d < p.head_dim; d = d + THREADS) {
+        var acc: f32 = 0.0;
+        for (var j: u32 = 0u; j < n; j = j + 1u) {
+            let base_k = (lo + j) * kvd + kvh * p.head_dim;
+            acc = acc + d_score[row + j] * k[base_k + d];
         }
+        dq[base_t + d] = acc;
     }
 }

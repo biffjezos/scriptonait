@@ -930,7 +930,7 @@ $('train-btn').addEventListener('click', async () => {
       // The embedding table is one row per token, so this has to happen
       // before training starts, and it rebuilds the model.
       $('train-stats').textContent = 'Learning a vocabulary from your text…';
-      const learned = await call('learn-vocabulary', { targetVocabSize: 4096 }, [], 0);
+      const learned = await call('learn-vocabulary', { maxVocabSize: 8192 }, [], 0);
       if (learned && learned.model) renderModel(learned.model);
     }
 

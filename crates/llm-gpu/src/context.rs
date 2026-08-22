@@ -44,6 +44,7 @@ pub struct Pipelines {
     pub adam_update: Kernel,
     pub zero: Kernel,
     pub reduce: Kernel,
+    pub reduce_finish: Kernel,
 }
 
 /// A recycled pool of tiny uniform buffers, one per dispatch.
@@ -265,6 +266,11 @@ impl GpuContext {
             adam_update: make_pipeline(&device, "adam_update", include_str!("shaders/adam_update.wgsl")),
             zero: make_pipeline(&device, "zero", include_str!("shaders/zero.wgsl")),
             reduce: make_pipeline(&device, "reduce", include_str!("shaders/reduce.wgsl")),
+            reduce_finish: make_pipeline(
+                &device,
+                "reduce_finish",
+                include_str!("shaders/reduce_finish.wgsl"),
+            ),
         };
 
         let info = adapter.get_info();

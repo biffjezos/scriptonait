@@ -37,6 +37,11 @@ const RMS_EPS: f32 = 1e-6;
 /// overhead per step.
 const DEFAULT_DISPATCHES_PER_SUBMIT: u32 = 4;
 
+/// Workgroups a reduction splits its tensor across. Enough to keep a
+/// small GPU busy on a multi-million element tensor, small enough that
+/// summing the partials afterwards is one cheap dispatch.
+const REDUCE_GROUPS: usize = 64;
+
 /// Per-layer tensors, in the order `ParamSet` stores them.
 const T_ATTN_GAIN: usize = 0;
 const T_WQ: usize = 1;
@@ -199,6 +204,8 @@ struct Scratch {
     d_act: wgpu::Buffer,
     d_gate: wgpu::Buffer,
     d_up: wgpu::Buffer,
+    /// Per-workgroup partial sums, consumed by reduce_finish.
+    partials: wgpu::Buffer,
     /// Slot 0 is the summed loss; slot 1+i is tensor i's summed square.
     /// One small buffer, one readback per step - the only host-device
     /// synchronization a step has.
@@ -310,6 +317,7 @@ impl GpuTrainer {
             d_act: s("d_act", t_len * ffn),
             d_gate: s("d_gate", t_len * ffn),
             d_up: s("d_up", t_len * ffn),
+            partials: buffers::storage_f32(dev, "partials", REDUCE_GROUPS, false),
             stats: buffers::storage_f32(dev, "stats", stats_len, true),
         };
 
@@ -913,6 +921,11 @@ impl GpuTrainer {
         dispatch(chunks.enc(), ctx, &ctx.pipelines.zero, &entries, (groups, 1, 1));
     }
 
+    /// Sum a buffer (or its squares) into one stats slot, in two stages:
+    /// `REDUCE_GROUPS` workgroups each reduce a slice into `partials`,
+    /// then one workgroup sums those. One workgroup walking a whole
+    /// tensor alone was serial time proportional to the largest tensor,
+    /// paid once per tensor per step.
     fn dispatch_reduce(
         &self,
         chunks: &mut Chunks,
@@ -922,17 +935,30 @@ impl GpuTrainer {
         slot: usize,
         square: bool,
     ) {
+        let groups = REDUCE_GROUPS.min(len.div_ceil(256)).max(1) as u32;
         let params = ctx.params.alloc(
             &ctx.device,
             &ctx.queue,
-            P4 { a: len as u32, b: slot as u32, c: u32::from(square), d: 0 },
+            P4 { a: len as u32, b: 0, c: u32::from(square), d: 0 },
         );
         let entries = [
             wgpu::BindGroupEntry { binding: 0, resource: params.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 1, resource: src.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 2, resource: self.scratch.partials.as_entire_binding() },
+        ];
+        dispatch(chunks.enc(), ctx, &ctx.pipelines.reduce, &entries, (groups, 1, 1));
+
+        let params = ctx.params.alloc(
+            &ctx.device,
+            &ctx.queue,
+            P4 { a: 0, b: groups, c: slot as u32, d: 0 },
+        );
+        let entries = [
+            wgpu::BindGroupEntry { binding: 0, resource: params.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 1, resource: self.scratch.partials.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 2, resource: self.scratch.stats.as_entire_binding() },
         ];
-        dispatch(chunks.enc(), ctx, &ctx.pipelines.reduce, &entries, (1, 1, 1));
+        dispatch(chunks.enc(), ctx, &ctx.pipelines.reduce_finish, &entries, (1, 1, 1));
     }
 
     fn dispatch_gather(
@@ -1088,12 +1114,14 @@ impl GpuTrainer {
             wgpu::BindGroupEntry { binding: 4, resource: acts.concat.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 5, resource: acts.probs.as_entire_binding() },
         ];
+        // One workgroup per (row, head); the 64 threads inside split the
+        // window - see shaders/attention_fwd.wgsl.
         dispatch(
             chunks.enc(),
             ctx,
             &ctx.pipelines.attention_fwd,
             &entries,
-            (ceil_div(self.t_len, 8), ceil_div(self.config.num_heads, 8), 1),
+            (self.t_len as u32, self.config.num_heads as u32, 1),
         );
     }
 
@@ -1123,7 +1151,7 @@ impl GpuTrainer {
             ctx,
             &ctx.pipelines.attention_bwd_dscore,
             &entries,
-            (ceil_div(self.t_len, 8), ceil_div(heads, 8), 1),
+            (self.t_len as u32, heads as u32, 1),
         );
 
         let params = ctx.params.alloc(&ctx.device, &ctx.queue, self.attention_params(band));
@@ -1138,7 +1166,7 @@ impl GpuTrainer {
             ctx,
             &ctx.pipelines.attention_bwd_dq,
             &entries,
-            (ceil_div(self.t_len, 8), ceil_div(heads, 8), 1),
+            (self.t_len as u32, heads as u32, 1),
         );
 
         let params = ctx.params.alloc(&ctx.device, &ctx.queue, self.attention_params(band));
@@ -1156,7 +1184,7 @@ impl GpuTrainer {
             ctx,
             &ctx.pipelines.attention_bwd_dkdv,
             &entries,
-            (ceil_div(self.t_len, 8), ceil_div(kv_heads, 8), 1),
+            (self.t_len as u32, kv_heads as u32, 1),
         );
     }
 
