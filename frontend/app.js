@@ -737,24 +737,25 @@ onStream('train-progress', (progress) => {
   drawLossChart();
 });
 
-// Samples from the model as it trains. One card, rewritten in place:
-// the point is watching the writing change, and a stack of twenty stale
-// cards buries the only one worth reading.
+// Samples from the model as it trains. Exactly one card, rewritten in
+// place every time a sample arrives: `replaceChildren` runs on every
+// event, so the box holds this card and nothing else no matter what was
+// in it before. Never append - a stack of stale samples buries the only
+// one worth reading, which is the current one.
 onStream('train-sample', ({ step, loss, text }) => {
   const box = $('train-samples');
   let block = box.firstElementChild;
-  if (!block) {
+  if (!block || box.children.length !== 1) {
     block = document.createElement('div');
     block.className = 'train-sample';
     const head = document.createElement('div');
     head.className = 'train-sample-head';
-    const body = document.createElement('pre');
-    block.append(head, body);
-    box.replaceChildren(block);
+    block.append(head, document.createElement('pre'));
   }
   block.firstElementChild.textContent = `step ${step.toLocaleString()}` +
     (typeof loss === 'number' ? ` \u00b7 loss ${loss.toFixed(3)}` : '');
   block.lastElementChild.textContent = text;
+  box.replaceChildren(block);
 });
 
 $('train-btn').addEventListener('click', async () => {
