@@ -4,9 +4,11 @@
 // tensor reduces into its own slot, and the host reads the one small
 // buffer once per step.
 //
-// A single workgroup per dispatch: a grid-wide reduction would need
-// either atomics or a second pass, and the tensors here are small enough
-// that one workgroup striding over them is not the bottleneck.
+// A single workgroup per dispatch, 256 threads striding over the tensor:
+// a grid-wide reduction would need either float atomics (which WGSL does
+// not have) or a second pass. The largest tensor is the embedding table,
+// which at 256 threads is a few thousand iterations each - small beside
+// the matmuls of the step it belongs to.
 struct Params {
     len: u32,
     slot: u32,
@@ -18,12 +20,14 @@ struct Params {
 @group(0) @binding(1) var<storage, read> src: array<f32>;
 @group(0) @binding(2) var<storage, read_write> stats: array<f32>;
 
-var<workgroup> partial: array<f32, 64>;
+const THREADS: u32 = 256u;
 
-@compute @workgroup_size(64)
+var<workgroup> partial: array<f32, 256>;
+
+@compute @workgroup_size(256)
 fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
     var acc: f32 = 0.0;
-    for (var i: u32 = lid.x; i < p.len; i = i + 64u) {
+    for (var i: u32 = lid.x; i < p.len; i = i + THREADS) {
         let value = src[i];
         if (p.square == 1u) {
             acc = acc + value * value;
@@ -34,7 +38,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
     partial[lid.x] = acc;
     workgroupBarrier();
 
-    for (var stride: u32 = 32u; stride > 0u; stride = stride / 2u) {
+    for (var stride: u32 = THREADS / 2u; stride > 0u; stride = stride / 2u) {
         if (lid.x < stride) {
             partial[lid.x] = partial[lid.x] + partial[lid.x + stride];
         }

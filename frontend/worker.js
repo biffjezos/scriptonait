@@ -443,6 +443,21 @@ const handlers = {
     return result;
   },
 
+/// A lost or reset device is the one failure worth naming precisely: it
+/// means a submission ran past the driver's watchdog, and the answer is a
+/// smaller batch or a shorter context, not a retry.
+function describeTrainingFailure(error) {
+  const message = (error && error.message) || String(error);
+  if (/device.*(lost|hung|removed|reset)|DXGI_ERROR|GPUDevice/i.test(message)) {
+    return (
+      `the GPU device was reset mid-step (${message}). That is the driver's watchdog: ` +
+      'the work it was given took too long. Lower the batch size or the context length ' +
+      'and reload the page.'
+    );
+  }
+  return message;
+}
+
   async train(payload) {
     // Training is GPU work. Without a device there is nothing to fall
     // back to, so say which of the two reasons stopped it.
@@ -454,9 +469,15 @@ const handlers = {
       log('cannot train: not enough source text to fill one context window.');
       return { steps: 0, stopReason: 'no-data', elapsedSeconds: 0 };
     }
-    const result = await train(payload);
-    result.model = describeModel();
-    return result;
+    try {
+      const result = await train(payload);
+      result.model = describeModel();
+      return result;
+    } catch (error) {
+      const explained = describeTrainingFailure(error);
+      log(`training failed: ${explained}`);
+      throw new Error(explained);
+    }
   },
 
   async stop() {

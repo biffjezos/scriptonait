@@ -2,9 +2,14 @@
 //!
 //! The weights, the gradients and both Adam moment buffers live in GPU
 //! memory for the whole run. A step uploads one batch of token ids,
-//! dispatches the kernels, and reads back exactly two floats' worth of
-//! summary (the loss and the gradient norm). Nothing else crosses the
-//! bus, and no part of the step runs on the CPU.
+//! dispatches the kernels, and reads back one small summary buffer (the
+//! loss and each tensor's gradient norm). Nothing else crosses the bus,
+//! and no part of the step runs on the CPU.
+//!
+//! The work is submitted in small command buffers rather than one per
+//! sequence — see `Chunks`. An operating system resets any GPU whose
+//! single submission runs past its watchdog (about two seconds on
+//! Windows), and a sequence of this model's size is far past it.
 //!
 //! Every kernel here mirrors a function in `llm_core::ops` /
 //! `llm_core::model`, named in the shader's own header, and computes it
@@ -24,6 +29,13 @@ use crate::model::{ceil_div, dispatch, dispatch_add_inplace, dispatch_linear, di
 
 /// Must match `llm_core::model`'s RMS_EPS, which is private there.
 const RMS_EPS: f32 = 1e-6;
+
+/// Operations per command buffer. One matmul over this project's shapes
+/// is single-digit milliseconds even on a small integrated GPU, so a
+/// chunk of four stays two orders of magnitude under the driver's
+/// watchdog while costing only a few hundred microseconds of submission
+/// overhead per step.
+const DEFAULT_DISPATCHES_PER_SUBMIT: u32 = 4;
 
 /// Per-layer tensors, in the order `ParamSet` stores them.
 const T_ATTN_GAIN: usize = 0;
@@ -159,6 +171,14 @@ struct LayerActs {
 struct Scratch {
     tokens: wgpu::Buffer,
     targets: wgpu::Buffer,
+    /// The per-sequence index the embedding scatter walks: the distinct
+    /// token ids, where each one's positions start, and the positions
+    /// themselves. Built on the host per sequence — it is `t_len` numbers
+    /// of bookkeeping, and it turns the scatter from the most expensive
+    /// dispatch of the step into one of the cheapest.
+    row_ids: wgpu::Buffer,
+    row_offsets: wgpu::Buffer,
+    row_positions: wgpu::Buffer,
     hidden: wgpu::Buffer,
     tmp_h: wgpu::Buffer,
     h_final: wgpu::Buffer,
@@ -195,6 +215,12 @@ pub struct GpuTrainer {
     scratch: Scratch,
     t_len: usize,
     step: i32,
+    /// How many operations go into one command buffer. Small on purpose:
+    /// a submission that runs longer than the OS GPU watchdog (about two
+    /// seconds on Windows) gets the whole device reset out from under the
+    /// page — `DXGI_ERROR_DEVICE_HUNG`, which is what a whole sequence in
+    /// one submission produced on a small GPU.
+    dispatches_per_submit: u32,
 }
 
 /// What one step did, mirroring `llm_core::train::StepReport`, plus what
@@ -257,6 +283,9 @@ impl GpuTrainer {
         let scratch = Scratch {
             tokens: buffers::upload_u32(dev, "tokens", &vec![0u32; t_len]),
             targets: buffers::upload_u32(dev, "targets", &vec![0u32; t_len]),
+            row_ids: buffers::upload_u32(dev, "scatter-row-ids", &vec![0u32; t_len]),
+            row_offsets: buffers::upload_u32(dev, "scatter-offsets", &vec![0u32; t_len + 1]),
+            row_positions: buffers::upload_u32(dev, "scatter-positions", &vec![0u32; t_len]),
             // The residual stream is the source of three
             // `copy_buffer_to_buffer`s per layer (into the activation
             // cache), so it needs COPY_SRC - which is what the `readable`
@@ -294,6 +323,7 @@ impl GpuTrainer {
             scratch,
             t_len,
             step: 0,
+            dispatches_per_submit: DEFAULT_DISPATCHES_PER_SUBMIT,
         })
     }
 
@@ -307,6 +337,13 @@ impl GpuTrainer {
 
     pub fn steps_done(&self) -> i32 {
         self.step
+    }
+
+    /// Change how many operations share a command buffer. Lower is safer
+    /// against the driver watchdog on a slow device, higher trims
+    /// submission overhead on a fast one.
+    pub fn set_dispatches_per_submit(&mut self, n: u32) {
+        self.dispatches_per_submit = n.max(1);
     }
 
     /// Bytes this trainer holds in GPU memory: four copies of every
@@ -361,42 +398,39 @@ impl GpuTrainer {
         let batch_size = inputs.len() / t;
         ctx.params.reset();
         ctx.dispatch_count.set(0);
-        let mut submits = 0u32;
+        let mut chunks = Chunks::new(ctx, self.dispatches_per_submit);
 
         // Zero the gradient accumulator and the stats slots once per
         // step; every backward kernel that writes a gradient accumulates.
-        let mut encoder = ctx.device.create_command_encoder(&Default::default());
         for slot in &self.grads.slots {
-            self.dispatch_zero(&mut encoder, ctx, &slot.buffer, slot.len);
+            self.dispatch_zero(&mut chunks, ctx, &slot.buffer, slot.len);
         }
         let stats_len = 1 + self.grads.slots.len();
-        self.dispatch_zero(&mut encoder, ctx, &self.scratch.stats, stats_len);
-        ctx.queue.submit(Some(encoder.finish()));
-        submits += 1;
+        self.dispatch_zero(&mut chunks, ctx, &self.scratch.stats, stats_len);
+        chunks.flush();
 
         for b in 0..batch_size {
             let seq = &inputs[b * t..(b + 1) * t];
             let tgt = &targets[b * t..(b + 1) * t];
             buffers::write_u32(&ctx.queue, &self.scratch.tokens, seq);
             buffers::write_u32(&ctx.queue, &self.scratch.targets, tgt);
+            let groups = self.upload_scatter_index(ctx, seq);
 
-            let mut encoder = ctx.device.create_command_encoder(&Default::default());
-            self.encode_forward(&mut encoder, ctx);
-            self.encode_loss(&mut encoder, ctx);
-            self.encode_backward(&mut encoder, ctx);
-            ctx.queue.submit(Some(encoder.finish()));
-            submits += 1;
+            self.encode_forward(&mut chunks, ctx);
+            self.encode_loss(&mut chunks, ctx);
+            self.encode_backward(&mut chunks, ctx, groups);
+            // A sequence's work must be complete before the next one
+            // overwrites the shared token buffer and activation cache.
+            chunks.flush();
         }
 
         // Gradient norm: each tensor's sum of squares into its own stats
         // slot, so the host adds a few dozen numbers instead of reading
         // back several megabytes of gradient.
-        let mut encoder = ctx.device.create_command_encoder(&Default::default());
         for (i, slot) in self.grads.slots.iter().enumerate() {
-            self.dispatch_reduce(&mut encoder, ctx, &slot.buffer, slot.len, 1 + i, true);
+            self.dispatch_reduce(&mut chunks, ctx, &slot.buffer, slot.len, 1 + i, true);
         }
-        ctx.queue.submit(Some(encoder.finish()));
-        submits += 1;
+        chunks.flush();
         let stats = buffers::read_f32(&ctx.device, &ctx.queue, &self.scratch.stats, stats_len).await?;
 
         let inv_batch = 1.0 / batch_size as f32;
@@ -423,9 +457,9 @@ impl GpuTrainer {
         self.step += 1;
         let bias1 = 1.0 - 0.9f32.powi(self.step);
         let bias2 = 1.0 - 0.95f32.powi(self.step);
-        let mut encoder = ctx.device.create_command_encoder(&Default::default());
         for (i, slot) in self.grads.slots.iter().enumerate() {
             let wd = if slot.decay { weight_decay } else { 0.0 };
+            let (groups, stride) = self.stride_dispatch(ctx, slot.len);
             let params = ctx.params.alloc(
                 &ctx.device,
                 &ctx.queue,
@@ -436,8 +470,8 @@ impl GpuTrainer {
                     bias2,
                     weight_decay: wd,
                     grad_scale: inv_batch * clip,
+                    stride,
                     _p0: 0,
-                    _p1: 0,
                 },
             );
             let entries = [
@@ -447,16 +481,9 @@ impl GpuTrainer {
                 wgpu::BindGroupEntry { binding: 3, resource: self.m.slots[i].buffer.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 4, resource: self.v.slots[i].buffer.as_entire_binding() },
             ];
-            dispatch(
-                &mut encoder,
-                ctx,
-                &ctx.pipelines.adam_update,
-                &entries,
-                (ceil_div(slot.len, 64), 1, 1),
-            );
+            dispatch(chunks.enc(), ctx, &ctx.pipelines.adam_update, &entries, (groups, 1, 1));
         }
-        ctx.queue.submit(Some(encoder.finish()));
-        submits += 1;
+        chunks.flush();
 
         Ok(GpuStepReport {
             loss,
@@ -464,7 +491,7 @@ impl GpuTrainer {
             grad_norm,
             tokens: batch_size * t,
             dispatches: ctx.dispatch_count.get(),
-            submits,
+            submits: chunks.submits,
         })
     }
 
@@ -515,10 +542,11 @@ impl GpuTrainer {
             return Err(format!("compare needs exactly {} tokens", self.t_len));
         }
         ctx.params.reset();
+        ctx.dispatch_count.set(0);
         buffers::write_u32(&ctx.queue, &self.scratch.tokens, tokens);
-        let mut encoder = ctx.device.create_command_encoder(&Default::default());
-        self.encode_forward(&mut encoder, ctx);
-        ctx.queue.submit(Some(encoder.finish()));
+        let mut chunks = Chunks::new(ctx, self.dispatches_per_submit);
+        self.encode_forward(&mut chunks, ctx);
+        chunks.flush();
         let vocab = self.config.vocab_size();
         let gpu_logits =
             buffers::read_f32(&ctx.device, &ctx.queue, &self.scratch.logits, self.t_len * vocab).await?;
@@ -534,18 +562,18 @@ impl GpuTrainer {
 
     // --- encoding -------------------------------------------------------
 
-    fn encode_forward(&self, encoder: &mut wgpu::CommandEncoder, ctx: &GpuContext) {
+    fn encode_forward(&self, chunks: &mut Chunks, ctx: &GpuContext) {
         let t = self.t_len;
         let c = &self.config;
         let (h, kv, ffn) = (c.hidden_dim, c.kv_dim(), c.ffn_dim());
         let band = ops::band_width(t, c.effective_window());
 
-        self.dispatch_gather(encoder, ctx, self.weights.embed(), &self.scratch.tokens, &self.scratch.hidden);
+        self.dispatch_gather(chunks, ctx, self.weights.embed(), &self.scratch.tokens, &self.scratch.hidden);
 
         for (l, acts) in self.acts.iter().enumerate() {
-            copy(encoder, &self.scratch.hidden, &acts.h_in, t * h);
+            chunks.copy(&self.scratch.hidden, &acts.h_in, t * h);
             self.dispatch_rmsnorm(
-                encoder,
+                chunks,
                 ctx,
                 &self.scratch.hidden,
                 self.weights.layer(l, T_ATTN_GAIN),
@@ -553,14 +581,14 @@ impl GpuTrainer {
                 &acts.inv_rms1,
                 h,
             );
-            dispatch_linear(encoder, ctx, &acts.normed1, self.weights.layer(l, T_WQ), &acts.q, t, h, h);
-            dispatch_linear(encoder, ctx, &acts.normed1, self.weights.layer(l, T_WK), &acts.k, t, h, kv);
-            dispatch_linear(encoder, ctx, &acts.normed1, self.weights.layer(l, T_WV), &acts.v, t, h, kv);
-            self.dispatch_rope(encoder, ctx, &acts.q, c.num_heads, false);
-            self.dispatch_rope(encoder, ctx, &acts.k, c.num_kv_heads, false);
-            self.dispatch_attention_fwd(encoder, ctx, acts, band);
+            dispatch_linear(chunks.enc(), ctx, &acts.normed1, self.weights.layer(l, T_WQ), &acts.q, t, h, h);
+            dispatch_linear(chunks.enc(), ctx, &acts.normed1, self.weights.layer(l, T_WK), &acts.k, t, h, kv);
+            dispatch_linear(chunks.enc(), ctx, &acts.normed1, self.weights.layer(l, T_WV), &acts.v, t, h, kv);
+            self.dispatch_rope(chunks, ctx, &acts.q, c.num_heads, false);
+            self.dispatch_rope(chunks, ctx, &acts.k, c.num_kv_heads, false);
+            self.dispatch_attention_fwd(chunks, ctx, acts, band);
             dispatch_linear(
-                encoder,
+                chunks.enc(),
                 ctx,
                 &acts.concat,
                 self.weights.layer(l, T_WO),
@@ -569,11 +597,11 @@ impl GpuTrainer {
                 h,
                 h,
             );
-            dispatch_add_inplace(encoder, ctx, &self.scratch.hidden, &self.scratch.tmp_h, t * h);
-            copy(encoder, &self.scratch.hidden, &acts.h_after_attn, t * h);
+            dispatch_add_inplace(chunks.enc(), ctx, &self.scratch.hidden, &self.scratch.tmp_h, t * h);
+            chunks.copy(&self.scratch.hidden, &acts.h_after_attn, t * h);
 
             self.dispatch_rmsnorm(
-                encoder,
+                chunks,
                 ctx,
                 &self.scratch.hidden,
                 self.weights.layer(l, T_MLP_GAIN),
@@ -581,11 +609,11 @@ impl GpuTrainer {
                 &acts.inv_rms2,
                 h,
             );
-            dispatch_linear(encoder, ctx, &acts.normed2, self.weights.layer(l, T_W_GATE), &acts.gate, t, h, ffn);
-            dispatch_linear(encoder, ctx, &acts.normed2, self.weights.layer(l, T_W_UP), &acts.up, t, h, ffn);
-            dispatch_swiglu(encoder, ctx, &acts.gate, &acts.up, &self.scratch.act, t * ffn);
+            dispatch_linear(chunks.enc(), ctx, &acts.normed2, self.weights.layer(l, T_W_GATE), &acts.gate, t, h, ffn);
+            dispatch_linear(chunks.enc(), ctx, &acts.normed2, self.weights.layer(l, T_W_UP), &acts.up, t, h, ffn);
+            dispatch_swiglu(chunks.enc(), ctx, &acts.gate, &acts.up, &self.scratch.act, t * ffn);
             dispatch_linear(
-                encoder,
+                chunks.enc(),
                 ctx,
                 &self.scratch.act,
                 self.weights.layer(l, T_W_DOWN),
@@ -594,12 +622,12 @@ impl GpuTrainer {
                 ffn,
                 h,
             );
-            dispatch_add_inplace(encoder, ctx, &self.scratch.hidden, &self.scratch.tmp_h, t * h);
+            dispatch_add_inplace(chunks.enc(), ctx, &self.scratch.hidden, &self.scratch.tmp_h, t * h);
         }
 
-        copy(encoder, &self.scratch.hidden, &self.scratch.h_final, t * h);
+        chunks.copy(&self.scratch.hidden, &self.scratch.h_final, t * h);
         self.dispatch_rmsnorm(
-            encoder,
+            chunks,
             ctx,
             &self.scratch.hidden,
             self.weights.final_gain(&self.config),
@@ -609,7 +637,7 @@ impl GpuTrainer {
         );
         // Weight-tied output head: logits = final_normed @ embed^T.
         dispatch_linear(
-            encoder,
+            chunks.enc(),
             ctx,
             &self.scratch.final_normed,
             self.weights.embed(),
@@ -620,7 +648,7 @@ impl GpuTrainer {
         );
     }
 
-    fn encode_loss(&self, encoder: &mut wgpu::CommandEncoder, ctx: &GpuContext) {
+    fn encode_loss(&self, chunks: &mut Chunks, ctx: &GpuContext) {
         let t = self.t_len;
         let params = ctx.params.alloc(
             &ctx.device,
@@ -634,14 +662,42 @@ impl GpuTrainer {
             wgpu::BindGroupEntry { binding: 3, resource: self.scratch.d_logits.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 4, resource: self.scratch.loss_rows.as_entire_binding() },
         ];
-        dispatch(encoder, ctx, &ctx.pipelines.cross_entropy, &entries, (ceil_div(t, 64), 1, 1));
+        dispatch(chunks.enc(), ctx, &ctx.pipelines.cross_entropy, &entries, (ceil_div(t, 64), 1, 1));
         // The per-row losses reduce straight into the step's loss slot,
         // so the batch costs one readback in total rather than one per
         // sequence.
-        self.dispatch_reduce(encoder, ctx, &self.scratch.loss_rows, t, 0, false);
+        self.dispatch_reduce(chunks, ctx, &self.scratch.loss_rows, t, 0, false);
     }
 
-    fn encode_backward(&self, encoder: &mut wgpu::CommandEncoder, ctx: &GpuContext) {
+    /// Groups this sequence's token positions by token id and uploads the
+    /// result for the embedding scatter. Returns how many distinct ids
+    /// there are, which is the scatter's dispatch width.
+    fn upload_scatter_index(&self, ctx: &GpuContext, tokens: &[u32]) -> usize {
+        let mut ids: Vec<u32> = Vec::with_capacity(tokens.len());
+        let mut positions_by_id: Vec<Vec<u32>> = Vec::with_capacity(tokens.len());
+        for (position, &id) in tokens.iter().enumerate() {
+            match ids.iter().position(|&existing| existing == id) {
+                Some(group) => positions_by_id[group].push(position as u32),
+                None => {
+                    ids.push(id);
+                    positions_by_id.push(vec![position as u32]);
+                }
+            }
+        }
+        let mut offsets = Vec::with_capacity(ids.len() + 1);
+        let mut positions = Vec::with_capacity(tokens.len());
+        offsets.push(0u32);
+        for group in &positions_by_id {
+            positions.extend_from_slice(group);
+            offsets.push(positions.len() as u32);
+        }
+        buffers::write_u32(&ctx.queue, &self.scratch.row_ids, &ids);
+        buffers::write_u32(&ctx.queue, &self.scratch.row_offsets, &offsets);
+        buffers::write_u32(&ctx.queue, &self.scratch.row_positions, &positions);
+        ids.len()
+    }
+
+    fn encode_backward(&self, chunks: &mut Chunks, ctx: &GpuContext, scatter_groups: usize) {
         let t = self.t_len;
         let c = &self.config;
         let (h, kv, ffn, vocab) = (c.hidden_dim, c.kv_dim(), c.ffn_dim(), c.vocab_size());
@@ -650,10 +706,10 @@ impl GpuTrainer {
 
         // Output head, tied with the embedding table: its gradient gets
         // both this contribution and the input-gather one at the end.
-        self.dispatch_linear_bwd_dw(encoder, ctx, &s.d_logits, &s.final_normed, self.grads.embed(), t, h, vocab);
-        self.dispatch_linear_bwd_dx(encoder, ctx, &s.d_logits, self.weights.embed(), &s.d_a, t, h, vocab);
+        self.dispatch_linear_bwd_dw(chunks, ctx, &s.d_logits, &s.final_normed, self.grads.embed(), t, h, vocab);
+        self.dispatch_linear_bwd_dx(chunks, ctx, &s.d_logits, self.weights.embed(), &s.d_a, t, h, vocab);
         self.dispatch_rmsnorm_bwd_dgain(
-            encoder,
+            chunks,
             ctx,
             &s.d_a,
             &s.h_final,
@@ -662,7 +718,7 @@ impl GpuTrainer {
             h,
         );
         self.dispatch_rmsnorm_bwd_dx(
-            encoder,
+            chunks,
             ctx,
             &s.d_a,
             &s.h_final,
@@ -676,9 +732,9 @@ impl GpuTrainer {
             let acts = &self.acts[l];
 
             // --- MLP branch ---
-            dispatch_swiglu(encoder, ctx, &acts.gate, &acts.up, &s.act, t * ffn);
+            dispatch_swiglu(chunks.enc(), ctx, &acts.gate, &acts.up, &s.act, t * ffn);
             self.dispatch_linear_bwd_dw(
-                encoder,
+                chunks,
                 ctx,
                 &s.d_hidden,
                 &s.act,
@@ -688,7 +744,7 @@ impl GpuTrainer {
                 h,
             );
             self.dispatch_linear_bwd_dx(
-                encoder,
+                chunks,
                 ctx,
                 &s.d_hidden,
                 self.weights.layer(l, T_W_DOWN),
@@ -697,9 +753,9 @@ impl GpuTrainer {
                 ffn,
                 h,
             );
-            self.dispatch_swiglu_bwd(encoder, ctx, &s.d_act, &acts.gate, &acts.up, t * ffn);
+            self.dispatch_swiglu_bwd(chunks, ctx, &s.d_act, &acts.gate, &acts.up, t * ffn);
             self.dispatch_linear_bwd_dw(
-                encoder,
+                chunks,
                 ctx,
                 &s.d_gate,
                 &acts.normed2,
@@ -709,7 +765,7 @@ impl GpuTrainer {
                 ffn,
             );
             self.dispatch_linear_bwd_dw(
-                encoder,
+                chunks,
                 ctx,
                 &s.d_up,
                 &acts.normed2,
@@ -719,7 +775,7 @@ impl GpuTrainer {
                 ffn,
             );
             self.dispatch_linear_bwd_dx(
-                encoder,
+                chunks,
                 ctx,
                 &s.d_gate,
                 self.weights.layer(l, T_W_GATE),
@@ -729,7 +785,7 @@ impl GpuTrainer {
                 ffn,
             );
             self.dispatch_linear_bwd_dx(
-                encoder,
+                chunks,
                 ctx,
                 &s.d_up,
                 self.weights.layer(l, T_W_UP),
@@ -738,10 +794,10 @@ impl GpuTrainer {
                 h,
                 ffn,
             );
-            dispatch_add_inplace(encoder, ctx, &s.d_a, &s.d_b, t * h);
+            dispatch_add_inplace(chunks.enc(), ctx, &s.d_a, &s.d_b, t * h);
 
             self.dispatch_rmsnorm_bwd_dgain(
-                encoder,
+                chunks,
                 ctx,
                 &s.d_a,
                 &acts.h_after_attn,
@@ -750,7 +806,7 @@ impl GpuTrainer {
                 h,
             );
             self.dispatch_rmsnorm_bwd_dx(
-                encoder,
+                chunks,
                 ctx,
                 &s.d_a,
                 &acts.h_after_attn,
@@ -761,11 +817,11 @@ impl GpuTrainer {
             );
             // The residual splits the gradient: what arrived plus what
             // came back through the norm branch.
-            dispatch_add_inplace(encoder, ctx, &s.d_hidden, &s.d_c, t * h);
+            dispatch_add_inplace(chunks.enc(), ctx, &s.d_hidden, &s.d_c, t * h);
 
             // --- Attention branch ---
             self.dispatch_linear_bwd_dw(
-                encoder,
+                chunks,
                 ctx,
                 &s.d_hidden,
                 &acts.concat,
@@ -775,7 +831,7 @@ impl GpuTrainer {
                 h,
             );
             self.dispatch_linear_bwd_dx(
-                encoder,
+                chunks,
                 ctx,
                 &s.d_hidden,
                 self.weights.layer(l, T_WO),
@@ -784,21 +840,21 @@ impl GpuTrainer {
                 h,
                 h,
             );
-            self.dispatch_attention_bwd(encoder, ctx, acts, band);
-            self.dispatch_rope(encoder, ctx, &s.d_q, c.num_heads, true);
-            self.dispatch_rope(encoder, ctx, &s.d_k, c.num_kv_heads, true);
+            self.dispatch_attention_bwd(chunks, ctx, acts, band);
+            self.dispatch_rope(chunks, ctx, &s.d_q, c.num_heads, true);
+            self.dispatch_rope(chunks, ctx, &s.d_k, c.num_kv_heads, true);
 
-            self.dispatch_linear_bwd_dw(encoder, ctx, &s.d_q, &acts.normed1, self.grads.layer(l, T_WQ), t, h, h);
-            self.dispatch_linear_bwd_dw(encoder, ctx, &s.d_k, &acts.normed1, self.grads.layer(l, T_WK), t, h, kv);
-            self.dispatch_linear_bwd_dw(encoder, ctx, &s.d_v, &acts.normed1, self.grads.layer(l, T_WV), t, h, kv);
-            self.dispatch_linear_bwd_dx(encoder, ctx, &s.d_q, self.weights.layer(l, T_WQ), &s.d_a, t, h, h);
-            self.dispatch_linear_bwd_dx(encoder, ctx, &s.d_k, self.weights.layer(l, T_WK), &s.d_b, t, h, kv);
-            self.dispatch_linear_bwd_dx(encoder, ctx, &s.d_v, self.weights.layer(l, T_WV), &s.d_c, t, h, kv);
-            dispatch_add_inplace(encoder, ctx, &s.d_a, &s.d_b, t * h);
-            dispatch_add_inplace(encoder, ctx, &s.d_a, &s.d_c, t * h);
+            self.dispatch_linear_bwd_dw(chunks, ctx, &s.d_q, &acts.normed1, self.grads.layer(l, T_WQ), t, h, h);
+            self.dispatch_linear_bwd_dw(chunks, ctx, &s.d_k, &acts.normed1, self.grads.layer(l, T_WK), t, h, kv);
+            self.dispatch_linear_bwd_dw(chunks, ctx, &s.d_v, &acts.normed1, self.grads.layer(l, T_WV), t, h, kv);
+            self.dispatch_linear_bwd_dx(chunks, ctx, &s.d_q, self.weights.layer(l, T_WQ), &s.d_a, t, h, h);
+            self.dispatch_linear_bwd_dx(chunks, ctx, &s.d_k, self.weights.layer(l, T_WK), &s.d_b, t, h, kv);
+            self.dispatch_linear_bwd_dx(chunks, ctx, &s.d_v, self.weights.layer(l, T_WV), &s.d_c, t, h, kv);
+            dispatch_add_inplace(chunks.enc(), ctx, &s.d_a, &s.d_b, t * h);
+            dispatch_add_inplace(chunks.enc(), ctx, &s.d_a, &s.d_c, t * h);
 
             self.dispatch_rmsnorm_bwd_dgain(
-                encoder,
+                chunks,
                 ctx,
                 &s.d_a,
                 &acts.h_in,
@@ -807,7 +863,7 @@ impl GpuTrainer {
                 h,
             );
             self.dispatch_rmsnorm_bwd_dx(
-                encoder,
+                chunks,
                 ctx,
                 &s.d_a,
                 &acts.h_in,
@@ -816,33 +872,50 @@ impl GpuTrainer {
                 &s.d_c,
                 h,
             );
-            dispatch_add_inplace(encoder, ctx, &s.d_hidden, &s.d_c, t * h);
+            dispatch_add_inplace(chunks.enc(), ctx, &s.d_hidden, &s.d_c, t * h);
         }
 
         // The other half of the tied embedding gradient: the input gather.
-        self.dispatch_scatter_add(encoder, ctx, &s.d_hidden, self.grads.embed(), vocab, h);
+        self.dispatch_scatter_add(chunks, ctx, &s.d_hidden, self.grads.embed(), scatter_groups, h);
     }
 
     // --- dispatch helpers ------------------------------------------------
 
+    /// Workgroups for a grid-stride kernel over `len` elements: enough to
+    /// fill the device, never more than the adapter's per-dimension limit.
+    /// A model's embedding table is millions of floats, and asking for one
+    /// workgroup per 64 of them exceeds that limit (65535 on most
+    /// adapters) — which fails validation rather than merely running slow.
+    fn stride_dispatch(&self, ctx: &GpuContext, len: usize) -> (u32, u32) {
+        let wanted = ceil_div(len, 64);
+        let cap = ctx.max_workgroups_per_dimension.max(1).min(4096);
+        let groups = wanted.min(cap).max(1);
+        (groups, groups * 64)
+    }
+
     fn dispatch_zero(
         &self,
-        encoder: &mut wgpu::CommandEncoder,
+        chunks: &mut Chunks,
         ctx: &GpuContext,
         buffer: &wgpu::Buffer,
         len: usize,
     ) {
-        let params = ctx.params.alloc(&ctx.device, &ctx.queue, P4 { a: len as u32, b: 0, c: 0, d: 0 });
+        let (groups, stride) = self.stride_dispatch(ctx, len);
+        let params = ctx.params.alloc(
+            &ctx.device,
+            &ctx.queue,
+            P4 { a: len as u32, b: stride, c: 0, d: 0 },
+        );
         let entries = [
             wgpu::BindGroupEntry { binding: 0, resource: params.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 1, resource: buffer.as_entire_binding() },
         ];
-        dispatch(encoder, ctx, &ctx.pipelines.zero, &entries, (ceil_div(len, 64), 1, 1));
+        dispatch(chunks.enc(), ctx, &ctx.pipelines.zero, &entries, (groups, 1, 1));
     }
 
     fn dispatch_reduce(
         &self,
-        encoder: &mut wgpu::CommandEncoder,
+        chunks: &mut Chunks,
         ctx: &GpuContext,
         src: &wgpu::Buffer,
         len: usize,
@@ -859,12 +932,12 @@ impl GpuTrainer {
             wgpu::BindGroupEntry { binding: 1, resource: src.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 2, resource: self.scratch.stats.as_entire_binding() },
         ];
-        dispatch(encoder, ctx, &ctx.pipelines.reduce, &entries, (1, 1, 1));
+        dispatch(chunks.enc(), ctx, &ctx.pipelines.reduce, &entries, (1, 1, 1));
     }
 
     fn dispatch_gather(
         &self,
-        encoder: &mut wgpu::CommandEncoder,
+        chunks: &mut Chunks,
         ctx: &GpuContext,
         table: &wgpu::Buffer,
         ids: &wgpu::Buffer,
@@ -883,7 +956,7 @@ impl GpuTrainer {
             wgpu::BindGroupEntry { binding: 3, resource: out.as_entire_binding() },
         ];
         dispatch(
-            encoder,
+            chunks.enc(),
             ctx,
             &ctx.pipelines.embedding_gather,
             &entries,
@@ -891,39 +964,42 @@ impl GpuTrainer {
         );
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn dispatch_scatter_add(
         &self,
-        encoder: &mut wgpu::CommandEncoder,
+        chunks: &mut Chunks,
         ctx: &GpuContext,
         d_rows: &wgpu::Buffer,
         table_grad: &wgpu::Buffer,
-        vocab: usize,
+        groups: usize,
         hidden: usize,
     ) {
         let params = ctx.params.alloc(
             &ctx.device,
             &ctx.queue,
-            P4 { a: self.t_len as u32, b: hidden as u32, c: vocab as u32, d: 0 },
+            P4 { a: groups as u32, b: hidden as u32, c: 0, d: 0 },
         );
         let entries = [
             wgpu::BindGroupEntry { binding: 0, resource: params.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 1, resource: d_rows.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 2, resource: self.scratch.tokens.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 3, resource: table_grad.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 2, resource: self.scratch.row_ids.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 3, resource: self.scratch.row_offsets.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 4, resource: self.scratch.row_positions.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 5, resource: table_grad.as_entire_binding() },
         ];
         dispatch(
-            encoder,
+            chunks.enc(),
             ctx,
             &ctx.pipelines.embedding_scatter_add,
             &entries,
-            (ceil_div(vocab, 8), ceil_div(hidden, 8), 1),
+            (ceil_div(groups, 8), ceil_div(hidden, 8), 1),
         );
     }
 
     #[allow(clippy::too_many_arguments)]
     fn dispatch_rmsnorm(
         &self,
-        encoder: &mut wgpu::CommandEncoder,
+        chunks: &mut Chunks,
         ctx: &GpuContext,
         x: &wgpu::Buffer,
         gain: &wgpu::Buffer,
@@ -945,12 +1021,12 @@ impl GpuTrainer {
             wgpu::BindGroupEntry { binding: 3, resource: out.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 4, resource: inv_rms.as_entire_binding() },
         ];
-        dispatch(encoder, ctx, &ctx.pipelines.rmsnorm, &entries, (ceil_div(self.t_len, 64), 1, 1));
+        dispatch(chunks.enc(), ctx, &ctx.pipelines.rmsnorm, &entries, (ceil_div(self.t_len, 64), 1, 1));
     }
 
     fn dispatch_rope(
         &self,
-        encoder: &mut wgpu::CommandEncoder,
+        chunks: &mut Chunks,
         ctx: &GpuContext,
         x: &wgpu::Buffer,
         heads: usize,
@@ -975,7 +1051,7 @@ impl GpuTrainer {
             wgpu::BindGroupEntry { binding: 1, resource: x.as_entire_binding() },
         ];
         dispatch(
-            encoder,
+            chunks.enc(),
             ctx,
             &ctx.pipelines.rope,
             &entries,
@@ -998,7 +1074,7 @@ impl GpuTrainer {
 
     fn dispatch_attention_fwd(
         &self,
-        encoder: &mut wgpu::CommandEncoder,
+        chunks: &mut Chunks,
         ctx: &GpuContext,
         acts: &LayerActs,
         band: usize,
@@ -1013,7 +1089,7 @@ impl GpuTrainer {
             wgpu::BindGroupEntry { binding: 5, resource: acts.probs.as_entire_binding() },
         ];
         dispatch(
-            encoder,
+            chunks.enc(),
             ctx,
             &ctx.pipelines.attention_fwd,
             &entries,
@@ -1025,7 +1101,7 @@ impl GpuTrainer {
     /// each other: softmax backward first, then dQ and dK/dV from it.
     fn dispatch_attention_bwd(
         &self,
-        encoder: &mut wgpu::CommandEncoder,
+        chunks: &mut Chunks,
         ctx: &GpuContext,
         acts: &LayerActs,
         band: usize,
@@ -1043,7 +1119,7 @@ impl GpuTrainer {
             wgpu::BindGroupEntry { binding: 4, resource: s.d_score.as_entire_binding() },
         ];
         dispatch(
-            encoder,
+            chunks.enc(),
             ctx,
             &ctx.pipelines.attention_bwd_dscore,
             &entries,
@@ -1058,7 +1134,7 @@ impl GpuTrainer {
             wgpu::BindGroupEntry { binding: 3, resource: s.d_q.as_entire_binding() },
         ];
         dispatch(
-            encoder,
+            chunks.enc(),
             ctx,
             &ctx.pipelines.attention_bwd_dq,
             &entries,
@@ -1076,7 +1152,7 @@ impl GpuTrainer {
             wgpu::BindGroupEntry { binding: 6, resource: s.d_v.as_entire_binding() },
         ];
         dispatch(
-            encoder,
+            chunks.enc(),
             ctx,
             &ctx.pipelines.attention_bwd_dkdv,
             &entries,
@@ -1087,7 +1163,7 @@ impl GpuTrainer {
     #[allow(clippy::too_many_arguments)]
     fn dispatch_linear_bwd_dw(
         &self,
-        encoder: &mut wgpu::CommandEncoder,
+        chunks: &mut Chunks,
         ctx: &GpuContext,
         dy: &wgpu::Buffer,
         x: &wgpu::Buffer,
@@ -1108,7 +1184,7 @@ impl GpuTrainer {
             wgpu::BindGroupEntry { binding: 3, resource: dw.as_entire_binding() },
         ];
         dispatch(
-            encoder,
+            chunks.enc(),
             ctx,
             &ctx.pipelines.linear_bwd_dw,
             &entries,
@@ -1119,7 +1195,7 @@ impl GpuTrainer {
     #[allow(clippy::too_many_arguments)]
     fn dispatch_linear_bwd_dx(
         &self,
-        encoder: &mut wgpu::CommandEncoder,
+        chunks: &mut Chunks,
         ctx: &GpuContext,
         dy: &wgpu::Buffer,
         w: &wgpu::Buffer,
@@ -1140,7 +1216,7 @@ impl GpuTrainer {
             wgpu::BindGroupEntry { binding: 3, resource: dx.as_entire_binding() },
         ];
         dispatch(
-            encoder,
+            chunks.enc(),
             ctx,
             &ctx.pipelines.linear_bwd_dx,
             &entries,
@@ -1150,7 +1226,7 @@ impl GpuTrainer {
 
     fn dispatch_swiglu_bwd(
         &self,
-        encoder: &mut wgpu::CommandEncoder,
+        chunks: &mut Chunks,
         ctx: &GpuContext,
         d_act: &wgpu::Buffer,
         gate: &wgpu::Buffer,
@@ -1166,13 +1242,13 @@ impl GpuTrainer {
             wgpu::BindGroupEntry { binding: 4, resource: self.scratch.d_gate.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 5, resource: self.scratch.d_up.as_entire_binding() },
         ];
-        dispatch(encoder, ctx, &ctx.pipelines.swiglu_bwd, &entries, (ceil_div(len, 64), 1, 1));
+        dispatch(chunks.enc(), ctx, &ctx.pipelines.swiglu_bwd, &entries, (ceil_div(len, 64), 1, 1));
     }
 
     #[allow(clippy::too_many_arguments)]
     fn dispatch_rmsnorm_bwd_dx(
         &self,
-        encoder: &mut wgpu::CommandEncoder,
+        chunks: &mut Chunks,
         ctx: &GpuContext,
         dy: &wgpu::Buffer,
         x: &wgpu::Buffer,
@@ -1195,7 +1271,7 @@ impl GpuTrainer {
             wgpu::BindGroupEntry { binding: 5, resource: dx.as_entire_binding() },
         ];
         dispatch(
-            encoder,
+            chunks.enc(),
             ctx,
             &ctx.pipelines.rmsnorm_bwd_dx,
             &entries,
@@ -1205,7 +1281,7 @@ impl GpuTrainer {
 
     fn dispatch_rmsnorm_bwd_dgain(
         &self,
-        encoder: &mut wgpu::CommandEncoder,
+        chunks: &mut Chunks,
         ctx: &GpuContext,
         dy: &wgpu::Buffer,
         x: &wgpu::Buffer,
@@ -1225,12 +1301,62 @@ impl GpuTrainer {
             wgpu::BindGroupEntry { binding: 3, resource: inv_rms.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 4, resource: dgain.as_entire_binding() },
         ];
-        dispatch(encoder, ctx, &ctx.pipelines.rmsnorm_bwd_dgain, &entries, (ceil_div(dim, 64), 1, 1));
+        dispatch(chunks.enc(), ctx, &ctx.pipelines.rmsnorm_bwd_dgain, &entries, (ceil_div(dim, 64), 1, 1));
     }
 }
 
-fn copy(encoder: &mut wgpu::CommandEncoder, src: &wgpu::Buffer, dst: &wgpu::Buffer, len: usize) {
-    encoder.copy_buffer_to_buffer(src, 0, dst, 0, (len * std::mem::size_of::<f32>()) as u64);
+/// Encodes work in bounded chunks and submits each one.
+///
+/// A whole sequence's forward and backward pass in a single command
+/// buffer is several hundred GFLOP of work in one submission. Windows
+/// resets any GPU whose submission runs past its ~2 second watchdog
+/// (`DXGI_ERROR_DEVICE_HUNG`), which is exactly what a step of this size
+/// did: the device was killed mid-training. Submitting every few
+/// dispatches keeps each submission far under the watchdog, at the cost
+/// of a few hundred microseconds per step - and the queue still runs
+/// them in order, so nothing about the arithmetic changes.
+struct Chunks<'a> {
+    ctx: &'a GpuContext,
+    encoder: Option<wgpu::CommandEncoder>,
+    since_submit: u32,
+    per_submit: u32,
+    pub submits: u32,
+}
+
+impl<'a> Chunks<'a> {
+    fn new(ctx: &'a GpuContext, per_submit: u32) -> Self {
+        Self { ctx, encoder: None, since_submit: 0, per_submit, submits: 0 }
+    }
+
+    /// The encoder to put the next operation into.
+    ///
+    /// Counting happens here rather than in a separate call the caller
+    /// has to remember: one `enc()` is one operation, so the chunk is
+    /// submitted the moment it is full and a fresh encoder starts. The
+    /// submit happens *between* operations, never inside one.
+    fn enc(&mut self) -> &mut wgpu::CommandEncoder {
+        if self.since_submit >= self.per_submit {
+            self.flush();
+        }
+        if self.encoder.is_none() {
+            self.encoder = Some(self.ctx.device.create_command_encoder(&Default::default()));
+        }
+        self.since_submit += 1;
+        self.encoder.as_mut().expect("just created")
+    }
+
+    fn flush(&mut self) {
+        if let Some(encoder) = self.encoder.take() {
+            self.ctx.queue.submit(Some(encoder.finish()));
+            self.submits += 1;
+        }
+        self.since_submit = 0;
+    }
+
+    fn copy(&mut self, src: &wgpu::Buffer, dst: &wgpu::Buffer, len: usize) {
+        let bytes = (len * std::mem::size_of::<f32>()) as u64;
+        self.enc().copy_buffer_to_buffer(src, 0, dst, 0, bytes);
+    }
 }
 
 #[repr(C)]
@@ -1251,6 +1377,6 @@ struct AdamParams {
     bias2: f32,
     weight_decay: f32,
     grad_scale: f32,
+    stride: u32,
     _p0: u32,
-    _p1: u32,
 }

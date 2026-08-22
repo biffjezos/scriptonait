@@ -6,6 +6,9 @@
 // the batch average (1/batch_size) and the global-norm clip factor, which
 // the host computes from this step's gradient-norm readback - so neither
 // needs a separate pass over every parameter.
+//
+// Grid-stride for the same reason as zero.wgsl: the largest tensor here
+// has millions of elements, past what one-thread-per-element can dispatch.
 struct Params {
     len: u32,
     lr: f32,
@@ -13,8 +16,8 @@ struct Params {
     bias2: f32,
     weight_decay: f32,
     grad_scale: f32,
+    stride: u32,
     _p0: u32,
-    _p1: u32,
 };
 
 const BETA1: f32 = 0.9;
@@ -29,16 +32,14 @@ const EPS: f32 = 1e-8;
 
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let i = gid.x;
-    if (i >= p.len) {
-        return;
+    for (var i: u32 = gid.x; i < p.len; i = i + p.stride) {
+        let gi = g[i] * p.grad_scale;
+        let mi = BETA1 * m[i] + (1.0 - BETA1) * gi;
+        let vi = BETA2 * v[i] + (1.0 - BETA2) * gi * gi;
+        m[i] = mi;
+        v[i] = vi;
+        let m_hat = mi / p.bias1;
+        let v_hat = vi / p.bias2;
+        w[i] = w[i] - p.lr * (m_hat / (sqrt(v_hat) + EPS) + p.weight_decay * w[i]);
     }
-    let gi = g[i] * p.grad_scale;
-    let mi = BETA1 * m[i] + (1.0 - BETA1) * gi;
-    let vi = BETA2 * v[i] + (1.0 - BETA2) * gi * gi;
-    m[i] = mi;
-    v[i] = vi;
-    let m_hat = mi / p.bias1;
-    let v_hat = vi / p.bias2;
-    w[i] = w[i] - p.lr * (m_hat / (sqrt(v_hat) + EPS) + p.weight_decay * w[i]);
 }
