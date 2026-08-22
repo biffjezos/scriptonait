@@ -20,6 +20,72 @@ use crate::model::{self, AdamState, Gradients, ModelWeights};
 use crate::ops;
 use crate::rng::Rng;
 
+/// Everything about a training step that isn't the model's shape.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TrainConfig {
+    /// Peak learning rate, reached at the end of warmup.
+    pub lr: f32,
+    /// Steps spent ramping the learning rate from ~0 to `lr`.
+    ///
+    /// A transformer's first few hundred steps are the dangerous ones:
+    /// the attention softmax is near-uniform, gradients are large and
+    /// badly conditioned, and a full-size step there can put the model
+    /// somewhere it spends thousands of steps climbing back out of.
+    pub warmup_steps: u64,
+    /// Total steps the run is planned for, used to shape the cosine
+    /// decay. Training past it just holds the floor learning rate.
+    pub total_steps: u64,
+    /// Floor of the cosine decay, as a fraction of `lr`.
+    pub min_lr_ratio: f32,
+    /// Decoupled weight decay (AdamW).
+    pub weight_decay: f32,
+    /// Global gradient-norm clip; see `model::clip_global_norm`.
+    pub grad_clip: f32,
+}
+
+impl Default for TrainConfig {
+    fn default() -> Self {
+        Self {
+            lr: 3e-4,
+            warmup_steps: 200,
+            total_steps: 10_000,
+            min_lr_ratio: 0.1,
+            weight_decay: 0.1,
+            grad_clip: 1.0,
+        }
+    }
+}
+
+impl TrainConfig {
+    /// Learning rate for `step` (0-based): linear warmup, then cosine
+    /// decay to `min_lr_ratio * lr`.
+    pub fn lr_at(&self, step: u64) -> f32 {
+        if self.warmup_steps > 0 && step < self.warmup_steps {
+            // +1 so step 0 isn't a literal zero-size step.
+            return self.lr * (step + 1) as f32 / self.warmup_steps as f32;
+        }
+        let decay_steps = self.total_steps.saturating_sub(self.warmup_steps).max(1);
+        let progress = ((step - self.warmup_steps) as f32 / decay_steps as f32).clamp(0.0, 1.0);
+        let cosine = 0.5 * (1.0 + (std::f32::consts::PI * progress).cos());
+        self.lr * (self.min_lr_ratio + (1.0 - self.min_lr_ratio) * cosine)
+    }
+}
+
+/// What one training step did, beyond its loss.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct StepReport {
+    pub loss: f32,
+    /// Learning rate this step actually used.
+    pub lr: f32,
+    /// Gradient norm *before* clipping. A run where this is pinned at
+    /// the clip threshold every step is a run whose learning rate is too
+    /// high.
+    pub grad_norm: f32,
+    /// Tokens the step consumed (batch size x context length), for
+    /// throughput reporting.
+    pub tokens: usize,
+}
+
 pub struct Trainer {
     pub weights: ModelWeights,
     pub config: ModelConfig,
@@ -78,12 +144,31 @@ impl Trainer {
     /// mean loss, or `None` if the corpus doesn't have enough tokens yet
     /// to fill even one `context_len` window (e.g. no sources added yet).
     pub fn train_step(&mut self, corpus: &mut Corpus, batch_size: usize, lr: f32) -> Option<f32> {
+        let train = TrainConfig { lr, warmup_steps: 0, ..TrainConfig::default() };
+        self.train_step_with(corpus, batch_size, &train).map(|r| r.loss)
+    }
+
+    /// A full step under an explicit `TrainConfig`: schedule the learning
+    /// rate, accumulate the batch's gradients, clip, then AdamW.
+    pub fn train_step_with(
+        &mut self,
+        corpus: &mut Corpus,
+        batch_size: usize,
+        train: &TrainConfig,
+    ) -> Option<StepReport> {
         let batch = corpus.sample_batch(batch_size, self.config.context_len, &mut self.rng)?;
         let total_loss = self.accumulate_gradients(&batch);
         self.grad_accum.scale_(1.0 / batch.batch_size as f32);
-        self.adam.step(&mut self.weights, &self.grad_accum, lr);
+        let grad_norm = model::clip_global_norm(&mut self.grad_accum, train.grad_clip);
+        let lr = train.lr_at(self.step);
+        self.adam.step(&mut self.weights, &self.grad_accum, lr, train.weight_decay);
         self.step += 1;
-        Some(total_loss / batch.batch_size as f32)
+        Some(StepReport {
+            loss: total_loss / batch.batch_size as f32,
+            lr,
+            grad_norm,
+            tokens: batch.batch_size * batch.context_len,
+        })
     }
 
     /// Forward + backward over every sequence in `batch`, leaving the
@@ -175,7 +260,7 @@ mod tests {
     use super::*;
 
     fn tiny_config() -> ModelConfig {
-        ModelConfig { num_layers: 2, hidden_dim: 8, num_heads: 2, context_len: 8, local_window: 8, ..Default::default() }
+        ModelConfig { num_layers: 2, hidden_dim: 8, num_heads: 2, num_kv_heads: 1, context_len: 8, local_window: 8, ..Default::default() }
     }
 
     #[test]
@@ -238,6 +323,30 @@ mod tests {
         let (a, b) = (as_floats(&single_weights), as_floats(&multi_weights));
         let worst = a.iter().zip(&b).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
         assert!(worst < 1e-5, "threaded step moved the weights somewhere else: worst diff {worst}");
+    }
+
+    #[test]
+    fn learning_rate_warms_up_then_decays() {
+        let t = TrainConfig { lr: 1.0, warmup_steps: 100, total_steps: 1000, min_lr_ratio: 0.1, ..Default::default() };
+        assert!(t.lr_at(0) > 0.0 && t.lr_at(0) < 0.02, "warmup should start near zero");
+        assert!((t.lr_at(99) - 1.0).abs() < 1e-6, "warmup should end at the peak");
+        assert!(t.lr_at(500) < 1.0 && t.lr_at(500) > 0.1, "mid-run should be decaying");
+        assert!((t.lr_at(1000) - 0.1).abs() < 1e-6, "decay should land on the floor");
+        assert!((t.lr_at(5000) - 0.1).abs() < 1e-6, "past the plan it holds the floor");
+    }
+
+    #[test]
+    fn gradient_clipping_reports_and_bounds_the_norm() {
+        let config = tiny_config();
+        let mut trainer = Trainer::new(config, 5);
+        let mut corpus = Corpus::new();
+        corpus.upsert("a", &"the quick brown fox. ".repeat(40), false);
+        let train = TrainConfig { grad_clip: 1e-6, warmup_steps: 0, ..Default::default() };
+        let report = trainer.train_step_with(&mut corpus, 2, &train).unwrap();
+        // The reported norm is the pre-clip one, so a tiny threshold
+        // must not change it.
+        assert!(report.grad_norm > 1e-6, "expected a real gradient norm, got {}", report.grad_norm);
+        assert_eq!(report.tokens, 2 * config.context_len);
     }
 
     #[test]

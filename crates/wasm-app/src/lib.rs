@@ -92,6 +92,10 @@ impl WasmLLM {
             num_heads: num_heads as usize,
             context_len: context_len as usize,
             local_window: local_window as usize,
+            // Multi-head attention and no per-layer embeddings until
+            // step 8 rebuilds this constructor around the shipped
+            // checkpoint, which carries its own shape.
+            num_kv_heads: num_heads as usize,
             // Byte level for now; step 8 replaces this constructor with
             // one that loads the shipped tokenizer and takes its vocab.
             vocab_size: llm_core::tokenizer::BASE_VOCAB_SIZE,

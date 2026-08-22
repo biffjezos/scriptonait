@@ -39,13 +39,15 @@ pub struct ModelWeights {
 pub type Gradients = ModelWeights;
 
 impl LayerWeights {
-    fn zeros(hidden: usize, ffn: usize, vocab: usize) -> Self {
+    fn zeros(config: &ModelConfig) -> Self {
+        let (hidden, ffn, kv) = (config.hidden_dim, config.ffn_dim(), config.kv_dim());
+        let ple_len = if config.use_ple { config.vocab_size() * hidden } else { 0 };
         Self {
-            ple: vec![0.0; vocab * hidden],
+            ple: vec![0.0; ple_len],
             attn_norm_gain: vec![0.0; hidden],
             wq: vec![0.0; hidden * hidden],
-            wk: vec![0.0; hidden * hidden],
-            wv: vec![0.0; hidden * hidden],
+            wk: vec![0.0; kv * hidden],
+            wv: vec![0.0; kv * hidden],
             wo: vec![0.0; hidden * hidden],
             mlp_norm_gain: vec![0.0; hidden],
             w_gate: vec![0.0; ffn * hidden],
@@ -54,22 +56,35 @@ impl LayerWeights {
         }
     }
 
-    fn init(hidden: usize, ffn: usize, vocab: usize, rng: &mut Rng) -> Self {
+    fn init(config: &ModelConfig, num_layers: usize, rng: &mut Rng) -> Self {
+        let (hidden, ffn, kv) = (config.hidden_dim, config.ffn_dim(), config.kv_dim());
         let linear = |out_dim: usize, in_dim: usize, rng: &mut Rng| -> Vec<f32> {
             let std = 1.0 / (in_dim as f32).sqrt();
             (0..out_dim * in_dim).map(|_| rng.next_gaussian() * std).collect()
         };
+        // The two projections that write *into* the residual stream get
+        // their initial scale divided by sqrt(2 * num_layers). Every
+        // layer adds into the same stream, so without this the stream's
+        // variance grows with depth and the first few hundred steps are
+        // spent undoing that instead of learning (GPT-2's initialization,
+        // and the reason deep stacks train stably from step one).
+        let residual_scale = 1.0 / (2.0 * num_layers as f32).sqrt();
+        let scaled = |out_dim: usize, in_dim: usize, rng: &mut Rng| -> Vec<f32> {
+            let std = residual_scale / (in_dim as f32).sqrt();
+            (0..out_dim * in_dim).map(|_| rng.next_gaussian() * std).collect()
+        };
+        let ple_len = if config.use_ple { config.vocab_size() * hidden } else { 0 };
         Self {
-            ple: (0..vocab * hidden).map(|_| rng.next_gaussian() * 0.02).collect(),
+            ple: (0..ple_len).map(|_| rng.next_gaussian() * 0.02).collect(),
             attn_norm_gain: vec![1.0; hidden],
             wq: linear(hidden, hidden, rng),
-            wk: linear(hidden, hidden, rng),
-            wv: linear(hidden, hidden, rng),
-            wo: linear(hidden, hidden, rng),
+            wk: linear(kv, hidden, rng),
+            wv: linear(kv, hidden, rng),
+            wo: scaled(hidden, hidden, rng),
             mlp_norm_gain: vec![1.0; hidden],
             w_gate: linear(ffn, hidden, rng),
             w_up: linear(ffn, hidden, rng),
-            w_down: linear(hidden, ffn, rng),
+            w_down: scaled(hidden, ffn, rng),
         }
     }
 
@@ -110,11 +125,10 @@ impl LayerWeights {
 impl ModelWeights {
     pub fn zeros(config: &ModelConfig) -> Self {
         let h = config.hidden_dim;
-        let f = config.ffn_dim();
         let v = config.vocab_size();
         Self {
             embed: vec![0.0; v * h],
-            layers: (0..config.num_layers).map(|_| LayerWeights::zeros(h, f, v)).collect(),
+            layers: (0..config.num_layers).map(|_| LayerWeights::zeros(config)).collect(),
             final_norm_gain: vec![0.0; h],
         }
     }
@@ -122,11 +136,11 @@ impl ModelWeights {
     pub fn init(config: &ModelConfig, seed: u64) -> Self {
         let mut rng = Rng::seed_from_u64(seed);
         let h = config.hidden_dim;
-        let f = config.ffn_dim();
         let v = config.vocab_size();
+        let n = config.num_layers;
         Self {
             embed: (0..v * h).map(|_| rng.next_gaussian() * 0.02).collect(),
-            layers: (0..config.num_layers).map(|_| LayerWeights::init(h, f, v, &mut rng)).collect(),
+            layers: (0..n).map(|_| LayerWeights::init(config, n, &mut rng)).collect(),
             final_norm_gain: vec![1.0; h],
         }
     }
@@ -151,6 +165,21 @@ impl ModelWeights {
         }
         out.push(&self.final_norm_gain);
         out
+    }
+
+    /// Whether weight decay applies to each tensor, in the same fixed
+    /// order `tensors()` uses. The three RMSNorm gains per model
+    /// (attention, MLP, final) are excluded; everything else is a matrix
+    /// or an embedding table and gets decayed.
+    fn decay_flags(&self) -> Vec<bool> {
+        let mut flags = vec![true]; // embed
+        for _ in &self.layers {
+            // ple, attn_norm_gain, wq, wk, wv, wo, mlp_norm_gain,
+            // w_gate, w_up, w_down
+            flags.extend_from_slice(&[true, false, true, true, true, true, false, true, true, true]);
+        }
+        flags.push(false); // final_norm_gain
+        flags
     }
 
     /// Reset every parameter/gradient buffer to zero in place (reused each
@@ -212,21 +241,61 @@ impl ModelWeights {
     }
 }
 
-/// Adam optimizer state, shaped like the model.
+/// Rescale `grads` in place so its global L2 norm is at most
+/// `max_norm`, and return the norm it had before clipping.
+///
+/// One bad batch — an unusual run of tokens, a rare character — can
+/// produce a gradient orders of magnitude larger than typical, and Adam
+/// happily takes a full-size step along it, which is what a loss curve
+/// that suddenly jumps and never recovers actually is. Clipping the
+/// whole gradient as one vector (rather than per tensor) keeps its
+/// direction and only limits how far the step goes.
+pub fn clip_global_norm(grads: &mut Gradients, max_norm: f32) -> f32 {
+    let mut sum_sq = 0.0f64;
+    for t in grads.tensors() {
+        for &g in t.iter() {
+            sum_sq += (g as f64) * (g as f64);
+        }
+    }
+    let norm = sum_sq.sqrt() as f32;
+    if norm > max_norm && norm.is_finite() && norm > 0.0 {
+        let scale = max_norm / norm;
+        grads.scale_(scale);
+    }
+    norm
+}
+
+/// AdamW optimizer state, shaped like the model.
 pub struct AdamState {
     m: ModelWeights,
     v: ModelWeights,
     t: i32,
+    /// Which tensors weight decay applies to, in `tensors()` order.
+    decay: Vec<bool>,
 }
 
 impl AdamState {
     pub fn new(config: &ModelConfig) -> Self {
-        Self { m: ModelWeights::zeros(config), v: ModelWeights::zeros(config), t: 0 }
+        let template = ModelWeights::zeros(config);
+        let decay = template.decay_flags();
+        Self { m: ModelWeights::zeros(config), v: ModelWeights::zeros(config), t: 0, decay }
     }
 
-    pub fn step(&mut self, weights: &mut ModelWeights, grads: &Gradients, lr: f32) {
+    /// One AdamW step.
+    ///
+    /// Decoupled weight decay, not L2 added to the gradient: with Adam
+    /// the two are not the same thing, because an L2 term goes through
+    /// the same per-parameter normalization as the gradient and so decays
+    /// rarely-updated parameters far less than often-updated ones.
+    /// Decoupling it (`w -= lr * wd * w`, applied directly) is what
+    /// "AdamW" means, and it's the version that actually regularizes.
+    ///
+    /// Decay is skipped for the RMSNorm gains: they're scale parameters
+    /// initialized at 1, and pulling them toward 0 shrinks the whole
+    /// residual stream for no benefit.
+    pub fn step(&mut self, weights: &mut ModelWeights, grads: &Gradients, lr: f32, weight_decay: f32) {
         self.t += 1;
-        let (beta1, beta2, eps) = (0.9f32, 0.999f32, 1e-8f32);
+        let (beta1, beta2, eps) = (0.9f32, 0.95f32, 1e-8f32);
         let bias1 = 1.0 - beta1.powi(self.t);
         let bias2 = 1.0 - beta2.powi(self.t);
 
@@ -235,13 +304,16 @@ impl AdamState {
         let m_tensors = self.m.tensors_mut().into_iter();
         let v_tensors = self.v.tensors_mut().into_iter();
 
-        for (((w, g), m), v) in w_tensors.zip(g_tensors).zip(m_tensors).zip(v_tensors) {
+        for (idx, (((w, g), m), v)) in
+            w_tensors.zip(g_tensors).zip(m_tensors).zip(v_tensors).enumerate()
+        {
+            let wd = if self.decay.get(idx).copied().unwrap_or(true) { weight_decay } else { 0.0 };
             for i in 0..w.len() {
                 m[i] = beta1 * m[i] + (1.0 - beta1) * g[i];
                 v[i] = beta2 * v[i] + (1.0 - beta2) * g[i] * g[i];
                 let m_hat = m[i] / bias1;
                 let v_hat = v[i] / bias2;
-                w[i] -= lr * m_hat / (v_hat.sqrt() + eps);
+                w[i] -= lr * (m_hat / (v_hat.sqrt() + eps) + wd * w[i]);
             }
         }
     }
@@ -296,6 +368,8 @@ pub fn forward(weights: &ModelWeights, config: &ModelConfig, tokens: &[u32]) -> 
     let t_len = tokens.len();
     let h = config.hidden_dim;
     let heads = config.num_heads;
+    let kv_heads = config.num_kv_heads;
+    let kv = config.kv_dim();
     let head_dim = config.head_dim();
     let window = config.effective_window();
     let vocab = config.vocab_size();
@@ -304,19 +378,22 @@ pub fn forward(weights: &ModelWeights, config: &ModelConfig, tokens: &[u32]) -> 
     let mut layer_caches = Vec::with_capacity(weights.layers.len());
 
     for layer in &weights.layers {
-        let ple = gather_rows(&layer.ple, tokens, h);
-        for i in 0..hidden.len() {
-            hidden[i] += ple[i];
+        if config.use_ple {
+            let ple = gather_rows(&layer.ple, tokens, h);
+            for i in 0..hidden.len() {
+                hidden[i] += ple[i];
+            }
         }
         let h_after_ple = hidden.clone();
 
         let (normed1, inv_rms1) = ops::rmsnorm_fwd(&hidden, &layer.attn_norm_gain, t_len, h, RMS_EPS);
         let mut q = ops::linear_fwd(&normed1, &layer.wq, t_len, h, h);
-        let mut k = ops::linear_fwd(&normed1, &layer.wk, t_len, h, h);
-        let v = ops::linear_fwd(&normed1, &layer.wv, t_len, h, h);
-        ops::rope_apply(&mut q, t_len, heads, head_dim, false);
-        ops::rope_apply(&mut k, t_len, heads, head_dim, false);
-        let (concat, probs) = ops::attention_fwd(&q, &k, &v, t_len, heads, head_dim, window);
+        let mut k = ops::linear_fwd(&normed1, &layer.wk, t_len, h, kv);
+        let v = ops::linear_fwd(&normed1, &layer.wv, t_len, h, kv);
+        ops::rope_apply(&mut q, t_len, heads, head_dim, config.rope_theta, false);
+        ops::rope_apply(&mut k, t_len, kv_heads, head_dim, config.rope_theta, false);
+        let (concat, probs) =
+            ops::attention_fwd(&q, &k, &v, t_len, heads, kv_heads, head_dim, window);
         let attn_out = ops::linear_fwd(&concat, &layer.wo, t_len, h, h);
 
         for i in 0..hidden.len() {
@@ -363,6 +440,160 @@ pub fn forward(weights: &ModelWeights, config: &ModelConfig, tokens: &[u32]) -> 
     )
 }
 
+/// Key/value cache for one layer: every key and value still inside the
+/// attention window, oldest first, RoPE already applied.
+#[derive(Clone)]
+struct LayerKv {
+    k: Vec<f32>, // [cached_len, kv_dim]
+    v: Vec<f32>, // [cached_len, kv_dim]
+}
+
+/// Incremental decoding state.
+///
+/// Without this, generating token *n* re-runs the forward pass over all
+/// *n* previous tokens: producing a 900-token story from a 512-token
+/// context costs on the order of 460,000 token-forwards. With it, the
+/// prompt is processed once and each new token costs one row of work
+/// plus attention over the window — about 1,400 token-forwards for the
+/// same story. That factor is why generation stopped being the part you
+/// wait on.
+pub struct GenCache {
+    layers: Vec<LayerKv>,
+    /// Absolute position of the next token to be generated, which is
+    /// also the number of tokens currently cached.
+    pos: usize,
+    /// Every token fed in so far, kept so the cache can be rebuilt when
+    /// `pos` reaches `context_len` (see `Generator` in `generate.rs`).
+    tokens: Vec<u32>,
+}
+
+impl GenCache {
+    pub fn position(&self) -> usize {
+        self.pos
+    }
+
+    pub fn tokens(&self) -> &[u32] {
+        &self.tokens
+    }
+
+    /// Drop everything older than the attention window. Positions of the
+    /// surviving entries don't change, so their RoPE rotations stay
+    /// valid — this only discards keys attention could no longer reach.
+    fn trim_to_window(&mut self, window: usize, kv_dim: usize) {
+        let cached = self.pos.min(self.cached_len(kv_dim));
+        if cached <= window {
+            return;
+        }
+        let drop = cached - window;
+        for layer in &mut self.layers {
+            layer.k.drain(..drop * kv_dim);
+            layer.v.drain(..drop * kv_dim);
+        }
+    }
+
+    fn cached_len(&self, kv_dim: usize) -> usize {
+        self.layers.first().map(|l| l.k.len() / kv_dim).unwrap_or(0)
+    }
+}
+
+/// Run the prompt through the model and build the decoding cache from it.
+/// Returns the logits for the *last* prompt token — the distribution the
+/// first generated token is sampled from.
+///
+/// `tokens.len()` must be at least 1 and at most `config.context_len`.
+pub fn prefill(weights: &ModelWeights, config: &ModelConfig, tokens: &[u32]) -> (Vec<f32>, GenCache) {
+    let vocab = config.vocab_size();
+    let (logits, cache) = forward(weights, config, tokens);
+    let last = logits[(tokens.len() - 1) * vocab..tokens.len() * vocab].to_vec();
+    // `forward` already computed and cached every key and value; moving
+    // them into the decoding cache is what makes prefill cost one
+    // forward pass rather than two.
+    let layers = cache.layers.iter().map(|lc| LayerKv { k: lc.k.clone(), v: lc.v.clone() }).collect();
+    let mut gen = GenCache { layers, pos: tokens.len(), tokens: tokens.to_vec() };
+    gen.trim_to_window(config.effective_window(), config.kv_dim());
+    (last, gen)
+}
+
+/// Advance the cache by one token and return that token's logits.
+///
+/// This is the whole decode step: one row through every layer, attending
+/// against the cached keys and values. No activation cache is built —
+/// nothing backpropagates through generation.
+pub fn decode_step(
+    weights: &ModelWeights,
+    config: &ModelConfig,
+    cache: &mut GenCache,
+    token: u32,
+) -> Vec<f32> {
+    let h = config.hidden_dim;
+    let kv_dim = config.kv_dim();
+    let heads = config.num_heads;
+    let kv_heads = config.num_kv_heads;
+    let head_dim = config.head_dim();
+    let window = config.effective_window();
+    let pos = cache.pos;
+
+    let mut hidden = gather_rows(&weights.embed, &[token], h);
+
+    for (layer_idx, layer) in weights.layers.iter().enumerate() {
+        if config.use_ple {
+            let ple = gather_rows(&layer.ple, &[token], h);
+            for i in 0..h {
+                hidden[i] += ple[i];
+            }
+        }
+
+        let (normed1, _) = ops::rmsnorm_fwd(&hidden, &layer.attn_norm_gain, 1, h, RMS_EPS);
+        let mut q = ops::linear_fwd(&normed1, &layer.wq, 1, h, h);
+        let mut k = ops::linear_fwd(&normed1, &layer.wk, 1, h, kv_dim);
+        let v = ops::linear_fwd(&normed1, &layer.wv, 1, h, kv_dim);
+        // RoPE at this token's absolute position, once, before caching:
+        // a cached key keeps the rotation of the position it was written
+        // at, which is exactly what the whole-sequence forward pass would
+        // have given it.
+        ops::rope_apply_at(&mut q, 1, heads, head_dim, config.rope_theta, pos, false);
+        ops::rope_apply_at(&mut k, 1, kv_heads, head_dim, config.rope_theta, pos, false);
+
+        let lk = &mut cache.layers[layer_idx];
+        lk.k.extend_from_slice(&k);
+        lk.v.extend_from_slice(&v);
+        // Trim *before* attending, not after: the whole-sequence
+        // forward pass lets query position t see exactly the `window`
+        // keys ending at t, so a decode step that attended over
+        // window + 1 keys would be computing a slightly different model
+        // than the one training trained.
+        let mut cached_len = lk.k.len() / kv_dim;
+        if cached_len > window {
+            let drop = cached_len - window;
+            lk.k.drain(..drop * kv_dim);
+            lk.v.drain(..drop * kv_dim);
+            cached_len = window;
+        }
+        let concat =
+            ops::attention_step(&q, &lk.k, &lk.v, cached_len, heads, kv_heads, head_dim);
+        let attn_out = ops::linear_fwd(&concat, &layer.wo, 1, h, h);
+        for i in 0..h {
+            hidden[i] += attn_out[i];
+        }
+
+        let (normed2, _) = ops::rmsnorm_fwd(&hidden, &layer.mlp_norm_gain, 1, h, RMS_EPS);
+        let gate = ops::linear_fwd(&normed2, &layer.w_gate, 1, h, config.ffn_dim());
+        let up = ops::linear_fwd(&normed2, &layer.w_up, 1, h, config.ffn_dim());
+        let act = ops::swiglu_fwd(&gate, &up);
+        let mlp_out = ops::linear_fwd(&act, &layer.w_down, 1, config.ffn_dim(), h);
+        for i in 0..h {
+            hidden[i] += mlp_out[i];
+        }
+    }
+
+    let (final_normed, _) = ops::rmsnorm_fwd(&hidden, &weights.final_norm_gain, 1, h, RMS_EPS);
+    let logits = ops::linear_fwd(&final_normed, &weights.embed, 1, h, config.vocab_size());
+
+    cache.pos += 1;
+    cache.tokens.push(token);
+    logits
+}
+
 /// Backward pass given the upstream gradient wrt the logits (from
 /// `ops::cross_entropy`, already mean-reduced over `T`), allocating a
 /// fresh gradient buffer. Prefer `backward_into` in a training loop.
@@ -392,6 +623,8 @@ pub fn backward_into(
     let t_len = cache.tokens.len();
     let h = config.hidden_dim;
     let heads = config.num_heads;
+    let kv_heads = config.num_kv_heads;
+    let kv = config.kv_dim();
     let head_dim = config.head_dim();
     let window = config.effective_window();
     let vocab = config.vocab_size();
@@ -451,14 +684,15 @@ pub fn backward_into(
         let (d_concat, d_wo) = ops::linear_bwd(&d_attn_out, &lc.concat, &layer.wo, t_len, h, h);
         lg.wo.iter_mut().zip(&d_wo).for_each(|(g, d)| *g += d);
 
-        let (mut d_q, mut d_k, d_v) =
-            ops::attention_bwd(&d_concat, &lc.q, &lc.k, &lc.v, &lc.probs, t_len, heads, head_dim, window);
-        ops::rope_apply(&mut d_q, t_len, heads, head_dim, true);
-        ops::rope_apply(&mut d_k, t_len, heads, head_dim, true);
+        let (mut d_q, mut d_k, d_v) = ops::attention_bwd(
+            &d_concat, &lc.q, &lc.k, &lc.v, &lc.probs, t_len, heads, kv_heads, head_dim, window,
+        );
+        ops::rope_apply(&mut d_q, t_len, heads, head_dim, config.rope_theta, true);
+        ops::rope_apply(&mut d_k, t_len, kv_heads, head_dim, config.rope_theta, true);
 
         let (d_normed1_q, d_wq) = ops::linear_bwd(&d_q, &lc.normed1, &layer.wq, t_len, h, h);
-        let (d_normed1_k, d_wk) = ops::linear_bwd(&d_k, &lc.normed1, &layer.wk, t_len, h, h);
-        let (d_normed1_v, d_wv) = ops::linear_bwd(&d_v, &lc.normed1, &layer.wv, t_len, h, h);
+        let (d_normed1_k, d_wk) = ops::linear_bwd(&d_k, &lc.normed1, &layer.wk, t_len, h, kv);
+        let (d_normed1_v, d_wv) = ops::linear_bwd(&d_v, &lc.normed1, &layer.wv, t_len, h, kv);
         lg.wq.iter_mut().zip(&d_wq).for_each(|(g, d)| *g += d);
         lg.wk.iter_mut().zip(&d_wk).for_each(|(g, d)| *g += d);
         lg.wv.iter_mut().zip(&d_wv).for_each(|(g, d)| *g += d);
@@ -478,7 +712,9 @@ pub fn backward_into(
 
         // PLE residual add: gradient passes through unchanged, and also
         // scatters into this layer's PLE table at the token positions.
-        scatter_add_rows(&mut lg.ple, &cache.tokens, &d_h_after_ple, h);
+        if config.use_ple {
+            scatter_add_rows(&mut lg.ple, &cache.tokens, &d_h_after_ple, h);
+        }
         d_hidden = d_h_after_ple;
     }
 
@@ -501,7 +737,21 @@ mod tests {
     use super::*;
 
     fn small_config() -> ModelConfig {
-        ModelConfig { num_layers: 2, hidden_dim: 8, num_heads: 2, context_len: 6, local_window: 6, ..Default::default() }
+        // num_kv_heads < num_heads deliberately: the gradient check below is
+        // the only thing that proves grouped-query attention's shared
+        // dk/dv accumulation is right.
+        // use_ple is on here (it's off by default) so the gradient check
+        // still covers the per-layer embedding scatter.
+        ModelConfig {
+            num_layers: 2,
+            hidden_dim: 8,
+            num_heads: 2,
+            num_kv_heads: 1,
+            context_len: 6,
+            local_window: 6,
+            use_ple: true,
+            ..Default::default()
+        }
     }
 
     fn total_loss(weights: &ModelWeights, config: &ModelConfig, tokens: &[u32], targets: &[u32]) -> f32 {
@@ -631,7 +881,7 @@ mod tests {
             let (logits, cache) = forward(&weights, &config, &tokens);
             let (_, d_logits) = ops::cross_entropy(&logits, &targets, tokens.len(), config.vocab_size());
             let grads = backward(&weights, &config, &cache, &d_logits);
-            adam.step(&mut weights, &grads, 0.05);
+            adam.step(&mut weights, &grads, 0.05, 0.0);
         }
         let loss_after = total_loss(&weights, &config, &tokens, &targets);
         assert!(loss_after < loss_before, "loss_before={loss_before} loss_after={loss_after}");

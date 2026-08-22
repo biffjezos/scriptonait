@@ -538,8 +538,19 @@ pub struct GpuModel {
 /// training's backward pass, not just the attention window) — see
 /// `shaders/attention.wgsl`. Callers should fall back to the CPU backend
 /// when this is `false` instead of trying to construct a `GpuModel`.
+///
+/// It also rejects the two architecture options this backend's kernels
+/// predate: grouped-query attention (its Wk/Wv are still `[hidden,
+/// hidden]`) and per-layer embeddings being *off* (its layer weights
+/// still assume a PLE table is present). Rejecting them here is what
+/// keeps a mismatch a clean fall back to the CPU backend instead of a
+/// GPU that computes a different model. The next step rewrites this
+/// crate as a GQA-aware, inference-only backend and these two go away.
 pub fn supports(config: &ModelConfig) -> bool {
-    config.effective_window() <= MAX_GPU_WINDOW && config.context_len <= MAX_GPU_WINDOW
+    config.effective_window() <= MAX_GPU_WINDOW
+        && config.context_len <= MAX_GPU_WINDOW
+        && config.num_kv_heads == config.num_heads
+        && config.use_ple
 }
 
 impl GpuModel {
