@@ -97,7 +97,7 @@ impl ParamSet {
         Self { slots }
     }
 
-    fn from_weights(ctx: &GpuContext, config: &ModelConfig, weights: &ModelWeights) -> Self {
+    fn from_weights(ctx: &GpuContext, weights: &ModelWeights) -> Self {
         let mut slots = Vec::new();
         let mut push = |label: &str, data: &[f32], decay: bool| {
             slots.push(TensorSlot {
@@ -195,8 +195,6 @@ pub struct GpuTrainer {
     scratch: Scratch,
     t_len: usize,
     step: i32,
-    /// Dispatches issued by the step currently being encoded.
-    dispatches: std::cell::Cell<u32>,
 }
 
 /// What one step did, mirroring `llm_core::train::StepReport`, plus what
@@ -288,7 +286,7 @@ impl GpuTrainer {
 
         Ok(Self {
             config: *config,
-            weights: ParamSet::from_weights(ctx, config, weights),
+            weights: ParamSet::from_weights(ctx, weights),
             grads: ParamSet::zeros(ctx, config, false),
             m: ParamSet::zeros(ctx, config, false),
             v: ParamSet::zeros(ctx, config, false),
@@ -296,7 +294,6 @@ impl GpuTrainer {
             scratch,
             t_len,
             step: 0,
-            dispatches: std::cell::Cell::new(0),
         })
     }
 

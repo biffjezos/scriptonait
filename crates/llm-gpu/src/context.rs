@@ -125,7 +125,7 @@ pub struct GpuContext {
     /// browser quietly capping one of them changes what the kernels can
     /// do.
     pub max_workgroups_per_dimension: u32,
-    pub max_storage_buffer_binding_size: u32,
+    pub max_storage_buffer_binding_size: u64,
     pub max_buffer_size: u64,
 }
 
@@ -283,7 +283,7 @@ impl GpuContext {
             backend: format!("{:?}", info.backend),
             device_type: format!("{:?}", info.device_type),
             max_workgroups_per_dimension: limits.max_compute_workgroups_per_dimension,
-            max_storage_buffer_binding_size: limits.max_storage_buffer_binding_size,
+            max_storage_buffer_binding_size: limits.max_storage_buffer_binding_size as u64,
             max_buffer_size: limits.max_buffer_size,
             device,
             queue,
