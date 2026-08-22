@@ -9,11 +9,7 @@
 <body>
   <header>
     <h1>Scriptonait</h1>
-    <p class="tagline">
-      Write a model on your own writing, then have it write for you.
-      Everything happens in this browser. Nothing is uploaded, and nothing
-      is downloaded.
-    </p>
+    <p class="tagline">Train a model on your writing. All local.</p>
 
     <div id="model-status" class="model-status absent">
       <span id="model-status-text">No model yet.</span>
@@ -29,13 +25,6 @@
   <main>
     <section class="panel" id="material-panel">
       <h2>1. Add your writing</h2>
-      <p class="hint">
-        Scripts, chapters, notes — plain text. This is what the model
-        learns from, so more is better: a few thousand words will teach it
-        very little, a few hundred thousand will teach it your formatting
-        and voice. It stays in this browser.
-      </p>
-
       <div class="input-group">
         <label for="file-input">Upload text files</label>
         <input type="file" id="file-input" multiple accept=".txt,.md,.markdown,.fountain,.text" />
@@ -56,11 +45,7 @@
           <input type="url" id="url-input" placeholder="https://example.com/script.html" />
           <button id="add-url-btn" type="button">Fetch</button>
         </div>
-        <p class="hint">
-          Only when you press Fetch, and only the address you type. Most
-          sites refuse cross-origin requests, so this often fails — when
-          it does, copy the text and paste it above.
-        </p>
+        <p class="hint">Most sites block this. Paste instead.</p>
       </div>
 
       <div id="sources-list" class="sources-list"></div>
@@ -107,13 +92,8 @@
             <input type="number" id="train-lr" value="0" min="0" max="0.01" step="0.00001" />
           </label>
         </div>
-        <p class="hint">
-          Leave the learning rate at 0 and it picks one: a large one when
-          starting from nothing, a small one when nudging a model that
-          already works. Press Train again to keep going from where it
-          stopped — progress isn't lost between runs.
-        </p>
-        <p class="hint">Shape of a new model. Only used when there isn't one yet:</p>
+        <p class="hint">0 = pick automatically.</p>
+        <p class="hint">New model shape:</p>
         <div class="settings-grid">
           <label>Layers <input type="number" id="cfg-layers" value="4" min="1" max="12" /></label>
           <label>Hidden size <input type="number" id="cfg-hidden" value="192" min="16" max="768" step="16" /></label>
@@ -181,11 +161,7 @@
             <input type="number" id="opt-seed" value="0" min="0" />
           </label>
         </div>
-        <p class="hint">
-          Temperature 0 is greedy and repeatable. Top-k and top-p cut the
-          long tail of unlikely words, which is what keeps a small model's
-          sentences from derailing.
-        </p>
+        <p class="hint">Temperature 0 = repeatable.</p>
       </details>
     </section>
 
@@ -195,20 +171,13 @@
       <div class="row">
         <button id="export-btn" type="button" class="secondary">Save this model to a file</button>
       </div>
-      <p class="hint">
-        A model file carries its own vocabulary, so it's the only thing
-        you need to keep. Open it again with "Open a model file" in
-        step 2, on any machine.
-      </p>
+      <p class="hint">One file. Reopen it in step 2.</p>
     </details>
   </main>
 
   <footer>
     <p id="error-banner" class="warning" hidden></p>
-    <p class="hint">
-      Everything runs locally, in this tab. Your writing is never sent
-      anywhere, and no model is ever fetched.
-    </p>
+    <p class="hint">Runs locally. Nothing uploaded or downloaded.</p>
   </footer>
 
   <script type="module" src="app.js"></script>

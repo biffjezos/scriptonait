@@ -45,7 +45,15 @@ function call(type, payload = {}, transfer = [], timeoutMs = DEFAULT_TIMEOUT_MS)
         reject(new Error(`the worker didn't answer "${type}" within ${Math.round(timeoutMs / 1000)}s`));
       }, timeoutMs);
     }
-    worker.postMessage({ id, type, ...payload }, transfer);
+    // The payload goes in its own field rather than being spread
+    // alongside the request id. It used to be `{ id, type, ...payload }`,
+    // and a payload carrying its own `id` — every upsert-source does —
+    // overwrote the request id with it. The worker then took that as the
+    // request id, so the source id vanished ("the source id was
+    // missing"), and the reply came back under an id no caller
+    // recognised, so that call never settled. One key collision, three
+    // symptoms.
+    worker.postMessage({ rid: id, type, payload }, transfer);
   });
 }
 
@@ -54,7 +62,7 @@ function onStream(type, handler) {
 }
 
 worker.onmessage = (event) => {
-  const { type, id } = event.data;
+  const { type, rid: id } = event.data;
   if (type === 'result') {
     const entry = pending.get(id);
     if (entry) {
@@ -221,38 +229,26 @@ function updateGuidance() {
     : 'Train a model on my writing';
 
   const explains = $('train-explains');
-  if (!model) {
-    explains.textContent =
-      'This makes a new model from scratch and teaches it your text. It runs here, ' +
-      'on your CPU, and it is slow: expect nonsense for the first while, and hours ' +
-      'before it reads like writing. You can stop and resume at any time.';
-  } else if (model.pretrained) {
-    explains.textContent =
-      'This nudges the model you loaded toward your text. Much faster than starting ' +
-      'from nothing, because it already knows English.';
-  } else {
-    explains.textContent =
-      'Carry on training the model you made. Progress is kept, so short runs add up.';
-  }
+  explains.textContent = !model
+    ? 'New model, from scratch. Slow — hours, not minutes.'
+    : model.pretrained
+      ? 'Nudges the loaded model toward your writing.'
+      : 'Continues where it stopped.';
 
   if (training) {
-    step.textContent = 'Training. You can stop it whenever you like — progress is kept.';
+    step.textContent = 'Training. Stop any time — progress is kept.';
   } else if (generating) {
-    step.textContent = 'Writing.';
+    step.textContent = 'Writing…';
   } else if (!model && sources.length === 0) {
-    step.textContent = 'Start at step 1: add some of your own writing for the model to learn from.';
+    step.textContent = 'Step 1: add your writing.';
   } else if (!model && !enoughText) {
-    step.textContent =
-      `You have ${formatCount(words)} characters. That's little to learn from — add more in ` +
-      'step 1, then press "Train a model on my writing".';
+    step.textContent = `Only ${formatCount(words)} characters. Add more, then train.`;
   } else if (!model) {
-    step.textContent = 'Next: press "Train a model on my writing" in step 2.';
+    step.textContent = 'Step 2: train.';
   } else if (model.step < 500) {
-    step.textContent =
-      'You have a model, but it has barely trained yet — it will write nonsense. ' +
-      'Keep training it in step 2, or try step 3 to see where it is.';
+    step.textContent = 'Barely trained. Keep training, or try step 3.';
   } else {
-    step.textContent = 'Ready. Type what you want in step 3 and press "Write it".';
+    step.textContent = 'Ready. Step 3: type a prompt.';
   }
 }
 
@@ -492,10 +488,7 @@ async function persist(what, action) {
     ]);
   } catch (error) {
     persistenceWorks = false;
-    showError(
-      `Couldn't save to this browser's storage (${error.message}). Your files are ` +
-        'loaded and usable, but they won\'t still be here after a reload.',
-    );
+    showError(`Storage unavailable (${error.message}). Files load but won't survive a reload.`);
     return null;
   }
 }
@@ -779,10 +772,7 @@ $('train-btn').addEventListener('click', async () => {
     }, [], 0);
 
     if (result.stopReason === 'no-data') {
-      showError(
-        'There isn\'t enough text yet to fill even one training window. Add more in step 1 — ' +
-          'a few pages at minimum.',
-      );
+      showError('Not enough text to train on. Add more in step 1.');
     } else {
       setProgress('train-progress-bar', 1);
       const loss = typeof result.loss === 'number' ? result.loss.toFixed(3) : '—';
@@ -875,6 +865,6 @@ $('import-input').addEventListener('change', async (event) => {
   // Nothing is fetched here. The page loads, shows what you already
   // have, and waits. No model is downloaded, ever.
   await refreshSources();
-  setModelStatus('absent', 'No model yet — make one in step 2, or open a model file you saved.');
+  setModelStatus('absent', 'No model yet.');
   updateGuidance();
 })();
