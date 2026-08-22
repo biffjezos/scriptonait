@@ -45,12 +45,12 @@ function newId() {
 
 // --- Sources -----------------------------------------------------------
 // A source: { id, title, kind: 'url'|'file'|'paste', rawText, sourceUrl,
-//             tags: { genre, tone }, createdAt, updatedAt }
+//             tags, createdAt, updatedAt }
 //
-// `tags` are plain metadata the frontend prepends as a short "[GENRE:
-// x] [TONE: y]" preamble when feeding this source's text to the model
-// (see app.js's buildTaggedText) — llm-core itself has no concept of
-// tags, they're just ordinary text from its point of view.
+// Genre/tone tagging is gone: the model now takes a real instruction
+// (form, length, subject, what to echo) parsed from the prompt itself,
+// which is what those tags were a crude stand-in for. `tags` stays in
+// the record shape so databases written by the old version still load.
 
 export async function addSource({ title, kind, rawText, sourceUrl = null, tags = {} }) {
   const store = await tx(SOURCES_STORE, 'readwrite');
@@ -85,29 +85,9 @@ export async function getSource(id) {
   return wrapRequest(store.get(id));
 }
 
-// --- Model checkpoints ---------------------------------------------------
-// A model: { id, name, config: {numLayers,hiddenDim,numHeads,contextLen,
-//            localWindow}, weightBytes: ArrayBuffer, step, createdAt }
-
-export async function saveModel({ name, config, weightBytes, step }) {
-  const store = await tx(MODELS_STORE, 'readwrite');
-  const record = { id: newId(), name, config, weightBytes, step, createdAt: Date.now() };
-  await wrapRequest(store.add(record));
-  return record;
-}
-
-export async function listModels() {
-  const store = await tx(MODELS_STORE, 'readonly');
-  const all = await wrapRequest(store.getAll());
-  return all.sort((a, b) => b.createdAt - a.createdAt);
-}
-
-export async function getModel(id) {
-  const store = await tx(MODELS_STORE, 'readonly');
-  return wrapRequest(store.get(id));
-}
-
-export async function deleteModel(id) {
-  const store = await tx(MODELS_STORE, 'readwrite');
-  await wrapRequest(store.delete(id));
-}
+// Model checkpoints are not stored here any more. A checkpoint carries
+// its own tokenizer and is a single file, so "Download this model" and
+// "Load a model file" cover saving and sharing without a second copy of
+// tens of MB living in IndexedDB where nobody can find it. The store is
+// still created by the upgrade handler above so an existing database
+// doesn't need a version bump.

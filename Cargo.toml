@@ -2,21 +2,26 @@
 resolver = "2"
 members = [
     "crates/llm-core",
+    "crates/llm-bench",
+    "crates/llm-data",
+    "crates/llm-train",
 ]
-# crates/llm-gpu and crates/wasm-app are deliberately NOT workspace members.
-# They pull in wgpu / wasm-bindgen (and need the wasm32 target), so they're
-# each their own standalone crate (see their own `[workspace]` marker) —
-# that keeps `cargo test` here fully offline-buildable against llm-core
-# alone, uncoupled from dependencies that need registry/network access.
+# crates/wasm-app is deliberately NOT a workspace member. It pulls in
+# wasm-bindgen and needs the wasm32 target, so it's its own standalone
+# crate (see its own `[workspace]` marker) — which keeps `cargo test`
+# here fully offline-buildable, uncoupled from dependencies that need
+# registry access. The Pages workflow is its only compiler.
 
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
 
+# Native release builds (llm-core's tests, llm-bench, the llm-train CLI
+# that does the actual pretraining). Speed, not size: nothing built from
+# this workspace is shipped to a browser. `crates/wasm-app` is its own
+# workspace and carries its own profile for the wasm bundle.
 [profile.release]
-opt-level = "z"
-lto = true
+opt-level = 3
+lto = "thin"
 codegen-units = 1
-panic = "abort"
-strip = true

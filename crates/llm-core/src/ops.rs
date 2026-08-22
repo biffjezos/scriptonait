@@ -103,15 +103,74 @@ fn axpy(dst: &mut [f32], src: &[f32], scale: f32) {
     }
 }
 
+/// How many rows (or output channels) the blocked kernels below process
+/// against one shared operand at a time.
+///
+/// The matmuls in this file are all "contract along the last axis" —
+/// every output element is a dot product of one `x` row with one `w`
+/// row — so the naive loop order reads the *entire* weight matrix once
+/// per token. For the tied output head that matrix is `vocab * hidden`
+/// floats; at an 8k BPE vocab that's tens of MB streamed from RAM per
+/// token, and the arithmetic sits waiting on memory the whole time.
+///
+/// Processing `BLOCK` rows against each weight row before moving on cuts
+/// that traffic by a factor of `BLOCK` — the weight row is loaded once
+/// and used four times, and the four `x` rows it's used against stay in
+/// L1. Four is deliberate: the kernels hold `BLOCK * 4` float lanes of
+/// accumulator, which is 16 vector registers — the whole SSE2 register
+/// file, and half of AVX's. Eight spills.
+const BLOCK: usize = 4;
+
+/// Dot one weight row against up to `BLOCK` consecutive rows of `x`,
+/// reading the weight row once for all of them.
+///
+/// The body is `BLOCK` plain `dot` calls, not one hand-fused kernel over
+/// five interleaved iterators: the fused version looks like it should be
+/// faster and measures three times *slower*, because interleaving that
+/// many `chunks_exact` iterators is a shape LLVM gives up vectorizing.
+/// The win here is loop order, not the inner kernel — `w_row` is loaded
+/// from L1 for all `n` rows instead of from RAM for one.
+#[inline]
+fn dot_block(x_block: &[f32], in_dim: usize, n: usize, w_row: &[f32]) -> [f32; BLOCK] {
+    debug_assert!(n <= BLOCK);
+    debug_assert_eq!(w_row.len(), in_dim);
+    let mut out = [0.0f32; BLOCK];
+    for r in 0..n {
+        out[r] = dot(&x_block[r * in_dim..(r + 1) * in_dim], w_row);
+    }
+    out
+}
+
+/// `dst_row_j += scales[j] * src` for up to `BLOCK` consecutive rows of
+/// `dst`, reading `src` once for all of them. The mirror image of
+/// `dot_block`, and the reason both backward passes stream their large
+/// operand a quarter as many times as the naive loop would.
+#[inline]
+fn axpy_block(dst_block: &mut [f32], dim: usize, n: usize, scales: &[f32; BLOCK], src: &[f32]) {
+    debug_assert!(n <= BLOCK);
+    debug_assert_eq!(src.len(), dim);
+    for j in 0..n {
+        if scales[j] == 0.0 {
+            continue;
+        }
+        axpy(&mut dst_block[j * dim..(j + 1) * dim], src, scales[j]);
+    }
+}
+
 /// `y[rows,out_dim] = x[rows,in_dim] @ w[out_dim,in_dim]^T`, no bias.
 pub fn linear_fwd(x: &[f32], w: &[f32], rows: usize, in_dim: usize, out_dim: usize) -> Vec<f32> {
     let mut y = vec![0.0f32; rows * out_dim];
-    for r in 0..rows {
-        let x_row = &x[r * in_dim..(r + 1) * in_dim];
-        let y_row = &mut y[r * out_dim..(r + 1) * out_dim];
-        for (o, y_o) in y_row.iter_mut().enumerate() {
-            *y_o = dot(x_row, &w[o * in_dim..(o + 1) * in_dim]);
+    let mut r0 = 0;
+    while r0 < rows {
+        let n = BLOCK.min(rows - r0);
+        let x_block = &x[r0 * in_dim..(r0 + n) * in_dim];
+        for o in 0..out_dim {
+            let vals = dot_block(x_block, in_dim, n, &w[o * in_dim..(o + 1) * in_dim]);
+            for (r, v) in vals.iter().take(n).enumerate() {
+                y[(r0 + r) * out_dim + o] = *v;
+            }
         }
+        r0 += BLOCK;
     }
     y
 }
@@ -123,7 +182,9 @@ pub fn linear_fwd(x: &[f32], w: &[f32], rows: usize, in_dim: usize, out_dim: usi
 /// (`out_dim * in_dim` floats, far past L1 for real layer sizes) for every
 /// single token, which is what made this the most expensive op in the
 /// backward pass; keeping the two passes apart lets each one stream over
-/// memory it can actually keep hot.
+/// memory it can actually keep hot. Both passes are then blocked by
+/// `BLOCK` (see `dot_block`), so the operand that doesn't fit in cache is
+/// streamed a quarter as many times.
 pub fn linear_bwd(
     dy: &[f32],
     x: &[f32],
@@ -135,39 +196,76 @@ pub fn linear_bwd(
     let mut dx = vec![0.0f32; rows * in_dim];
     let mut dw = vec![0.0f32; out_dim * in_dim];
 
-    // dx[r] = sum_o dy[r,o] * w[o]
-    for r in 0..rows {
-        let dy_row = &dy[r * out_dim..(r + 1) * out_dim];
-        let dx_row = &mut dx[r * in_dim..(r + 1) * in_dim];
-        for (o, &dyo) in dy_row.iter().enumerate() {
-            if dyo == 0.0 {
+    // dx[r] = sum_o dy[r,o] * w[o]   -- w[o] read once per block of rows.
+    let mut r0 = 0;
+    while r0 < rows {
+        let n = BLOCK.min(rows - r0);
+        let dx_block = &mut dx[r0 * in_dim..(r0 + n) * in_dim];
+        for o in 0..out_dim {
+            let mut scales = [0.0f32; BLOCK];
+            let mut any = false;
+            for (r, s) in scales.iter_mut().take(n).enumerate() {
+                *s = dy[(r0 + r) * out_dim + o];
+                any |= *s != 0.0;
+            }
+            if !any {
                 continue;
             }
-            axpy(dx_row, &w[o * in_dim..(o + 1) * in_dim], dyo);
+            axpy_block(dx_block, in_dim, n, &scales, &w[o * in_dim..(o + 1) * in_dim]);
         }
+        r0 += BLOCK;
     }
 
-    // dw[o] = sum_r dy[r,o] * x[r]
-    for o in 0..out_dim {
-        let dw_row = &mut dw[o * in_dim..(o + 1) * in_dim];
+    // dw[o] = sum_r dy[r,o] * x[r]   -- x[r] read once per block of
+    // output channels, and the block of dw rows being accumulated into
+    // (BLOCK * in_dim floats) stays in L1 across the whole row loop.
+    let mut o0 = 0;
+    while o0 < out_dim {
+        let n = BLOCK.min(out_dim - o0);
+        let dw_block = &mut dw[o0 * in_dim..(o0 + n) * in_dim];
         for r in 0..rows {
-            let dyo = dy[r * out_dim + o];
-            if dyo == 0.0 {
+            let mut scales = [0.0f32; BLOCK];
+            let mut any = false;
+            for (j, s) in scales.iter_mut().take(n).enumerate() {
+                *s = dy[r * out_dim + o0 + j];
+                any |= *s != 0.0;
+            }
+            if !any {
                 continue;
             }
-            axpy(dw_row, &x[r * in_dim..(r + 1) * in_dim], dyo);
+            axpy_block(dw_block, in_dim, n, &scales, &x[r * in_dim..(r + 1) * in_dim]);
         }
+        o0 += BLOCK;
     }
 
     (dx, dw)
 }
 
 /// Applies rotary position embeddings in place to a `[rows, heads*head_dim]`
-/// buffer, one rotation per (row, head, dim-pair) using `base=10000`
-/// frequencies. `inverse` negates the rotation angle, which is exactly the
-/// backward pass (rotation matrices are orthogonal, so the transpose is the
-/// inverse rotation).
-pub fn rope_apply(x: &mut [f32], rows: usize, heads: usize, head_dim: usize, inverse: bool) {
+/// buffer, one rotation per (row, head, dim-pair). `inverse` negates the
+/// rotation angle, which is exactly the backward pass (rotation matrices
+/// are orthogonal, so the transpose is the inverse rotation).
+///
+/// `theta` is the frequency base (10000 in the original RoPE paper). A
+/// larger base makes the low-frequency dimensions turn more slowly, which
+/// is what lets a model address a longer context without the position
+/// signal aliasing; it's a config knob because the right value depends on
+/// the context length being trained.
+///
+/// `pos0` is the absolute position of the first row. It's 0 for a normal
+/// forward pass over a whole sequence, and the current sequence length
+/// when decoding one token at a time against a KV cache — RoPE is
+/// applied at the moment a key is computed and then cached, so a cached
+/// key carries the rotation for the absolute position it was written at.
+pub fn rope_apply_at(
+    x: &mut [f32],
+    rows: usize,
+    heads: usize,
+    head_dim: usize,
+    theta: f32,
+    pos0: usize,
+    inverse: bool,
+) {
     debug_assert_eq!(head_dim % 2, 0);
     let half = head_dim / 2;
     let sign = if inverse { -1.0 } else { 1.0 };
@@ -177,10 +275,11 @@ pub fn rope_apply(x: &mut [f32], rows: usize, heads: usize, head_dim: usize, inv
     // this four times per training step (q and k, forward and backward),
     // so the transcendentals dominated an otherwise trivial op.
     let inv_freq: Vec<f32> =
-        (0..half).map(|k| 1.0f32 / 10000f32.powf(2.0 * k as f32 / head_dim as f32)).collect();
+        (0..half).map(|k| 1.0f32 / theta.powf(2.0 * k as f32 / head_dim as f32)).collect();
     for t in 0..rows {
+        let pos = (pos0 + t) as f32;
         for k in 0..half {
-            let angle = sign * t as f32 * inv_freq[k];
+            let angle = sign * pos * inv_freq[k];
             let (s, c) = angle.sin_cos();
             for h in 0..heads {
                 let base_idx = t * heads * head_dim + h * head_dim;
@@ -191,6 +290,18 @@ pub fn rope_apply(x: &mut [f32], rows: usize, heads: usize, head_dim: usize, inv
             }
         }
     }
+}
+
+/// `rope_apply_at` starting from position 0 — the whole-sequence case.
+pub fn rope_apply(
+    x: &mut [f32],
+    rows: usize,
+    heads: usize,
+    head_dim: usize,
+    theta: f32,
+    inverse: bool,
+) {
+    rope_apply_at(x, rows, heads, head_dim, theta, 0, inverse);
 }
 
 pub fn sigmoid(x: f32) -> f32 {
@@ -256,10 +367,23 @@ fn band_lo(t: usize, band: usize) -> usize {
     t.saturating_sub(band.saturating_sub(1))
 }
 
-/// Multi-head causal, optionally windowed, scaled dot-product attention.
-/// `q`/`k`/`v` are `[T, heads*head_dim]` (`q`/`k` already RoPE'd). Returns
-/// `(concat_out[T, heads*head_dim], probs[heads*T*band])`, where `band` is
-/// `band_width(t_len, window)`.
+/// Grouped-query, causal, optionally windowed, scaled dot-product
+/// attention.
+///
+/// `q` is `[T, heads*head_dim]`; `k`/`v` are `[T, kv_heads*head_dim]`
+/// (all already RoPE'd). Query head `h` reads key/value head
+/// `h / (heads / kv_heads)`, so a group of query heads shares one KV
+/// head — Llama's grouped-query attention. With `kv_heads == heads` this
+/// is ordinary multi-head attention.
+///
+/// Sharing KV heads shrinks `Wk`/`Wv`, and shrinks the KV cache that
+/// decoding keeps per token by the same factor. The KV cache is what
+/// bounds how long a generation can run before it stops fitting in
+/// memory, so this is the difference between holding a scene and holding
+/// a chapter.
+///
+/// Returns `(concat_out[T, heads*head_dim], probs[heads*T*band])`, where
+/// `band` is `band_width(t_len, window)`.
 ///
 /// `probs` is stored **banded**, not dense: row `t` holds only the
 /// `band` in-window columns, with column `j` meaning key position
@@ -271,22 +395,28 @@ fn band_lo(t: usize, band: usize) -> usize {
 /// attention moot: masking and re-normalizing a full-length row is O(T)
 /// work per query no matter how narrow the window is. Banded storage
 /// makes both the memory and the time genuinely O(T * window).
+#[allow(clippy::too_many_arguments)]
 pub fn attention_fwd(
     q: &[f32],
     k: &[f32],
     v: &[f32],
     t_len: usize,
     heads: usize,
+    kv_heads: usize,
     head_dim: usize,
     window: usize,
 ) -> (Vec<f32>, Vec<f32>) {
+    debug_assert_eq!(heads % kv_heads, 0);
     let hd = heads * head_dim;
+    let kvd = kv_heads * head_dim;
+    let group = heads / kv_heads;
     let band = band_width(t_len, window);
     let mut out = vec![0.0f32; t_len * hd];
     let mut probs = vec![0.0f32; heads * t_len * band];
     let scale = 1.0 / (head_dim as f32).sqrt();
 
     for h in 0..heads {
+        let kvh = h / group;
         for t in 0..t_len {
             let lo = band_lo(t, band);
             let n = t - lo + 1; // in-window keys for this query
@@ -295,7 +425,7 @@ pub fn attention_fwd(
             let row = &mut probs[base..base + n];
             for (j, slot) in row.iter_mut().enumerate() {
                 let s = lo + j;
-                let k_s = &k[s * hd + h * head_dim..s * hd + h * head_dim + head_dim];
+                let k_s = &k[s * kvd + kvh * head_dim..s * kvd + kvh * head_dim + head_dim];
                 *slot = dot(q_t, k_s) * scale;
             }
             softmax_row_inplace(row);
@@ -306,15 +436,68 @@ pub fn attention_fwd(
                     continue;
                 }
                 let s = lo + j;
-                axpy(out_t, &v[s * hd + h * head_dim..s * hd + h * head_dim + head_dim], p);
+                axpy(out_t, &v[s * kvd + kvh * head_dim..s * kvd + kvh * head_dim + head_dim], p);
             }
         }
     }
     (out, probs)
 }
 
-/// Returns `(dq, dk, dv)`, all `[T, heads*head_dim]`. `probs` is the
-/// banded cache `attention_fwd` returned, same `window`.
+/// Attention for a single query row against an existing KV cache — the
+/// decoding step.
+///
+/// `q_row` is `[heads*head_dim]` for the new token; `k_cache`/`v_cache`
+/// are `[cached_len, kv_heads*head_dim]` holding every key/value still
+/// in the attention window, oldest first, already RoPE'd. Returns the
+/// `[heads*head_dim]` attention output.
+///
+/// No probabilities are returned: nothing backpropagates through
+/// decoding, and not materializing them is most of why one decode step
+/// costs a fraction of re-running the whole forward pass.
+pub fn attention_step(
+    q_row: &[f32],
+    k_cache: &[f32],
+    v_cache: &[f32],
+    cached_len: usize,
+    heads: usize,
+    kv_heads: usize,
+    head_dim: usize,
+) -> Vec<f32> {
+    debug_assert_eq!(heads % kv_heads, 0);
+    let hd = heads * head_dim;
+    let kvd = kv_heads * head_dim;
+    let group = heads / kv_heads;
+    let scale = 1.0 / (head_dim as f32).sqrt();
+    let mut out = vec![0.0f32; hd];
+    let mut scores = vec![0.0f32; cached_len];
+
+    for h in 0..heads {
+        let kvh = h / group;
+        let q_h = &q_row[h * head_dim..(h + 1) * head_dim];
+        for (s, score) in scores.iter_mut().enumerate() {
+            let k_s = &k_cache[s * kvd + kvh * head_dim..s * kvd + kvh * head_dim + head_dim];
+            *score = dot(q_h, k_s) * scale;
+        }
+        softmax_row_inplace(&mut scores);
+        let out_h = &mut out[h * head_dim..(h + 1) * head_dim];
+        for (s, &p) in scores.iter().enumerate() {
+            if p == 0.0 {
+                continue;
+            }
+            axpy(out_h, &v_cache[s * kvd + kvh * head_dim..s * kvd + kvh * head_dim + head_dim], p);
+        }
+    }
+    out
+}
+
+/// Returns `(dq, dk, dv)`; `dq` is `[T, heads*head_dim]` and `dk`/`dv`
+/// are `[T, kv_heads*head_dim]`. `probs` is the banded cache
+/// `attention_fwd` returned, same `window`.
+///
+/// With grouped-query attention every query head in a group accumulates
+/// into the *same* `dk`/`dv` rows, which is exactly right: a shared KV
+/// head's gradient is the sum over the queries that read it.
+#[allow(clippy::too_many_arguments)]
 pub fn attention_bwd(
     d_out: &[f32],
     q: &[f32],
@@ -323,14 +506,18 @@ pub fn attention_bwd(
     probs: &[f32],
     t_len: usize,
     heads: usize,
+    kv_heads: usize,
     head_dim: usize,
     window: usize,
 ) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
+    debug_assert_eq!(heads % kv_heads, 0);
     let hd = heads * head_dim;
+    let kvd = kv_heads * head_dim;
+    let group = heads / kv_heads;
     let band = band_width(t_len, window);
     let mut dq = vec![0.0f32; t_len * hd];
-    let mut dk = vec![0.0f32; t_len * hd];
-    let mut dv = vec![0.0f32; t_len * hd];
+    let mut dk = vec![0.0f32; t_len * kvd];
+    let mut dv = vec![0.0f32; t_len * kvd];
     let scale = 1.0 / (head_dim as f32).sqrt();
     // One row's worth of scratch, reused across rows and heads - the
     // gradient wrt the probabilities is only needed within the row it
@@ -339,6 +526,7 @@ pub fn attention_bwd(
     let mut d_probs_row = vec![0.0f32; band];
 
     for h in 0..heads {
+        let kvh = h / group;
         let probs_h = &probs[h * t_len * band..(h + 1) * t_len * band];
         for t in 0..t_len {
             let lo = band_lo(t, band);
@@ -349,11 +537,15 @@ pub fn attention_bwd(
             // dv, and the gradient arriving at each probability.
             for j in 0..n {
                 let s = lo + j;
-                let v_s = &v[s * hd + h * head_dim..s * hd + h * head_dim + head_dim];
+                let v_s = &v[s * kvd + kvh * head_dim..s * kvd + kvh * head_dim + head_dim];
                 d_probs_row[j] = dot(d_out_t, v_s);
                 let p = probs_row[j];
                 if p != 0.0 {
-                    axpy(&mut dv[s * hd + h * head_dim..s * hd + h * head_dim + head_dim], d_out_t, p);
+                    axpy(
+                        &mut dv[s * kvd + kvh * head_dim..s * kvd + kvh * head_dim + head_dim],
+                        d_out_t,
+                        p,
+                    );
                 }
             }
 
@@ -366,9 +558,13 @@ pub fn attention_bwd(
                     continue;
                 }
                 let s = lo + j;
-                let k_s = &k[s * hd + h * head_dim..s * hd + h * head_dim + head_dim];
+                let k_s = &k[s * kvd + kvh * head_dim..s * kvd + kvh * head_dim + head_dim];
                 axpy(&mut dq[t * hd + h * head_dim..t * hd + h * head_dim + head_dim], k_s, d_score);
-                axpy(&mut dk[s * hd + h * head_dim..s * hd + h * head_dim + head_dim], q_t, d_score);
+                axpy(
+                    &mut dk[s * kvd + kvh * head_dim..s * kvd + kvh * head_dim + head_dim],
+                    q_t,
+                    d_score,
+                );
             }
         }
     }
@@ -418,6 +614,7 @@ pub fn cross_entropy(logits: &[f32], targets: &[u32], t_len: usize, vocab: usize
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::DEFAULT_ROPE_THETA;
 
     /// Central-difference numerical gradient of `f` wrt each element of `x`.
     fn numerical_grad<F: Fn(&[f32]) -> f32>(x: &[f32], f: F, eps: f32) -> Vec<f32> {
@@ -510,8 +707,8 @@ mod tests {
         let head_dim = 4;
         let mut x = seeded_vec(20, rows * heads * head_dim);
         let orig = x.clone();
-        rope_apply(&mut x, rows, heads, head_dim, false);
-        rope_apply(&mut x, rows, heads, head_dim, true);
+        rope_apply(&mut x, rows, heads, head_dim, DEFAULT_ROPE_THETA, false);
+        rope_apply(&mut x, rows, heads, head_dim, DEFAULT_ROPE_THETA, true);
         assert_close(&x, &orig, 1e-4, "rope round trip");
     }
 
@@ -527,7 +724,7 @@ mod tests {
                 x[s..s + head_dim].iter().map(|v| v * v).sum::<f32>().sqrt()
             })
             .collect();
-        rope_apply(&mut x, rows, heads, head_dim, false);
+        rope_apply(&mut x, rows, heads, head_dim, DEFAULT_ROPE_THETA, false);
         let norm_after: Vec<f32> = (0..rows * heads)
             .map(|i| {
                 let s = i * head_dim;
@@ -566,11 +763,11 @@ mod tests {
         let v = seeded_vec(42, t_len * hd);
         let upstream = seeded_vec(43, t_len * hd);
 
-        let (_, probs) = attention_fwd(&q, &k, &v, t_len, heads, head_dim, window);
-        let (dq, dk, dv) = attention_bwd(&upstream, &q, &k, &v, &probs, t_len, heads, head_dim, window);
+        let (_, probs) = attention_fwd(&q, &k, &v, t_len, heads, heads, head_dim, window);
+        let (dq, dk, dv) = attention_bwd(&upstream, &q, &k, &v, &probs, t_len, heads, heads, head_dim, window);
 
         let loss_of = |qq: &[f32], kk: &[f32], vv: &[f32]| {
-            let (out, _) = attention_fwd(qq, kk, vv, t_len, heads, head_dim, window);
+            let (out, _) = attention_fwd(qq, kk, vv, t_len, heads, heads, head_dim, window);
             out.iter().zip(&upstream).map(|(a, b)| a * b).sum::<f32>()
         };
         let num_dq = numerical_grad(&q, |qq| loss_of(qq, &k, &v), 1e-3);
@@ -593,11 +790,11 @@ mod tests {
         let v = seeded_vec(52, t_len * hd);
         let upstream = seeded_vec(53, t_len * hd);
 
-        let (_, probs) = attention_fwd(&q, &k, &v, t_len, heads, head_dim, window);
-        let (dq, dk, dv) = attention_bwd(&upstream, &q, &k, &v, &probs, t_len, heads, head_dim, window);
+        let (_, probs) = attention_fwd(&q, &k, &v, t_len, heads, heads, head_dim, window);
+        let (dq, dk, dv) = attention_bwd(&upstream, &q, &k, &v, &probs, t_len, heads, heads, head_dim, window);
 
         let loss_of = |qq: &[f32], kk: &[f32], vv: &[f32]| {
-            let (out, _) = attention_fwd(qq, kk, vv, t_len, heads, head_dim, window);
+            let (out, _) = attention_fwd(qq, kk, vv, t_len, heads, heads, head_dim, window);
             out.iter().zip(&upstream).map(|(a, b)| a * b).sum::<f32>()
         };
         let num_dq = numerical_grad(&q, |qq| loss_of(qq, &k, &v), 1e-3);
@@ -615,12 +812,12 @@ mod tests {
         // in the window.
         let (t_len, heads, head_dim, window) = (64, 2, 4, 8);
         let x = vec![0.05f32; t_len * heads * head_dim];
-        let (_, probs) = attention_fwd(&x, &x, &x, t_len, heads, head_dim, window);
+        let (_, probs) = attention_fwd(&x, &x, &x, t_len, heads, heads, head_dim, window);
         assert_eq!(probs.len(), heads * t_len * window);
 
         // A window at or above the context length degenerates to full
         // causal attention, and the band is then just the context.
-        let (_, full) = attention_fwd(&x, &x, &x, t_len, heads, head_dim, t_len * 4);
+        let (_, full) = attention_fwd(&x, &x, &x, t_len, heads, heads, head_dim, t_len * 4);
         assert_eq!(full.len(), heads * t_len * t_len);
     }
 
@@ -631,7 +828,7 @@ mod tests {
         for (i, v) in x.iter_mut().enumerate() {
             *v = ((i % 7) as f32 - 3.0) * 0.3;
         }
-        let (_, probs) = attention_fwd(&x, &x, &x, t_len, heads, head_dim, window);
+        let (_, probs) = attention_fwd(&x, &x, &x, t_len, heads, heads, head_dim, window);
         for h in 0..heads {
             for t in 0..t_len {
                 let lo = t.saturating_sub(window - 1);
@@ -655,7 +852,7 @@ mod tests {
         let q = seeded_vec(60, t_len * head_dim);
         let k = seeded_vec(61, t_len * head_dim);
         let v = seeded_vec(62, t_len * head_dim);
-        let (out, _) = attention_fwd(&q, &k, &v, t_len, heads, head_dim, 1);
+        let (out, _) = attention_fwd(&q, &k, &v, t_len, heads, heads, head_dim, 1);
         assert_close(&out, &v, 1e-5, "window=1 attention == V");
     }
 

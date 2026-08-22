@@ -13,7 +13,7 @@ use crate::prep::{self, PreparedStats};
 use crate::retrieval::{RetrievalIndex, RetrievedChunk};
 use crate::rng::Rng;
 use crate::screenplay::{self, StoryState};
-use crate::tokenizer;
+use crate::tokenizer::{self, Tokenizer};
 
 /// Fraction of sampled training windows that start exactly at a source's
 /// beginning (its BOS token) instead of a uniformly random offset. A
@@ -35,6 +35,10 @@ pub struct Corpus {
     /// Index into `flat_cache` of each source's first token (its BOS).
     boundaries: Vec<usize>,
     dirty: bool,
+    /// The tokenizer every source is encoded with. Swapping it
+    /// re-encodes everything (see `set_tokenizer`), because token ids
+    /// from two different vocabularies cannot be mixed in one stream.
+    tokenizer: Tokenizer,
 }
 
 impl Default for Corpus {
@@ -54,12 +58,40 @@ impl Corpus {
             flat_cache: Vec::new(),
             boundaries: Vec::new(),
             dirty: true,
+            tokenizer: Tokenizer::byte_level(),
         }
+    }
+
+    /// A corpus that encodes its sources with a trained BPE vocabulary.
+    pub fn with_tokenizer(tokenizer: Tokenizer) -> Self {
+        Self { tokenizer, ..Self::new() }
+    }
+
+    pub fn tokenizer(&self) -> &Tokenizer {
+        &self.tokenizer
+    }
+
+    /// Replace the tokenizer and re-encode every source with it.
+    ///
+    /// Re-encoding is not optional: a token id only means anything
+    /// relative to the vocabulary that produced it, so leaving old
+    /// sources encoded with the old vocabulary would feed the model a
+    /// stream where the same id means two different things.
+    pub fn set_tokenizer(&mut self, tokenizer: Tokenizer) {
+        self.tokenizer = tokenizer;
+        let ids: Vec<String> = self.order.clone();
+        for id in ids {
+            if let Some(cleaned) = self.cleaned_text.get(&id).cloned() {
+                let tokens = self.tokenizer.encode(&cleaned);
+                self.sources.insert(id, tokenizer::wrap_with_boundaries(&tokens));
+            }
+        }
+        self.dirty = true;
     }
 
     /// Clean, tokenize, and store (or replace) one source's text.
     pub fn upsert(&mut self, id: &str, raw_text: &str, is_html: bool) -> PreparedStats {
-        let (cleaned, tokens, stats) = prep::prepare(raw_text, is_html);
+        let (cleaned, tokens, stats) = prep::prepare(&self.tokenizer, raw_text, is_html);
         let wrapped = tokenizer::wrap_with_boundaries(&tokens);
         if !self.sources.contains_key(id) {
             self.order.push(id.to_string());
@@ -70,6 +102,27 @@ impl Corpus {
         self.sources.insert(id.to_string(), wrapped);
         self.dirty = true;
         stats
+    }
+
+    /// Store one already-tokenized document.
+    ///
+    /// For the native trainer, which tokenizes a few tens of MB once
+    /// ahead of time and then samples from it for hours. It skips the
+    /// retrieval index and the story-state scan that `upsert` builds —
+    /// those exist for the browser's Sources panel, and building them
+    /// over a whole pretraining corpus would cost far more memory than
+    /// the token stream itself.
+    ///
+    /// `tokens` is stored as given, so the caller owns the framing:
+    /// `tokenizer::wrap_with_boundaries` for a plain document, or
+    /// `instruct::Request::to_training_tokens` for an instruction
+    /// example.
+    pub fn upsert_tokens(&mut self, id: &str, tokens: Vec<u32>) {
+        if !self.sources.contains_key(id) {
+            self.order.push(id.to_string());
+        }
+        self.sources.insert(id.to_string(), tokens);
+        self.dirty = true;
     }
 
     pub fn remove(&mut self, id: &str) -> bool {

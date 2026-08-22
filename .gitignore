@@ -4,3 +4,8 @@ Cargo.lock
 node_modules/
 frontend/pkg/
 .DS_Store
+
+# Corpus downloads and the dataset built from them: reproducible from
+# corpus/manifest.tsv, and far too big to keep in git.
+corpus/raw/
+corpus/build/
