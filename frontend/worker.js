@@ -358,7 +358,7 @@ async function handleMessage(msg) {
         try {
           await withTimeout(llm.init_gpu(), GPU_INIT_TIMEOUT_MS, 'GPU init');
           gpuInitialized = true;
-          post({ type: 'gpuReady' });
+          post({ type: 'gpuReady', adapter: llm.gpu_adapter_summary(), isSoftware: llm.gpu_is_software() });
         } catch (err) {
           post({ type: 'trainStalled', message: `WebGPU unavailable: ${err} — check "Train on WebGPU" only works after a WebGPU device is available.` });
           break;
@@ -454,7 +454,7 @@ async function handleMessage(msg) {
       try {
         await withTimeout(llm.init_gpu(), GPU_INIT_TIMEOUT_MS, 'GPU init');
         gpuInitialized = true;
-        post({ type: 'gpuReady' });
+        post({ type: 'gpuReady', adapter: llm.gpu_adapter_summary(), isSoftware: llm.gpu_is_software() });
       } catch (err) {
         post({ type: 'gpuUnavailable', message: String(err) });
       }

@@ -43,6 +43,7 @@ jobs:
             crates/llm-core
             crates/llm-gpu
             crates/wasm-app
+            crates/shader-check
 
       - name: Install wasm-pack
         uses: jetli/wasm-pack-action@v0.4.0
@@ -51,6 +52,14 @@ jobs:
 
       - name: Test llm-core (the verified CPU reference engine)
         run: cargo test -p llm-core
+
+      - name: Compile every WGSL shader
+        # llm-gpu embeds its shaders with include_str! and only compiles
+        # them at create_shader_module time — in a browser, on the user's
+        # first click. Nothing in this workflow's Rust build looks at them,
+        # so this step compiles each one with naga (wgpu's own WGSL front
+        # end) to keep shader errors out of the deployed page.
+        run: cargo test --manifest-path crates/shader-check/Cargo.toml
 
       - name: Build wasm-app -> frontend/pkg
         # +simd128 is what lets LLVM turn llm-core's dot/axpy inner loops

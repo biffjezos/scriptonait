@@ -41,7 +41,7 @@ fn js_err(msg: impl std::fmt::Display) -> JsValue {
 /// CPU copy would report a large, misleading "diff" that reflects two
 /// different models, not a kernel bug).
 async fn read_gpu_weights(ctx: &llm_gpu::GpuContext, model: &llm_gpu::GpuModel, config: &ModelConfig) -> Result<ModelWeights, JsValue> {
-    let flat = model.read_all_weights(ctx).await;
+    let flat = model.read_all_weights(ctx).await.map_err(js_err)?;
     let mut bytes = Vec::with_capacity(flat.len() * 4);
     for v in &flat {
         bytes.extend_from_slice(&v.to_le_bytes());
@@ -330,6 +330,30 @@ impl WasmLLM {
         inner.gpu_ctx = Some(Rc::new(ctx));
         inner.gpu_model = None; // force a fresh upload against the new device
         Ok(())
+    }
+
+    /// Which adapter the browser actually handed us, e.g.
+    /// "NVIDIA GeForce RTX 3070 (Vulkan, DiscreteGpu)". Empty until
+    /// `init_gpu` succeeds.
+    ///
+    /// Worth surfacing rather than assuming: a browser can hand back a
+    /// software rasterizer (SwiftShader) that presents as WebGPU and then
+    /// runs training orders of magnitude slower than the same code on
+    /// real hardware, which is indistinguishable from "the kernels are
+    /// slow" unless you ask.
+    pub fn gpu_adapter_summary(&self) -> String {
+        self.0
+            .borrow()
+            .gpu_ctx
+            .as_ref()
+            .map(|ctx| ctx.adapter_summary.clone())
+            .unwrap_or_default()
+    }
+
+    /// True when the WebGPU device is a software renderer rather than a
+    /// real GPU — see `gpu_adapter_summary`.
+    pub fn gpu_is_software(&self) -> bool {
+        self.0.borrow().gpu_ctx.as_ref().map(|ctx| ctx.is_software).unwrap_or(false)
     }
 
     /// Same as `generate`, but runs the forward pass on the GPU via

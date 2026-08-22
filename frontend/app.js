@@ -297,6 +297,15 @@ worker.onmessage = (event) => {
       el('gpu-status').textContent = 'WebGPU device ready.';
       el('debug-compare-btn').hidden = false;
       el('debug-compare-gradient-btn').hidden = false;
+      if (msg.adapter) {
+        // Which adapter the browser actually chose is the first thing
+        // worth knowing when training is slower than expected: a software
+        // fallback runs the same kernels orders of magnitude slower than
+        // real hardware.
+        el('gpu-status').textContent = msg.isSoftware
+          ? `WebGPU device: ${msg.adapter}. Training will be extremely slow — this is a software renderer, not a real GPU. CPU training is likely faster.`
+          : `WebGPU device: ${msg.adapter}`;
+      }
       break;
     }
 
