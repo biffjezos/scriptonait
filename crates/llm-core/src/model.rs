@@ -319,6 +319,45 @@ impl AdamState {
     }
 }
 
+impl AdamState {
+    /// Serialize the moment buffers and the step counter.
+    ///
+    /// Three times the size of the weights, which is why this is a
+    /// separate file from the checkpoint rather than part of it — but a
+    /// pretraining run that spans several CI jobs has to carry it, or
+    /// every resume throws away Adam's momentum and the loss visibly
+    /// jumps at each restart.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let m = self.m.to_bytes();
+        let v = self.v.to_bytes();
+        let mut out = Vec::with_capacity(8 + m.len() + v.len());
+        out.extend_from_slice(&(self.t as u32).to_le_bytes());
+        out.extend_from_slice(&(m.len() as u32).to_le_bytes());
+        out.extend_from_slice(&m);
+        out.extend_from_slice(&v);
+        out
+    }
+
+    pub fn from_bytes(bytes: &[u8], config: &ModelConfig) -> Result<Self, String> {
+        if bytes.len() < 8 {
+            return Err("optimizer state truncated".to_string());
+        }
+        let t = u32::from_le_bytes(bytes[0..4].try_into().unwrap()) as i32;
+        let len = u32::from_le_bytes(bytes[4..8].try_into().unwrap()) as usize;
+        if bytes.len() != 8 + 2 * len {
+            return Err(format!(
+                "optimizer state is {} bytes, expected {} for this model shape",
+                bytes.len(),
+                8 + 2 * len
+            ));
+        }
+        let m = ModelWeights::from_bytes(&bytes[8..8 + len], config)?;
+        let v = ModelWeights::from_bytes(&bytes[8 + len..], config)?;
+        let decay = m.decay_flags();
+        Ok(Self { m, v, t, decay })
+    }
+}
+
 fn gather_rows(table: &[f32], ids: &[u32], hidden: usize) -> Vec<f32> {
     let mut out = vec![0.0f32; ids.len() * hidden];
     for (t, &id) in ids.iter().enumerate() {

@@ -1,5 +1,7 @@
+pub mod checkpoint;
 pub mod config;
 pub mod corpus;
+pub mod dataset;
 pub mod generate;
 pub mod instruct;
 pub mod model;

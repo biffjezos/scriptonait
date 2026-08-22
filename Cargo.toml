@@ -3,6 +3,8 @@ resolver = "2"
 members = [
     "crates/llm-core",
     "crates/llm-bench",
+    "crates/llm-data",
+    "crates/llm-train",
 ]
 # crates/llm-gpu and crates/wasm-app are deliberately NOT workspace members.
 # They pull in wgpu / wasm-bindgen (and need the wasm32 target), so they're

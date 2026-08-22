@@ -104,6 +104,27 @@ impl Corpus {
         stats
     }
 
+    /// Store one already-tokenized document.
+    ///
+    /// For the native trainer, which tokenizes a few tens of MB once
+    /// ahead of time and then samples from it for hours. It skips the
+    /// retrieval index and the story-state scan that `upsert` builds —
+    /// those exist for the browser's Sources panel, and building them
+    /// over a whole pretraining corpus would cost far more memory than
+    /// the token stream itself.
+    ///
+    /// `tokens` is stored as given, so the caller owns the framing:
+    /// `tokenizer::wrap_with_boundaries` for a plain document, or
+    /// `instruct::Request::to_training_tokens` for an instruction
+    /// example.
+    pub fn upsert_tokens(&mut self, id: &str, tokens: Vec<u32>) {
+        if !self.sources.contains_key(id) {
+            self.order.push(id.to_string());
+        }
+        self.sources.insert(id.to_string(), tokens);
+        self.dirty = true;
+    }
+
     pub fn remove(&mut self, id: &str) -> bool {
         let removed = self.sources.remove(id).is_some();
         if removed {

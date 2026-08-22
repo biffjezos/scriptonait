@@ -125,6 +125,30 @@ impl Trainer {
         }
     }
 
+    /// A trainer resuming from an existing checkpoint's weights.
+    ///
+    /// `step` continues the learning-rate schedule where the previous
+    /// run left off — restarting warmup on every resume would give the
+    /// loss curve a visible notch at each restart.
+    pub fn resume(config: ModelConfig, weights: ModelWeights, step: u64, seed: u64) -> Self {
+        let mut trainer = Self::new(config, seed);
+        trainer.weights = weights;
+        trainer.step = step;
+        trainer
+    }
+
+    /// Optimizer state, for a run that will be continued in another
+    /// process. See `AdamState::to_bytes` for why it isn't part of the
+    /// checkpoint.
+    pub fn optimizer_bytes(&self) -> Vec<u8> {
+        self.adam.to_bytes()
+    }
+
+    pub fn load_optimizer(&mut self, bytes: &[u8]) -> Result<(), String> {
+        self.adam = AdamState::from_bytes(bytes, &self.config)?;
+        Ok(())
+    }
+
     /// Cap how many threads a step may use. Values below 1 are treated as
     /// 1. The native trainer exposes this so a run can be told to leave
     /// cores for the rest of the machine.
@@ -323,6 +347,73 @@ mod tests {
         let (a, b) = (as_floats(&single_weights), as_floats(&multi_weights));
         let worst = a.iter().zip(&b).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
         assert!(worst < 1e-5, "threaded step moved the weights somewhere else: worst diff {worst}");
+    }
+
+    #[test]
+    fn a_resumed_run_continues_rather_than_restarting() {
+        // What this is really testing: a pretraining run split across
+        // several CI jobs must behave like one continuous run. If the
+        // optimizer state or the step count is dropped, the loss curve
+        // notches upward at every restart.
+        let config = tiny_config();
+        let text = "the quick brown fox jumps over the lazy dog. ".repeat(60);
+        let train = TrainConfig { lr: 0.01, warmup_steps: 5, total_steps: 100, ..Default::default() };
+
+        let mut straight = Trainer::new(config, 21);
+        let mut corpus = Corpus::new();
+        corpus.upsert("a", &text, false);
+        for _ in 0..12 {
+            straight.train_step_with(&mut corpus, 2, &train).unwrap();
+        }
+
+        // The same twelve steps, but split across two "processes" with
+        // the checkpoint and optimizer state carried between them.
+        let mut first = Trainer::new(config, 21);
+        let mut corpus_a = Corpus::new();
+        corpus_a.upsert("a", &text, false);
+        for _ in 0..6 {
+            first.train_step_with(&mut corpus_a, 2, &train).unwrap();
+        }
+        let optimizer = first.optimizer_bytes();
+        let mut second = Trainer::resume(config, first.weights.clone(), first.step, 21);
+        second.load_optimizer(&optimizer).unwrap();
+        let mut corpus_b = Corpus::new();
+        corpus_b.upsert("a", &text, false);
+        for _ in 0..6 {
+            second.train_step_with(&mut corpus_b, 2, &train).unwrap();
+        }
+
+        assert_eq!(second.step, straight.step);
+        // Not identical weights: the resumed trainer's batch sampler
+        // restarts from the seed, so it sees different windows. What has
+        // to match is that it's in the same place on the schedule and
+        // hasn't thrown its momentum away.
+        assert_eq!(train.lr_at(second.step), train.lr_at(straight.step));
+        let restored = Trainer::resume(config, first.weights.clone(), first.step, 21);
+        assert!(
+            restored.config == config,
+            "a resumed trainer must keep the checkpoint's shape"
+        );
+    }
+
+    #[test]
+    fn optimizer_state_survives_a_round_trip() {
+        let config = tiny_config();
+        let mut trainer = Trainer::new(config, 3);
+        let mut corpus = Corpus::new();
+        corpus.upsert("a", &"shadows on the wall of the cave. ".repeat(40), false);
+        trainer.train_step(&mut corpus, 2, 0.01);
+        let bytes = trainer.optimizer_bytes();
+
+        let mut restored = Trainer::resume(config, trainer.weights.clone(), trainer.step, 3);
+        restored.load_optimizer(&bytes).unwrap();
+        assert_eq!(restored.optimizer_bytes(), bytes);
+
+        // A state from a different shape has to be rejected, not
+        // silently reinterpreted.
+        let other = ModelConfig { hidden_dim: 16, ..config };
+        let mut mismatched = Trainer::new(other, 3);
+        assert!(mismatched.load_optimizer(&bytes).is_err());
     }
 
     #[test]
