@@ -109,8 +109,21 @@ async function benchmarkOneConfig(cfg, batchSize, lr) {
   }
 }
 
+// Training can complete many steps per second on a small model, and every
+// one of them used to be its own postMessage - each waking the main
+// thread for a status-line rewrite and a canvas redraw. Progress is
+// coalesced into at most one message per this many ms; the message
+// carries the mean loss/step time over the interval it covers, so nothing
+// is silently dropped, and the chart gets a less noisy line for free.
+const PROGRESS_POST_INTERVAL_MS = 100;
+
 let llm = null;
 let training = false;
+// The promise for a train step that has been started but hasn't resolved
+// yet. GPU work isn't serialized across worker messages, so anything that
+// touches GPU state (stopping, syncing weights back) has to wait for this
+// first rather than issuing commands alongside an in-flight step.
+let inFlightStep = null;
 let trainParams = { batchSize: 4, lr: 0.01, useGpu: false, sampleEveryN: 0, samplePrompt: '' };
 let gpuInitialized = false;
 let gpuStepCounter = 0;
@@ -151,6 +164,42 @@ async function maybeGenerateSample(step) {
   }
 }
 
+// Coalesced progress state, flushed by flushProgress below.
+let pendingProgress = null;
+let lastProgressPostMs = 0;
+
+function recordProgress(step, loss, lr, stepMs, batchSize) {
+  if (!pendingProgress) {
+    pendingProgress = { lossSum: 0, stepMsSum: 0, count: 0 };
+  }
+  // Rate and shape are reported as of the latest step; loss and step time
+  // as the mean over the steps this message covers.
+  pendingProgress.step = step;
+  pendingProgress.lr = lr;
+  pendingProgress.batchSize = batchSize;
+  pendingProgress.lossSum += loss;
+  pendingProgress.stepMsSum += stepMs;
+  pendingProgress.count += 1;
+}
+
+function flushProgress(force) {
+  if (!pendingProgress) return;
+  const now = performance.now();
+  if (!force && now - lastProgressPostMs < PROGRESS_POST_INTERVAL_MS) return;
+  const p = pendingProgress;
+  pendingProgress = null;
+  lastProgressPostMs = now;
+  post({
+    type: 'trainProgress',
+    step: p.step,
+    loss: p.lossSum / p.count,
+    lr: p.lr,
+    stepMs: p.stepMsSum / p.count,
+    batchSize: p.batchSize,
+    stepsCoalesced: p.count,
+  });
+}
+
 async function trainingLoop() {
   if (!training || !llm) return;
   try {
@@ -168,7 +217,17 @@ async function trainingLoop() {
       // would silently sit there forever with no feedback at all. Sized
       // well above any real step time so it doesn't fire on a merely slow
       // step.
-      loss = await withTimeout(llm.train_step_gpu(trainParams.batchSize, lr, gpuStepCounter), TRAIN_STEP_GPU_TIMEOUT_MS, 'GPU train step');
+      const stepPromise = llm.train_step_gpu(trainParams.batchSize, lr, gpuStepCounter);
+      // A barrier that never rejects (the loop's own catch reports the
+      // error) and stays set until the *real* call settles - withTimeout
+      // can give up while the GPU work is still running, and a stop
+      // arriving then must still wait for it before touching GPU state.
+      const barrier = stepPromise.then(() => {}, () => {});
+      inFlightStep = barrier;
+      barrier.then(() => {
+        if (inFlightStep === barrier) inFlightStep = null;
+      });
+      loss = await withTimeout(stepPromise, TRAIN_STEP_GPU_TIMEOUT_MS, 'GPU train step');
       gpuStepCounter += 1;
       step = gpuStepCounter;
     } else {
@@ -179,14 +238,24 @@ async function trainingLoop() {
     }
     const stepMs = performance.now() - t0;
     if (loss !== undefined) {
-      post({ type: 'trainProgress', step, loss, lr, stepMs, batchSize: trainParams.batchSize });
+      recordProgress(step, loss, lr, stepMs, trainParams.batchSize);
+      flushProgress(false);
+      // A stop that arrived while the step above was running has already
+      // set training = false; don't start a sample generation (which
+      // touches the same GPU state) on the way out.
+      if (!training) {
+        flushProgress(true);
+        return;
+      }
       await maybeGenerateSample(Math.round(step));
     } else {
+      flushProgress(true);
       post({ type: 'trainStalled', message: 'Not enough training data yet — add a source with more text.' });
       training = false;
       return;
     }
   } catch (err) {
+    flushProgress(true);
     post({ type: 'error', context: 'train_step', message: String(err) });
     training = false;
     return;
@@ -308,6 +377,20 @@ async function handleMessage(msg) {
 
     case 'stopTraining': {
       training = false;
+      flushProgress(true);
+      // A stop message can be handled while a train step is still in
+      // flight - the worker starts handling it the moment the loop awaits.
+      // Issuing a weight sync alongside a running step would have both
+      // scribbling over the same GpuModel scratch buffers, the exact
+      // hazard the 'generate' and debug-compare handlers already refuse
+      // to risk. Wait it out instead.
+      if (inFlightStep) {
+        try {
+          await inFlightStep;
+        } catch {
+          // The step's own error is reported by the training loop.
+        }
+      }
       try {
         if (trainParams.useGpu && llm.gpu_training_dirty()) {
           await llm.sync_weights_from_gpu();
