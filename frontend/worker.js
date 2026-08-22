@@ -42,43 +42,41 @@ async function ensureWasm() {
   await wasmReady;
 }
 
-/// Load the checkpoint the site ships with. A missing one is a normal
-/// state, not an error: the page then offers to train a model instead.
-async function loadShippedModel(url) {
+/// Load the checkpoint the site ships with, from bytes the page already
+/// downloaded.
+///
+/// The download itself deliberately happens on the main thread. It used
+/// to happen here, and that was a bad idea twice over: a worker's fetch
+/// is harder to observe when it misbehaves (a hung one produced no
+/// error, no reply, and an app that sat on "Loading the model..."
+/// forever), and progress reporting has to be relayed back to the page
+/// anyway. Fetching where the progress bar lives is simpler and one
+/// failure mode shorter.
+async function loadModelBytes(bytes) {
   await ensureWasm();
-  const response = await fetch(url);
-  if (!response.ok) {
-    throw new Error(`no pretrained model at ${url} (${response.status})`);
-  }
-  const total = Number(response.headers.get('content-length')) || 0;
-  // Streamed rather than awaited whole, so a 15 MB download over a slow
-  // connection shows a real progress bar instead of a blank page.
-  const chunks = [];
-  let received = 0;
-  const reader = response.body && response.body.getReader ? response.body.getReader() : null;
-  if (reader) {
-    for (;;) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      chunks.push(value);
-      received += value.length;
-      post('download-progress', { received, total });
-    }
-  } else {
-    const buffer = new Uint8Array(await response.arrayBuffer());
-    chunks.push(buffer);
-    received = buffer.length;
-    post('download-progress', { received, total: received });
-  }
-
-  const bytes = new Uint8Array(received);
-  let at = 0;
-  for (const chunk of chunks) {
-    bytes.set(chunk, at);
-    at += chunk.length;
-  }
-  llm = WasmLLM.from_checkpoint(bytes);
+  llm = WasmLLM.from_checkpoint(new Uint8Array(bytes));
+  await initGpu();
   return describeModel();
+}
+
+/// Ask for a WebGPU device and upload the weights to it.
+///
+/// Not a setting and not a fallback the user has to think about: if the
+/// browser has WebGPU, generation runs there; if it doesn't, it runs on
+/// the CPU. Either way the page says which. A failure here is normal —
+/// browsers without WebGPU exist — so it's reported, not thrown.
+async function initGpu() {
+  if (!llm) return;
+  try {
+    const summary = await llm.init_gpu();
+    post('gpu-status', { available: true, device: summary });
+  } catch (error) {
+    post('gpu-status', {
+      available: false,
+      device: 'CPU',
+      reason: (error && error.message) || String(error),
+    });
+  }
 }
 
 function describeModel() {
@@ -94,6 +92,8 @@ function describeModel() {
     params: info.params,
     step: info.step,
     pretrained: info.pretrained,
+    device: llm.device_summary(),
+    usingGpu: llm.using_gpu(),
     sources: llm.num_sources(),
     corpusTokens: llm.total_tokens(),
   };
@@ -110,13 +110,13 @@ function describePrompt(prompt) {
   };
 }
 
-function generate({ prompt, extraContext, temperature, topK, topP, repetitionPenalty, seed }) {
+async function generate({ prompt, extraContext, temperature, topK, topP, repetitionPenalty, seed }) {
   stopRequested = false;
   const startedAt = performance.now();
   let lastPost = 0;
   let tokens = 0;
 
-  const result = llm.generate(
+  const result = await llm.generate(
     prompt,
     extraContext || '',
     temperature,
@@ -218,13 +218,14 @@ async function train({ batchSize, learningRate, maxSteps, effort }) {
 }
 
 const handlers = {
-  async 'load-model'({ url }) {
-    return loadShippedModel(url);
+  async 'load-model'({ bytes }) {
+    return loadModelBytes(bytes);
   },
 
   async 'create-model'({ layers, hidden, heads, kvHeads, contextLen, window: attentionWindow, seed }) {
     await ensureWasm();
     llm = new WasmLLM(layers, hidden, heads, kvHeads, contextLen, attentionWindow, seed);
+    await initGpu();
     return describeModel();
   },
 
@@ -235,6 +236,7 @@ const handlers = {
     } else {
       llm.import_checkpoint(new Uint8Array(bytes));
     }
+    await initGpu();
     return describeModel();
   },
 
@@ -289,7 +291,7 @@ const handlers = {
       const retrieved = llm.retrieve_context_text(payload.prompt, 2);
       if (retrieved) extraContext = [extraContext, retrieved].filter(Boolean).join(' ');
     }
-    const result = generate({ ...payload, extraContext });
+    const result = await generate({ ...payload, extraContext });
     const parsed = describePrompt(payload.prompt);
     result.notes = llm.qa_check(result.text, parsed.targetWords || 0);
     return result;

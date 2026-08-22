@@ -515,6 +515,25 @@ impl GenCache {
         &self.tokens
     }
 
+    pub fn num_layers(&self) -> usize {
+        self.layers.len()
+    }
+
+    /// One layer's cached keys, oldest first, `[cached, kv_dim]`.
+    ///
+    /// Exposed so another backend can be seeded from a prefill this one
+    /// already computed — the WebGPU path prefills on the CPU (that
+    /// forward pass is gradient-checked and fast) and then decodes on the
+    /// GPU, rather than reimplementing a whole batched forward pass in
+    /// WGSL that nobody could verify.
+    pub fn layer_keys(&self, layer: usize) -> &[f32] {
+        &self.layers[layer].k
+    }
+
+    pub fn layer_values(&self, layer: usize) -> &[f32] {
+        &self.layers[layer].v
+    }
+
     /// Drop everything older than the attention window. Positions of the
     /// surviving entries don't change, so their RoPE rotations stay
     /// valid — this only discards keys attention could no longer reach.

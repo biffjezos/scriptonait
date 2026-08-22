@@ -27,8 +27,8 @@ page to push against.
 
 ## How it's put together
 
-The short version: **training happens on a server, generation happens in
-your browser, and nothing is compiled while you wait.**
+The short version: **training happens on a server, generation happens on
+your GPU, and nothing is compiled while you wait.**
 
 ```
 crates/
@@ -42,7 +42,8 @@ crates/
   llm-train/   Native pretraining: threaded, time-budgeted, resumable,
                and loud about its progress.
   llm-bench/   Throughput numbers, so performance claims are reproducible.
-  wasm-app/    wasm-bindgen glue: one WasmLLM class over llm-core.
+  llm-gpu/     WebGPU inference: the per-token decode step, in WGSL.
+  wasm-app/    wasm-bindgen glue: one WasmLLM class over both.
 frontend/
   index.html, style.css, app.js   The page.
   worker.js                       Owns the wasm module, off the main thread.
@@ -112,6 +113,28 @@ it against "700" teaches a number it can't honour. The counting is done by
 the code, which can: generation runs to your target and then to the next
 sentence boundary, so it ends on a finished sentence, with a hard ceiling
 40% over in case the model never produces one.
+
+### Where generation happens
+
+On the GPU, when the browser has WebGPU. On the CPU when it doesn't. That
+is a fact about your machine rather than a setting, so there's no toggle —
+the page states which one it got, in the status line and in the model
+panel.
+
+The split inside the GPU path is worth knowing: the prompt is prefilled by
+llm-core's CPU forward pass, the one with gradient checks behind it, and
+its keys and values are uploaded; every token after that is decoded on the
+GPU. A batched forward pass in WGSL would be a lot of code duplicating
+something already computed correctly, and it's the part nobody can verify
+without a GPU in front of them. The decode step is where the time goes —
+one prompt, hundreds of tokens — and it's a much smaller kernel set.
+
+Sampling, the repetition penalty and the stopping rule stay on the CPU in
+both paths, sharing one implementation (`instruct::LengthGuard`), so the
+two backends can't drift apart in what they produce.
+
+If the device is lost mid-generation, it finishes on the CPU rather than
+showing you an error where a story should be.
 
 ### Where training happens
 
@@ -232,14 +255,19 @@ only compiler, which is why every push runs it. The frontend JavaScript is
 syntax-checked as ES modules and reviewed, but has not been run in a
 browser here.
 
-There used to be a WebGPU backend (`crates/llm-gpu`). It has been removed:
-it was never verified to compute the right numbers, it couldn't express
-grouped-query attention or PLE-off models without a rewrite that also
-couldn't be verified here, and its CPU/GPU toggle kept two independent
-sets of weights and optimizer state — flipping it mid-run silently reset
-Adam's momentum. With the KV cache and a BPE vocabulary the CPU path is
-fast enough at this model size. It's in the git history if someone with a
-real WebGPU setup wants to bring it back.
+`llm-gpu` has the same problem in a sharper form: it cannot run here at
+all. CI compiles it and validates every shader with naga, so the WGSL
+parses and type-checks, but whether it computes the *right numbers* needs
+a browser. `GpuModel::debug_compare_step` is the answer to that in one
+number — it runs the same decode step on both backends from the same
+state and reports the largest difference between their logits. Under
+`1e-2` is float rounding. Anything larger means the kernels are wrong and
+the CPU path should be used until they're fixed.
+
+The GPU backend is inference-only by design. Training kernels (backward,
+Adam, cross-entropy) are gone, along with the CPU/GPU training toggle that
+used to keep two independent sets of weights and optimizer state — where
+flipping it mid-run silently reset Adam's momentum.
 
 ## Known limitations
 
