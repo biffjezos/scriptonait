@@ -321,35 +321,51 @@ function setTrainingButtons(isTraining) {
   el('stop-train-btn').disabled = !isTraining;
 }
 
-const STORY_STATE_DISMISSED_KEY = 'scriptonait.storyStateDismissed';
+// Opt-in, not opt-out: the heuristic extraction misfires often enough on
+// real scripts (shot descriptions, technical slug codes, etc. read as
+// "characters") that showing it unprompted does more harm than good. Off
+// by default for everyone; a new key (rather than reinterpreting the old
+// "dismissed" one) means anyone who previously hit "Hide" also lands on
+// the new, safer default instead of depending on how that flag was stored.
+const STORY_STATE_SHOWN_KEY = 'scriptonait.storyStateShown';
 
-function isStoryStateDismissed() {
+function isStoryStateShown() {
   try {
-    return localStorage.getItem(STORY_STATE_DISMISSED_KEY) === '1';
+    return localStorage.getItem(STORY_STATE_SHOWN_KEY) === '1';
   } catch {
     return false;
   }
 }
 
+function setStoryStateShown(shown) {
+  el('story-state-panel').hidden = !shown;
+  el('show-story-state-btn').hidden = shown;
+  try {
+    localStorage.setItem(STORY_STATE_SHOWN_KEY, shown ? '1' : '0');
+  } catch {
+    // Storage unavailable (private mode, quota) - the choice just won't
+    // persist across reloads.
+  }
+}
+
+let lastStoryState = null;
+
 function updateStoryStatePanel(storyState) {
   if (!storyState) return;
-  const panel = el('story-state-panel');
+  lastStoryState = storyState;
   const hasAnything = storyState.characters.length > 0 || storyState.locations.length > 0;
-  panel.hidden = !hasAnything || isStoryStateDismissed();
+  el('show-story-state-btn').hidden = !hasAnything || isStoryStateShown();
+  el('story-state-panel').hidden = !hasAnything || !isStoryStateShown();
   if (!hasAnything) return;
   el('story-characters').textContent = storyState.characters.length ? storyState.characters.join(', ') : '—';
   el('story-locations').textContent = storyState.locations.length ? storyState.locations.join(', ') : '—';
   el('story-scene-count').textContent = String(storyState.sceneCount);
 }
 
-el('dismiss-story-state-btn').addEventListener('click', () => {
-  el('story-state-panel').hidden = true;
-  try {
-    localStorage.setItem(STORY_STATE_DISMISSED_KEY, '1');
-  } catch {
-    // Storage unavailable (private mode, quota) - the panel still stays
-    // hidden for this page load, it just won't persist across reloads.
-  }
+el('dismiss-story-state-btn').addEventListener('click', () => setStoryStateShown(false));
+el('show-story-state-btn').addEventListener('click', () => {
+  setStoryStateShown(true);
+  if (lastStoryState) updateStoryStatePanel(lastStoryState);
 });
 
 function renderQaNotes(notes) {
