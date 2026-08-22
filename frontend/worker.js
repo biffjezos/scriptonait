@@ -34,7 +34,31 @@ function post(type, payload = {}) {
 }
 
 function fail(id, error) {
-  post('error', { id, message: error && error.message ? error.message : String(error) });
+  // The stack travels with the message. "Cannot read properties of
+  // undefined" is useless on its own; the same error with a frame in it
+  // names the call that did it, and the page shows both.
+  post('error', {
+    id,
+    message: error && error.message ? error.message : String(error),
+    stack: (error && error.stack) || '',
+  });
+}
+
+/// Coerce a value that must reach wasm as a string.
+///
+/// wasm-bindgen reads `.length` off whatever it's handed for a `String`
+/// parameter, so `undefined` there throws "Cannot read properties of
+/// undefined (reading 'length')" from inside generated glue, with no clue
+/// which call it came from. A stored source with no text — an old record,
+/// a file that read as nothing — reaches `upsert_source` exactly that
+/// way. Coercing at the boundary turns a mystery into either working
+/// code or an honest error message.
+function text(value, what) {
+  if (typeof value === 'string') return value;
+  if (value === null || value === undefined) {
+    throw new Error(`${what} was ${value === null ? 'null' : 'missing'}`);
+  }
+  return String(value);
 }
 
 async function ensureWasm() {
@@ -251,11 +275,15 @@ const handlers = {
 
   async 'parse-prompt'({ prompt }) {
     await ensureWasm();
-    return describePrompt(prompt);
+    return describePrompt(text(prompt, 'the prompt'));
   },
 
-  async 'upsert-source'({ id, text, isHtml }) {
-    const stats = llm.upsert_source(id, text, !!isHtml);
+  async 'upsert-source'(payload) {
+    const stats = llm.upsert_source(
+      text(payload.id, 'the source id'),
+      text(payload.text, `the text of source ${payload.id}`),
+      !!payload.isHtml,
+    );
     return {
       charCount: stats.char_count,
       byteCount: stats.byte_count,
@@ -265,21 +293,21 @@ const handlers = {
   },
 
   async 'remove-source'({ id }) {
-    llm.remove_source(id);
+    llm.remove_source(text(id, 'the source id'));
     return describeModel();
   },
 
   async 'story-state'() {
     return {
-      characters: llm.story_characters(),
-      locations: llm.story_locations(),
-      sceneCount: llm.story_scene_count(),
-      preamble: llm.story_state_preamble(),
+      characters: llm.story_characters() || [],
+      locations: llm.story_locations() || [],
+      sceneCount: llm.story_scene_count() || 0,
+      preamble: llm.story_state_preamble() || '',
     };
   },
 
   async 'retrieve'({ query, k }) {
-    return { chunks: llm.retrieve_context(query, k) };
+    return { chunks: llm.retrieve_context(text(query, 'the query'), k || 3) };
   },
 
   async generate(payload) {
@@ -291,9 +319,13 @@ const handlers = {
       const retrieved = llm.retrieve_context_text(payload.prompt, 2);
       if (retrieved) extraContext = [extraContext, retrieved].filter(Boolean).join(' ');
     }
-    const result = await generate({ ...payload, extraContext });
-    const parsed = describePrompt(payload.prompt);
-    result.notes = llm.qa_check(result.text, parsed.targetWords || 0);
+    const result = await generate({
+      ...payload,
+      prompt: text(payload.prompt, 'the prompt'),
+      extraContext,
+    });
+    const parsed = describePrompt(text(payload.prompt, 'the prompt'));
+    result.notes = llm.qa_check(result.text || '', parsed.targetWords || 0);
     return result;
   },
 

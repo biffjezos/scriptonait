@@ -64,12 +64,14 @@ worker.onmessage = (event) => {
     return;
   }
   if (type === 'error') {
+    const error = new Error(event.data.message);
+    if (event.data.stack) error.stack = event.data.stack;
     const entry = pending.get(id);
     if (entry) {
       pending.delete(id);
-      entry.reject(new Error(event.data.message));
+      entry.reject(error);
     } else {
-      showError(event.data.message);
+      showError(error);
     }
     return;
   }
@@ -83,10 +85,21 @@ worker.onerror = (event) => showError(event.message || 'the worker failed');
 
 const $ = (id) => document.getElementById(id);
 
-function showError(message) {
+/// Show a failure, with enough of the stack to act on.
+///
+/// An error message on its own is often useless — "Cannot read
+/// properties of undefined (reading 'length')" says nothing about which
+/// call produced it. The first frame does, so it goes on screen, and the
+/// whole thing goes to the console.
+function showError(error) {
   const banner = $('error-banner');
-  banner.textContent = message;
+  const message = typeof error === 'string' ? error : error.message;
+  const frame = typeof error === 'object' && error && error.stack
+    ? String(error.stack).split('\n').slice(1).find((line) => line.trim()) || ''
+    : '';
+  banner.textContent = frame ? `${message}  (${frame.trim()})` : message;
   banner.hidden = false;
+  if (typeof error === 'object') console.error('scriptonait:', error);
 }
 
 function clearError() {
@@ -479,6 +492,14 @@ function updateSourceSummary(sources, note = '') {
 /// loaded this is expected to fail, and failing here must not stop
 /// anything.
 async function syncSource(source) {
+  // A record with no text can't be handed to the model: wasm-bindgen
+  // reads `.length` off whatever it gets for a string parameter, so
+  // `undefined` there throws from inside generated glue with no clue
+  // where it came from.
+  if (typeof source.rawText !== 'string' || source.rawText.length === 0) {
+    showError(`"${source.title}" has no text stored — skipping it. Remove and re-add it.`);
+    return false;
+  }
   try {
     const result = await call('upsert-source', {
       id: source.id,
