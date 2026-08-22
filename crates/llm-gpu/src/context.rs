@@ -20,7 +20,7 @@ pub const MAX_GPU_WINDOW: usize = 256;
 /// round trip into the browser's WebGPU implementation — thousands of
 /// them per training step, for a value that never changes.
 pub struct Kernel {
-    pub pipeline: Kernel,
+    pub pipeline: wgpu::ComputePipeline,
     pub layout: wgpu::BindGroupLayout,
 }
 
