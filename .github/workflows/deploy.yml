@@ -8,14 +8,13 @@ name: Build and deploy to GitHub Pages
 #
 # It has to run here rather than in this project's development sandbox,
 # which has no route to crates.io, npmjs.org, or the wasm32 target
-# installer — so this workflow is also the only compiler llm-gpu and
-# wasm-app ever see, which is why every push runs the build job.
+# installer — so this workflow is also the only compiler wasm-app ever
+# sees, which is why every push runs the build job.
 
 on:
   # Every push runs the `build` job (compile + test), regardless of
   # branch - that's the fast CI-compile-check signal for a crate
-  # (llm-gpu/wasm-app) this repo's dev sandbox has no way to build
-  # itself. Actual Pages deployment (the `deploy` job) is additionally
+  # (wasm-app) this repo's dev sandbox has no way to build itself. Actual Pages deployment (the `deploy` job) is additionally
   # gated to dev/main/master only, so a work-in-progress branch gets
   # build validation without deploying to the live site.
   push:
@@ -49,32 +48,22 @@ jobs:
         with:
           workspaces: |
             crates/llm-core
-            crates/llm-gpu
             crates/wasm-app
-            crates/shader-check
 
       - name: Install wasm-pack
         uses: jetli/wasm-pack-action@v0.4.0
         with:
           version: latest
 
-      - name: Test llm-core (the verified CPU reference engine)
-        run: cargo test -p llm-core
-
-      - name: Compile every WGSL shader
-        # llm-gpu embeds its shaders with include_str! and only compiles
-        # them at create_shader_module time — in a browser, on the user's
-        # first click. Nothing in this workflow's Rust build looks at them,
-        # so this step compiles each one with naga (wgpu's own WGSL front
-        # end) to keep shader errors out of the deployed page.
-        run: cargo test --manifest-path crates/shader-check/Cargo.toml
+      - name: Test the engine
+        run: cargo test
 
       - name: Build wasm-app -> frontend/pkg
         # +simd128 is what lets LLVM turn llm-core's dot/axpy inner loops
-        # into real wasm SIMD instead of scalar float ops - a large,
-        # measurable difference for CPU training, which is the default
-        # (and the only) path in browsers without WebGPU. WebAssembly SIMD
-        # has been baseline in Chrome/Edge/Firefox/Safari since 2023.
+        # into real wasm SIMD instead of scalar float ops — a large,
+        # measurable difference to how fast text appears on the page.
+        # WebAssembly SIMD has been baseline in Chrome/Edge/Firefox/Safari
+        # since 2023.
         env:
           RUSTFLAGS: -C target-feature=+simd128
         run: wasm-pack build crates/wasm-app --release --target web --out-dir ../../frontend/pkg
