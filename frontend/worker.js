@@ -187,7 +187,29 @@ async function generate({ prompt, extraContext, temperature, topK, topP, repetit
 /// pause is derived from it, rather than the other way around, so a
 /// single step never gets interrupted — it can't be — and the machine
 /// gets a predictable gap even if one step turns out slow.
-async function train({ batchSize, learningRate, maxSteps, effort }) {
+/// Generate a short sample from the weights as they are right now.
+///
+/// Uses the ordinary generation path, stopped by its own callback once
+/// enough words have arrived — the model is mid-training, so this is
+/// about hearing where it has got to, not producing anything finished.
+/// It runs on the CPU: the GPU copy of the weights is the one uploaded
+/// before training started, and `generate` already declines to use a
+/// stale copy.
+async function trainingSample(prompt, words) {
+  const result = await llm.generate(
+    prompt,
+    '',
+    0.9,
+    40,
+    0.95,
+    1.1,
+    Math.floor(Math.random() * 1e9),
+    (_piece, produced) => produced < words,
+  );
+  return result.text;
+}
+
+async function train({ batchSize, learningRate, maxSteps, effort, sampleEvery, samplePrompt, sampleWords }) {
   stopRequested = false;
   if (learningRate > 0) llm.set_learning_rate(learningRate);
 
@@ -198,6 +220,9 @@ async function train({ batchSize, learningRate, maxSteps, effort }) {
   let tokens = 0;
   let lastPost = 0;
   let smoothedLoss = null;
+  // First sample after the first interval, not immediately: a sample at
+  // step 0 is noise from an untouched model.
+  let nextSampleAt = llm.step() + (sampleEvery || 0);
 
   while (!stopRequested && (maxSteps <= 0 || steps < maxSteps)) {
     const sliceStart = performance.now();
@@ -229,8 +254,33 @@ async function train({ batchSize, learningRate, maxSteps, effort }) {
       }
       if (stopRequested || (maxSteps > 0 && steps >= maxSteps)) break;
     }
-    // ...then hand the machine back.
-    if (pauseMs > 0) await new Promise((resolve) => setTimeout(resolve, pauseMs));
+
+    // Between slices, never inside one: sampling takes as long as it
+    // takes and shouldn't be counted against a slice's time budget.
+    // Keyed on the model's own step count, so the interval means the
+    // same thing across stop/resume.
+    if (sampleEvery > 0 && llm.step() >= nextSampleAt) {
+      nextSampleAt = llm.step() + sampleEvery;
+      try {
+        post('train-sample', {
+          step: llm.step(),
+          loss: smoothedLoss,
+          text: await trainingSample(samplePrompt, sampleWords || 40),
+        });
+      } catch (error) {
+        post('train-sample', {
+          step: llm.step(),
+          loss: smoothedLoss,
+          text: `(sample failed: ${(error && error.message) || error})`,
+        });
+      }
+    }
+
+    // ...then hand the machine back. Always yield, even at full effort
+    // where the pause is zero: this is the only point in the loop where
+    // the worker's message queue gets a turn, so skipping it means a
+    // `stop` message sits unread until training ends on its own.
+    await new Promise((resolve) => setTimeout(resolve, pauseMs));
   }
 
   return {
