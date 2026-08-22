@@ -1,20 +1,19 @@
 // y[rows,out_dim] = x[rows,in_dim] @ w[out_dim,in_dim]^T  (no bias)
-// Direct GPU translation of llm-core's ops::linear_fwd — see that
-// function for the reference this must match.
+// GPU translation of llm_core's ops::linear_fwd.
 //
-// Tiled through workgroup shared memory. The obvious one-thread-per-output
-// version (which this replaces) issued two global loads per multiply and
-// read at least one of its operands with a stride of a whole row, so
-// neighbouring threads never shared a cache line: it ran at a small
-// fraction of the device's memory bandwidth and made a training step tens
-// of times slower than the arithmetic warrants. Here each 16x16 block
-// loads one tile of x and one of w cooperatively — every load contiguous
-// across lanes — then reuses each loaded value 16 times out of shared
-// memory.
+// 64x64 output tile per workgroup, 4x4 outputs per thread, accumulated in
+// registers over 16-deep k-slabs held in workgroup memory.
 //
-// Note the dispatch convention: gid.x indexes out_dim, gid.y indexes rows
-// (so the fastest-varying thread index runs along contiguous memory).
-// model.rs's dispatch_linear must match.
+// The previous version had each thread produce one output. That reloads
+// every operand from shared memory for every single multiply-add: one
+// FMA per two loads, which is memory-bound at a small fraction of the
+// device's arithmetic. Holding a 4x4 block in registers reuses each
+// loaded value four times, an 8x cut in shared-memory traffic for the
+// same arithmetic - and the matmuls are where essentially all of a
+// training step's time goes.
+//
+// Dispatch convention: gid.x covers out_dim in blocks of 64, gid.y covers
+// rows in blocks of 64. model.rs's dispatch_linear must match.
 struct Params {
     rows: u32,
     in_dim: u32,
@@ -27,49 +26,80 @@ struct Params {
 @group(0) @binding(2) var<storage, read> w: array<f32>;
 @group(0) @binding(3) var<storage, read_write> y: array<f32>;
 
-const TILE: u32 = 16u;
+const TILE: u32 = 64u;   // rows and columns per workgroup
+const DEPTH: u32 = 16u;  // k elements per slab
+const PER: u32 = 4u;     // outputs per thread, each dimension
 
-var<workgroup> tile_x: array<f32, 256>; // [row_local][k_local]
-var<workgroup> tile_w: array<f32, 256>; // [out_local][k_local]
+var<workgroup> tile_x: array<f32, 1024>; // [64][16], row-major
+var<workgroup> tile_w: array<f32, 1024>; // [64][16], row-major
 
 @compute @workgroup_size(16, 16, 1)
 fn main(
     @builtin(workgroup_id) wid: vec3<u32>,
     @builtin(local_invocation_id) lid: vec3<u32>,
 ) {
-    let row = wid.y * TILE + lid.y;
-    let col = wid.x * TILE + lid.x;
+    let row_base = wid.y * TILE;
+    let col_base = wid.x * TILE;
+    let tid = lid.y * 16u + lid.x;
 
-    var acc: f32 = 0.0;
-    let num_tiles = (p.in_dim + TILE - 1u) / TILE;
-    for (var k: u32 = 0u; k < num_tiles; k = k + 1u) {
-        let kk = k * TILE + lid.x;
+    var acc: array<f32, 16>; // 4x4 block, [i][j]
+    for (var n: u32 = 0u; n < 16u; n = n + 1u) {
+        acc[n] = 0.0;
+    }
 
-        // Both loads are contiguous across lid.x, the fastest-varying lane.
-        var xv: f32 = 0.0;
-        let x_row = wid.y * TILE + lid.y;
-        if (x_row < p.rows && kk < p.in_dim) {
-            xv = x[x_row * p.in_dim + kk];
+    let slabs = (p.in_dim + DEPTH - 1u) / DEPTH;
+    for (var s: u32 = 0u; s < slabs; s = s + 1u) {
+        let k_base = s * DEPTH;
+        // 256 threads cooperatively load two 64x16 tiles, four elements
+        // each. Consecutive threads read consecutive k, so every load is
+        // coalesced.
+        for (var f: u32 = 0u; f < 4u; f = f + 1u) {
+            let index = tid + f * 256u;
+            let i = index / DEPTH;
+            let k = index % DEPTH;
+
+            var xv: f32 = 0.0;
+            let xr = row_base + i;
+            if (xr < p.rows && k_base + k < p.in_dim) {
+                xv = x[xr * p.in_dim + k_base + k];
+            }
+            tile_x[index] = xv;
+
+            var wv: f32 = 0.0;
+            let wr = col_base + i;
+            if (wr < p.out_dim && k_base + k < p.in_dim) {
+                wv = w[wr * p.in_dim + k_base + k];
+            }
+            tile_w[index] = wv;
         }
-        tile_x[lid.y * TILE + lid.x] = xv;
-
-        var wv: f32 = 0.0;
-        let w_row = wid.x * TILE + lid.y;
-        if (w_row < p.out_dim && kk < p.in_dim) {
-            wv = w[w_row * p.in_dim + kk];
-        }
-        tile_w[lid.y * TILE + lid.x] = wv;
-
-        // Barriers sit in uniform control flow: this kernel never returns
-        // early, it only guards its loads and its final store.
         workgroupBarrier();
-        for (var j: u32 = 0u; j < TILE; j = j + 1u) {
-            acc = acc + tile_x[lid.y * TILE + j] * tile_w[lid.x * TILE + j];
+
+        for (var k: u32 = 0u; k < DEPTH; k = k + 1u) {
+            var a: array<f32, 4>;
+            var b: array<f32, 4>;
+            for (var i: u32 = 0u; i < PER; i = i + 1u) {
+                a[i] = tile_x[(lid.y * PER + i) * DEPTH + k];
+                b[i] = tile_w[(lid.x * PER + i) * DEPTH + k];
+            }
+            for (var i: u32 = 0u; i < PER; i = i + 1u) {
+                for (var j: u32 = 0u; j < PER; j = j + 1u) {
+                    acc[i * PER + j] = acc[i * PER + j] + a[i] * b[j];
+                }
+            }
         }
         workgroupBarrier();
     }
 
-    if (row < p.rows && col < p.out_dim) {
-        y[row * p.out_dim + col] = acc;
+    for (var i: u32 = 0u; i < PER; i = i + 1u) {
+        let row = row_base + lid.y * PER + i;
+        if (row >= p.rows) {
+            continue;
+        }
+        for (var j: u32 = 0u; j < PER; j = j + 1u) {
+            let col = col_base + lid.x * PER + j;
+            if (col < p.out_dim) {
+                y[row * p.out_dim + col] = acc[i * PER + j];
+            }
+        }
     }
 }

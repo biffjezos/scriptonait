@@ -89,6 +89,29 @@ impl Corpus {
         self.dirty = true;
     }
 
+    /// Learn a BPE vocabulary from the sources already loaded, and
+    /// re-encode everything with it.
+    ///
+    /// Without this the tokenizer is byte-level: one token per byte, so a
+    /// 900-word story costs ~4,000 tokens instead of ~900. That is four
+    /// times the work per unit of text, in training and in generation
+    /// alike, and four times less story inside the attention window. The
+    /// merges have to be learned before a model exists, because the
+    /// vocabulary size fixes the model's embedding table.
+    ///
+    /// Returns the resulting vocabulary size, or `None` when there is no
+    /// text to learn from.
+    pub fn learn_vocabulary(&mut self, target_vocab_size: usize) -> Option<usize> {
+        let texts: Vec<&str> = self.order.iter().filter_map(|id| self.cleaned_text.get(id).map(|s| s.as_str())).collect();
+        if texts.is_empty() {
+            return None;
+        }
+        let tokenizer = Tokenizer::train(&texts, target_vocab_size);
+        let size = tokenizer.vocab_size();
+        self.set_tokenizer(tokenizer);
+        Some(size)
+    }
+
     /// Clean, tokenize, and store (or replace) one source's text.
     pub fn upsert(&mut self, id: &str, raw_text: &str, is_html: bool) -> PreparedStats {
         let (cleaned, tokens, stats) = prep::prepare(&self.tokenizer, raw_text, is_html);
@@ -301,6 +324,23 @@ mod tests {
         c.upsert("a", "the quick brown fox jumps over the lazy dog", false);
         c.remove("a");
         assert!(!c.can_sample(4));
+    }
+
+    #[test]
+    fn learning_a_vocabulary_shortens_the_token_stream() {
+        let mut c = Corpus::new();
+        let text = "INT. KITCHEN - DAY\n\nJANE\nWhere were you?\n\nJOHN\nOut.\n".repeat(40);
+        c.upsert("a", &text, false);
+        let before = c.total_tokens();
+        let vocab = c.learn_vocabulary(600).expect("there is text to learn from");
+        assert!(vocab > tokenizer::BASE_VOCAB_SIZE, "no merges were learned");
+        let after = c.total_tokens();
+        assert!(after < before, "expected fewer tokens after BPE, {before} -> {after}");
+    }
+
+    #[test]
+    fn learning_a_vocabulary_needs_text() {
+        assert_eq!(Corpus::new().learn_vocabulary(600), None);
     }
 
     #[test]
