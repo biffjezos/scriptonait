@@ -97,7 +97,7 @@ impl ParamSet {
         Self { slots }
     }
 
-    fn from_weights(ctx: &GpuContext, config: &ModelConfig, weights: &ModelWeights) -> Self {
+    fn from_weights(ctx: &GpuContext, weights: &ModelWeights) -> Self {
         let mut slots = Vec::new();
         let mut push = |label: &str, data: &[f32], decay: bool| {
             slots.push(TensorSlot {
@@ -197,12 +197,18 @@ pub struct GpuTrainer {
     step: i32,
 }
 
-/// What one step did, mirroring `llm_core::train::StepReport`.
+/// What one step did, mirroring `llm_core::train::StepReport`, plus what
+/// it cost to run — the numbers a "why is this slow?" question needs.
 pub struct GpuStepReport {
     pub loss: f32,
     pub lr: f32,
     pub grad_norm: f32,
     pub tokens: usize,
+    /// Compute dispatches issued for this step, and command buffers
+    /// submitted. Both scale with the batch, and together they say
+    /// whether a step is bound by arithmetic or by per-dispatch overhead.
+    pub dispatches: u32,
+    pub submits: u32,
 }
 
 impl GpuTrainer {
@@ -280,7 +286,7 @@ impl GpuTrainer {
 
         Ok(Self {
             config: *config,
-            weights: ParamSet::from_weights(ctx, config, weights),
+            weights: ParamSet::from_weights(ctx, weights),
             grads: ParamSet::zeros(ctx, config, false),
             m: ParamSet::zeros(ctx, config, false),
             v: ParamSet::zeros(ctx, config, false),
@@ -301,6 +307,30 @@ impl GpuTrainer {
 
     pub fn steps_done(&self) -> i32 {
         self.step
+    }
+
+    /// Bytes this trainer holds in GPU memory: four copies of every
+    /// parameter (weights, gradients, both Adam moments), the per-layer
+    /// activation cache, and the scratch. Logged at startup, because on
+    /// an integrated GPU the difference between "fits" and "spills to
+    /// system memory" is the difference between fast and not.
+    pub fn allocated_bytes(&self) -> u64 {
+        let params: usize = self.weights.slots.iter().map(|s| s.len).sum();
+        let c = &self.config;
+        let t = self.t_len;
+        let band = ops::band_width(t, c.effective_window());
+        let per_layer = 6 * t * c.hidden_dim
+            + 2 * t
+            + 2 * t * c.kv_dim()
+            + c.num_heads * t * band
+            + 2 * t * c.ffn_dim();
+        let scratch = 8 * t * c.hidden_dim
+            + 2 * t * c.vocab_size()
+            + 2 * t * c.kv_dim()
+            + c.num_heads * t * band
+            + 4 * t * c.ffn_dim()
+            + 3 * t;
+        ((4 * params + c.num_layers * per_layer + scratch) * std::mem::size_of::<f32>()) as u64
     }
 
     /// One training step over a batch: `inputs`/`targets` are
@@ -330,6 +360,8 @@ impl GpuTrainer {
         }
         let batch_size = inputs.len() / t;
         ctx.params.reset();
+        ctx.dispatch_count.set(0);
+        let mut submits = 0u32;
 
         // Zero the gradient accumulator and the stats slots once per
         // step; every backward kernel that writes a gradient accumulates.
@@ -340,6 +372,7 @@ impl GpuTrainer {
         let stats_len = 1 + self.grads.slots.len();
         self.dispatch_zero(&mut encoder, ctx, &self.scratch.stats, stats_len);
         ctx.queue.submit(Some(encoder.finish()));
+        submits += 1;
 
         for b in 0..batch_size {
             let seq = &inputs[b * t..(b + 1) * t];
@@ -352,6 +385,7 @@ impl GpuTrainer {
             self.encode_loss(&mut encoder, ctx);
             self.encode_backward(&mut encoder, ctx);
             ctx.queue.submit(Some(encoder.finish()));
+            submits += 1;
         }
 
         // Gradient norm: each tensor's sum of squares into its own stats
@@ -362,6 +396,7 @@ impl GpuTrainer {
             self.dispatch_reduce(&mut encoder, ctx, &slot.buffer, slot.len, 1 + i, true);
         }
         ctx.queue.submit(Some(encoder.finish()));
+        submits += 1;
         let stats = buffers::read_f32(&ctx.device, &ctx.queue, &self.scratch.stats, stats_len).await?;
 
         let inv_batch = 1.0 / batch_size as f32;
@@ -421,8 +456,16 @@ impl GpuTrainer {
             );
         }
         ctx.queue.submit(Some(encoder.finish()));
+        submits += 1;
 
-        Ok(GpuStepReport { loss, lr, grad_norm, tokens: batch_size * t })
+        Ok(GpuStepReport {
+            loss,
+            lr,
+            grad_norm,
+            tokens: batch_size * t,
+            dispatches: ctx.dispatch_count.get(),
+            submits,
+        })
     }
 
     /// Copy the trained weights back into a CPU-side `ModelWeights` —

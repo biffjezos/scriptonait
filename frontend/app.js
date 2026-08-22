@@ -269,10 +269,37 @@ async function syncAllSources() {
   }
 }
 
+/// The shape fields describe the model that exists, once one does.
+///
+/// They start at the defaults a new model would be built with, and until
+/// this ran they kept showing those defaults next to a loaded model with
+/// an entirely different shape — four layers on screen, eight in the
+/// model. With a model loaded the shape is fixed, so the fields state it
+/// and stop being editable.
+function renderModelShape(info) {
+  const fields = [
+    ['cfg-layers', info && info.layers],
+    ['cfg-hidden', info && info.hidden],
+    ['cfg-heads', info && info.heads],
+    ['cfg-kv-heads', info && info.kvHeads],
+    ['cfg-context', info && info.contextLen],
+    ['cfg-window', info && info.window],
+  ];
+  for (const [id, value] of fields) {
+    const field = $(id);
+    if (info) field.value = value;
+    field.disabled = Boolean(info);
+  }
+  $('shape-hint').textContent = info
+    ? "This model's shape. Fixed — training continues the model you have."
+    : 'New model shape:';
+}
+
 function renderModel(info) {
   model = info;
   $('generate-btn').disabled = !info;
   $('train-btn').disabled = !info;
+  renderModelShape(info);
   if (!info) return;
 
   const params = formatCount(info.params);
@@ -350,13 +377,30 @@ function escapeHtml(text) {
 
 let targetWords = 0;
 
-onStream('gpu-status', ({ available, device, reason }) => {
-  // Logged rather than shown: someone debugging why generation is slow
-  // wants the reason, and everyone else has it in the status line.
-  if (available) {
-    console.info(`scriptonait: generating on ${device}`);
+// The worker's log, mirrored into the page's console so both are in one
+// place: which device was acquired, what each training step cost, and
+// why a run refused to start.
+onStream('log', ({ message, data }) => {
+  if (data === null || data === undefined) {
+    console.info(`[scriptonait] ${message}`);
   } else {
-    console.info(`scriptonait: no WebGPU (${reason || 'unavailable'}), generating on the CPU`);
+    console.info(`[scriptonait] ${message}`, data);
+  }
+});
+
+onStream('gpu-status', ({ available, device, reason, report }) => {
+  if (available) {
+    console.info(`[scriptonait] device: ${device}`, report || {});
+    if (report && report.isSoftware) {
+      console.warn(
+        '[scriptonait] this is a software renderer, not your GPU — training will be slow',
+      );
+    }
+  } else {
+    console.warn(
+      `[scriptonait] no WebGPU (${reason || 'unavailable'}): generation runs on the CPU, ` +
+        'and training cannot run at all',
+    );
   }
 });
 
@@ -805,9 +849,10 @@ const lossHistory = [];
 
 onStream('train-progress', (progress) => {
   setProgress('train-progress-bar', progress.fractionDone);
+  const on = model && model.device ? ` · on ${model.device}` : '';
   $('train-stats').textContent =
     `step ${progress.step.toLocaleString()} · loss ${progress.smoothedLoss.toFixed(3)} · ` +
-    `${progress.tokensPerSecond.toFixed(0)} tokens/s · ${formatDuration(progress.elapsedSeconds)} elapsed`;
+    `${progress.tokensPerSecond.toFixed(0)} tokens/s · ${formatDuration(progress.elapsedSeconds)} elapsed${on}`;
   setTitleProgress('Fine-tuning', progress.fractionDone);
   lossHistory.push(progress.smoothedLoss);
   drawLossChart();
