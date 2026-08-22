@@ -259,6 +259,7 @@ async function downloadModel(url) {
   return bytes;
 }
 
+/// Download the shipped checkpoint. Only ever called from a click.
 async function loadModel() {
   try {
     const bytes = await downloadModel(MODEL_URL);
@@ -408,6 +409,12 @@ $('generate-btn').addEventListener('click', async () => {
 
 $('stop-btn').addEventListener('click', () => call('stop'));
 
+$('load-model-btn').addEventListener('click', async () => {
+  $('load-model-btn').disabled = true;
+  await loadModel();
+  $('load-model-btn').disabled = false;
+});
+
 function renderNotes(notes) {
   const box = $('qa-notes');
   if (!notes || notes.length === 0) {
@@ -425,21 +432,71 @@ function renderNotes(notes) {
 }
 
 // --- Sources -----------------------------------------------------------
+//
+// The list you see is this array. Not the database.
+//
+// It used to be the database, and that was the bug: every add did a
+// write, then a read, then a re-render, so anything that made IndexedDB
+// slow, blocked or unavailable — another tab holding an old connection,
+// a private window, storage pressure — froze the whole batch on the
+// first file. Thirty files went in, one appeared, and a reload was the
+// only way to find out what had actually been stored.
+//
+// Now: read the file, put it in this array, draw it. Persisting it and
+// handing it to the model are both things that happen afterwards and are
+// both allowed to fail without you losing sight of your own files.
 
-/// Render the source list from IndexedDB.
+let sources = [];
+
+/// Persistence, entirely best-effort.
 ///
-/// From the database, not from the model — that distinction is the whole
-/// bug fix here. Adding a source used to mean: write it to IndexedDB,
-/// then await the worker, then re-render. With no model loaded (or a
-/// worker that never answered) the await never returned, so the loop
-/// stopped on the first file, the list never re-rendered, and the only
-/// way to see what had actually been saved was to reload the page.
-/// Uploading thirty files added thirty database rows and displayed one.
-///
-/// Your material belongs to you and to the database. Handing it to the
-/// model is a separate, best-effort step.
-async function refreshSources() {
-  const sources = await db.listSources();
+/// Every call is time-boxed, because the failure that matters here isn't
+/// an error — it's a promise that never settles. The first time one does
+/// that, persistence switches off for the session and the page says so
+/// once, rather than hanging on every subsequent file.
+let persistenceWorks = true;
+const DB_TIMEOUT_MS = 4000;
+
+/// Writes are chained rather than awaited by the caller, so a slow or
+/// dead IndexedDB can never hold up the next file. This is the whole
+/// reason thirty files used to show up as one: each add waited on its
+/// own write, and a write that hangs for four seconds thirty times over
+/// is two minutes of an apparently frozen page.
+let persistChain = Promise.resolve();
+
+function persistLater(what, action) {
+  persistChain = persistChain.then(() => persist(what, action));
+  return persistChain;
+}
+
+async function persist(what, action) {
+  if (!persistenceWorks) return null;
+  try {
+    return await Promise.race([
+      action(),
+      new Promise((_, reject) =>
+        setTimeout(() => reject(new Error(`${what} timed out`)), DB_TIMEOUT_MS),
+      ),
+    ]);
+  } catch (error) {
+    persistenceWorks = false;
+    showError(
+      `Couldn't save to this browser's storage (${error.message}). Your files are ` +
+        'loaded and usable, but they won\'t still be here after a reload.',
+    );
+    return null;
+  }
+}
+
+function newSourceId() {
+  return crypto.randomUUID
+    ? crypto.randomUUID()
+    : `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+}
+
+/// Draw the list from memory. Synchronous on purpose: nothing it needs
+/// can be slow, so nothing can stop it running.
+function renderSources() {
   const list = $('sources-list');
   if (sources.length === 0) {
     list.innerHTML = '<p class="empty-hint">Nothing added yet.</p>';
@@ -458,46 +515,64 @@ async function refreshSources() {
       )
       .join('');
     for (const button of list.querySelectorAll('.remove-source')) {
-      button.addEventListener('click', async () => {
-        await db.deleteSource(button.dataset.id);
-        await refreshSources();
-        try {
-          renderModel(await call('remove-source', { id: button.dataset.id }));
-          await refreshStoryState();
-        } catch (error) {
-          /* no model: it was only ever in the database anyway */
-        }
-      });
+      button.addEventListener('click', () => removeSource(button.dataset.id));
     }
   }
   $('train-btn').disabled = !model || sources.length === 0;
   updateSourceSummary(sources);
 }
 
-/// Say how much material is stored, and whether the model has seen it.
-function updateSourceSummary(sources, note = '') {
-  const stats = $('corpus-stats');
-  if (sources.length === 0) {
-    stats.textContent = note || 'No sources added yet.';
-    return;
+async function removeSource(id) {
+  sources = sources.filter((source) => source.id !== id);
+  renderSources();
+  await persist('deleting a source', () => db.deleteSource(id));
+  try {
+    renderModel(await call('remove-source', { id }));
+    await refreshStoryState();
+  } catch (error) {
+    /* no model loaded: it was only ever in the list */
   }
-  const chars = sources.reduce((sum, s) => sum + (s.rawText || '').length, 0);
-  const seen = model ? '' : ' — no model loaded yet, so nothing is using them';
-  stats.textContent =
-    `${sources.length} source${sources.length === 1 ? '' : 's'}, ` +
-    `${formatCount(chars)} characters${seen}${note ? ` · ${note}` : ''}`;
 }
 
-/// Hand one stored source to the model. Best effort: with no model
-/// loaded this is expected to fail, and failing here must not stop
-/// anything.
+/// Load whatever was stored in a previous session and merge it in.
+///
+/// Merge, not replace. This read is slow — it waits on IndexedDB opening
+/// — and files can be added while it's still in flight. Assigning its
+/// result would then delete them, which is a race that looks exactly
+/// like "I added thirty files and they vanished, and a reload brought
+/// some back". Anything already in the list wins; stored records only
+/// fill in what isn't there.
+async function refreshSources() {
+  const stored = await persist('reading saved sources', () => db.listSources());
+  if (Array.isArray(stored)) {
+    const have = new Set(sources.map((source) => source.id));
+    const restored = stored.filter(
+      (source) => typeof source.rawText === 'string' && !have.has(source.id),
+    );
+    sources = [...restored, ...sources];
+  }
+  renderSources();
+}
+
+/// Say how much material is loaded, and whether the model has seen it.
+function updateSourceSummary(list, note = '') {
+  const stats = $('corpus-stats');
+  if (!list || list.length === 0) {
+    stats.textContent = note || 'Nothing added yet.';
+    return;
+  }
+  const chars = list.reduce((sum, s) => sum + (s.rawText || '').length, 0);
+  const seen = model ? '' : ' — no model loaded, so nothing is using them yet';
+  const saved = persistenceWorks ? '' : ' · not saved (storage unavailable)';
+  stats.textContent =
+    `${list.length} source${list.length === 1 ? '' : 's'}, ` +
+    `${formatCount(chars)} characters${seen}${saved}${note ? ` · ${note}` : ''}`;
+}
+
+/// Hand one source to the model. Best effort: with no model loaded this
+/// is expected to fail, and failing must not stop anything.
 async function syncSource(source) {
-  // A record with no text can't be handed to the model: wasm-bindgen
-  // reads `.length` off whatever it gets for a string parameter, so
-  // `undefined` there throws from inside generated glue with no clue
-  // where it came from.
   if (typeof source.rawText !== 'string' || source.rawText.length === 0) {
-    showError(`"${source.title}" has no text stored — skipping it. Remove and re-add it.`);
     return false;
   }
   try {
@@ -513,47 +588,64 @@ async function syncSource(source) {
   }
 }
 
-/// Add sources one at a time, reporting progress and surviving
-/// individual failures.
+/// Add sources one at a time: read it, show it, then try to save it and
+/// try to give it to the model. Each entry is `{ title, kind, read() }`.
 ///
-/// Each entry is a `{ title, kind, read() }`, where `read()` returns the
-/// text. Reading is deferred into this loop on purpose: with thirty
-/// files, reading all thirty before storing any means the list stays
-/// empty for the whole batch, and one unreadable file loses the lot.
-/// Here each file is read, stored, and *rendered* before the next one
-/// starts, so thirty files look like thirty files arriving.
+/// The order matters. Reading and displaying come first and depend on
+/// nothing; storage and the model come after and are both allowed to
+/// fail. One unreadable file is reported by name and the rest continue.
 async function addSources(entries) {
   clearError();
   const failures = [];
+  const syncing = [];
   let added = 0;
+
   for (const [index, entry] of entries.entries()) {
-    const progress = entries.length > 1 ? `adding ${index + 1} of ${entries.length}…` : 'adding…';
-    updateSourceSummary(await db.listSources(), progress);
-    try {
-      const rawText = await entry.read();
-      const record = await db.addSource({
-        title: entry.title,
-        kind: entry.kind,
-        rawText,
-        sourceUrl: entry.sourceUrl || null,
-      });
-      added += 1;
-      await refreshSources();
-      await syncSource(record);
-    } catch (error) {
-      failures.push(`${entry.title}: ${error.message}`);
+    if (entries.length > 1) {
+      updateSourceSummary(sources, `reading ${index + 1} of ${entries.length}…`);
     }
+    let rawText;
+    try {
+      rawText = await entry.read();
+    } catch (error) {
+      failures.push(`${entry.title} (${error.message})`);
+      continue;
+    }
+    if (typeof rawText !== 'string' || rawText.length === 0) {
+      failures.push(`${entry.title} (empty)`);
+      continue;
+    }
+
+    const source = {
+      id: newSourceId(),
+      title: entry.title,
+      kind: entry.kind,
+      rawText,
+      sourceUrl: entry.sourceUrl || null,
+      createdAt: Date.now(),
+    };
+    sources.push(source);
+    added += 1;
+    // Drawn immediately, and nothing below is awaited: the next file
+    // starts reading straight away. Saving and handing it to the model
+    // both catch up on their own.
+    renderSources();
+    persistLater('saving a source', () => db.putSource(source));
+    syncing.push(syncSource(source));
   }
-  await refreshSources();
+
+  // Only now, once every file is on screen, wait for the model to have
+  // caught up — and only for that, never for storage.
+  await Promise.allSettled(syncing);
+  renderSources();
   await refreshStoryState();
   if (failures.length) {
     showError(
-      failures.length === 1
-        ? `couldn't add ${failures[0]}`
-        : `${failures.length} of ${entries.length} couldn't be added — first was ${failures[0]}`,
+      `${failures.length} of ${entries.length} couldn't be added: ${failures.slice(0, 3).join(', ')}` +
+        (failures.length > 3 ? ', …' : ''),
     );
   }
-  updateSourceSummary(await db.listSources(), added ? `added ${added} just now` : '');
+  updateSourceSummary(sources, added ? `added ${added}` : '');
 }
 
 async function refreshStoryState() {
@@ -730,11 +822,11 @@ $('create-model-btn').addEventListener('click', async () => {
         seed: Math.floor(Math.random() * 1e9),
       }),
     );
-    // A fresh model has an empty corpus; re-feed whatever is stored.
-    for (const source of await db.listSources()) {
-      await call('upsert-source', { id: source.id, text: source.rawText, isHtml: source.kind === 'url' });
+    // A fresh model has an empty corpus; re-feed what's loaded.
+    for (const source of sources) {
+      await syncSource(source);
     }
-    await refreshSources();
+    renderSources();
     await refreshStoryState();
   } catch (error) {
     showError(error.message);
@@ -745,20 +837,14 @@ $('create-model-btn').addEventListener('click', async () => {
 // --- Start -------------------------------------------------------------
 
 (async function start() {
-  // Sources render before anything touches the model, so the page is
-  // useful (and visibly alive) even if the model never arrives.
+  // Nothing is fetched here. The page loads, shows what you already
+  // have, and waits. Downloading an 18 MB file because a page opened is
+  // not a thing this should do to you.
   await refreshSources();
-  await loadModel();
-  if (model) {
-    for (const source of await db.listSources()) {
-      await syncSource(source);
-    }
-    try {
-      renderModel(await call('model-info'));
-    } catch (error) {
-      /* the banner already says what went wrong */
-    }
-    await refreshStoryState();
-  }
-  updateSourceSummary(await db.listSources());
+  setModelStatus(
+    'absent',
+    'No model loaded. Use "Load the writing model" below to download the ' +
+      'one built from public-domain books, or load a model file you already have.',
+  );
+  updateSourceSummary(sources);
 })();
