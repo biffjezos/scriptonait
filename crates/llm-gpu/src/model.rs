@@ -83,6 +83,7 @@ pub(crate) fn dispatch(
     entries: &[wgpu::BindGroupEntry],
     workgroups: (u32, u32, u32),
 ) {
+    ctx.dispatch_count.set(ctx.dispatch_count.get() + 1);
     let bind_group = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: None,
         layout: &kernel.layout,

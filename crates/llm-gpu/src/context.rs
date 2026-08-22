@@ -101,6 +101,11 @@ impl ParamsPool {
 pub struct GpuContext {
     pub device: wgpu::Device,
     pub queue: wgpu::Queue,
+    /// Every compute dispatch issued through `model::dispatch`, counted
+    /// so a step can report how many it took. Per-dispatch overhead is
+    /// real on the web (each one is a call into the browser), and this
+    /// is the number that says whether it dominates.
+    pub dispatch_count: Cell<u32>,
     pub pipelines: Pipelines,
     pub params: ParamsPool,
     /// What the browser actually gave us. Reported to the UI because
@@ -110,6 +115,18 @@ pub struct GpuContext {
     /// True when the adapter is a CPU/software implementation (SwiftShader,
     /// WARP, lavapipe) rather than real hardware.
     pub is_software: bool,
+    /// The adapter's own fields, kept separate from the summary string so
+    /// the page can log them individually — "is this actually my GPU?"
+    /// is the first question a slow training run raises.
+    pub adapter_name: String,
+    pub backend: String,
+    pub device_type: String,
+    /// Limits that decide how big a dispatch can be, logged because a
+    /// browser quietly capping one of them changes what the kernels can
+    /// do.
+    pub max_workgroups_per_dimension: u32,
+    pub max_storage_buffer_binding_size: u32,
+    pub max_buffer_size: u64,
 }
 
 fn make_pipeline(device: &wgpu::Device, label: &str, source: &str) -> Kernel {
@@ -251,6 +268,7 @@ impl GpuContext {
         };
 
         let info = adapter.get_info();
+        let limits = device.limits();
         let is_software = info.device_type == wgpu::DeviceType::Cpu;
         let adapter_summary = format!(
             "{} ({:?}, {:?}){}",
@@ -260,6 +278,20 @@ impl GpuContext {
             if is_software { " — SOFTWARE renderer, not a real GPU" } else { "" }
         );
 
-        Ok(Self { device, queue, pipelines, params: ParamsPool::new(), adapter_summary, is_software })
+        Ok(Self {
+            adapter_name: info.name.clone(),
+            backend: format!("{:?}", info.backend),
+            device_type: format!("{:?}", info.device_type),
+            max_workgroups_per_dimension: limits.max_compute_workgroups_per_dimension,
+            max_storage_buffer_binding_size: limits.max_storage_buffer_binding_size,
+            max_buffer_size: limits.max_buffer_size,
+            device,
+            queue,
+            dispatch_count: Cell::new(0),
+            pipelines,
+            params: ParamsPool::new(),
+            adapter_summary,
+            is_software,
+        })
     }
 }

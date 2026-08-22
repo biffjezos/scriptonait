@@ -167,7 +167,7 @@ impl GenerationResult {
     }
 }
 
-/// One fine-tuning step's numbers.
+/// One training step's numbers, including what it cost to run.
 #[wasm_bindgen]
 pub struct StepReport {
     pub loss: f32,
@@ -175,6 +175,9 @@ pub struct StepReport {
     pub grad_norm: f32,
     pub tokens: u32,
     pub step: f64,
+    /// Compute dispatches and command-buffer submissions this step made.
+    pub dispatches: u32,
+    pub submits: u32,
 }
 
 fn stop_reason_label(reason: StopReason) -> &'static str {
@@ -337,6 +340,41 @@ impl WasmLLM {
             is_software,
         });
         Ok(summary)
+    }
+
+    /// Everything known about the device, as JSON, for the page to log.
+    /// This is the answer to "is it actually using my GPU?" — including
+    /// the case that matters most, a software adapter that reports itself
+    /// as WebGPU and runs at CPU speed.
+    pub fn gpu_report(&self) -> String {
+        let inner = self.0.borrow();
+        let Some(gpu) = inner.gpu.as_ref() else {
+            return "{\"available\":false}".to_string();
+        };
+        let ctx = &gpu.ctx;
+        let training_bytes = gpu.trainer.as_ref().map(|t| t.allocated_bytes()).unwrap_or(0);
+        format!(
+            "{{\"available\":true,\"adapter\":{:?},\"backend\":{:?},\"deviceType\":{:?},\
+             \"isSoftware\":{},\"maxWorkgroupsPerDimension\":{},\
+             \"maxStorageBufferBindingSize\":{},\"maxBufferSize\":{},\
+             \"trainingStateBytes\":{},\"trainerReady\":{}}}",
+            ctx.adapter_name,
+            ctx.backend,
+            ctx.device_type,
+            ctx.is_software,
+            ctx.max_workgroups_per_dimension,
+            ctx.max_storage_buffer_binding_size,
+            ctx.max_buffer_size,
+            training_bytes,
+            gpu.trainer.is_some(),
+        )
+    }
+
+    /// True when the browser handed us a software rasterizer rather than
+    /// real hardware — which trains at CPU speed and is worth saying out
+    /// loud rather than leaving someone to wonder.
+    pub fn gpu_is_software(&self) -> bool {
+        self.0.borrow().gpu.as_ref().is_some_and(|gpu| gpu.is_software)
     }
 
     /// What generation will actually run on: a device description, or
@@ -703,6 +741,8 @@ impl WasmLLM {
             grad_norm: report.grad_norm,
             tokens: report.tokens as u32,
             step: inner.step as f64,
+            dispatches: report.dispatches,
+            submits: report.submits,
         }))
     }
 

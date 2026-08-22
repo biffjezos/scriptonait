@@ -377,13 +377,30 @@ function escapeHtml(text) {
 
 let targetWords = 0;
 
-onStream('gpu-status', ({ available, device, reason }) => {
-  // Logged rather than shown: someone debugging why generation is slow
-  // wants the reason, and everyone else has it in the status line.
-  if (available) {
-    console.info(`scriptonait: generating on ${device}`);
+// The worker's log, mirrored into the page's console so both are in one
+// place: which device was acquired, what each training step cost, and
+// why a run refused to start.
+onStream('log', ({ message, data }) => {
+  if (data === null || data === undefined) {
+    console.info(`[scriptonait] ${message}`);
   } else {
-    console.info(`scriptonait: no WebGPU (${reason || 'unavailable'}), generating on the CPU`);
+    console.info(`[scriptonait] ${message}`, data);
+  }
+});
+
+onStream('gpu-status', ({ available, device, reason, report }) => {
+  if (available) {
+    console.info(`[scriptonait] device: ${device}`, report || {});
+    if (report && report.isSoftware) {
+      console.warn(
+        '[scriptonait] this is a software renderer, not your GPU — training will be slow',
+      );
+    }
+  } else {
+    console.warn(
+      `[scriptonait] no WebGPU (${reason || 'unavailable'}): generation runs on the CPU, ` +
+        'and training cannot run at all',
+    );
   }
 });
 
@@ -832,9 +849,10 @@ const lossHistory = [];
 
 onStream('train-progress', (progress) => {
   setProgress('train-progress-bar', progress.fractionDone);
+  const on = model && model.device ? ` · on ${model.device}` : '';
   $('train-stats').textContent =
     `step ${progress.step.toLocaleString()} · loss ${progress.smoothedLoss.toFixed(3)} · ` +
-    `${progress.tokensPerSecond.toFixed(0)} tokens/s · ${formatDuration(progress.elapsedSeconds)} elapsed`;
+    `${progress.tokensPerSecond.toFixed(0)} tokens/s · ${formatDuration(progress.elapsedSeconds)} elapsed${on}`;
   setTitleProgress('Fine-tuning', progress.fractionDone);
   lossHistory.push(progress.smoothedLoss);
   drawLossChart();

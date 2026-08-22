@@ -89,17 +89,38 @@ async function loadModelBytes(bytes) {
 /// device the page can still generate (on the CPU) but cannot train.
 /// A failure is reported rather than thrown, so the page can say which
 /// of the two it is looking at.
+/// Verbose logging, on by default: this page's whole performance story
+/// is "which device ran it, and how long did a step take", and that has
+/// to be readable in the console rather than inferred from a progress
+/// bar. Logs go to the worker's console and are mirrored to the page's.
+function log(message, data) {
+  if (data === undefined) {
+    console.log(`[scriptonait] ${message}`);
+  } else {
+    console.log(`[scriptonait] ${message}`, data);
+  }
+  post('log', { message, data: data === undefined ? null : data });
+}
+
 async function initGpu() {
   if (!llm) return;
+  const startedAt = performance.now();
   try {
     const summary = await llm.init_gpu();
-    post('gpu-status', { available: true, device: summary });
+    const report = JSON.parse(llm.gpu_report());
+    log(`WebGPU device acquired in ${(performance.now() - startedAt).toFixed(0)} ms`, report);
+    if (report.isSoftware) {
+      log(
+        'WARNING: this is a SOFTWARE renderer, not your GPU. Training will run at ' +
+          'roughly CPU speed. Check chrome://gpu (or your browser\'s equivalent) for why ' +
+          'hardware acceleration is off.',
+      );
+    }
+    post('gpu-status', { available: true, device: summary, report });
   } catch (error) {
-    post('gpu-status', {
-      available: false,
-      device: 'CPU',
-      reason: (error && error.message) || String(error),
-    });
+    const reason = (error && error.message) || String(error);
+    log(`no WebGPU device: ${reason}. Generation will run on the CPU; training cannot run.`);
+    post('gpu-status', { available: false, device: 'CPU', reason });
   }
 }
 
@@ -213,6 +234,19 @@ async function train({ batchSize, learningRate, maxSteps, effort, sampleEvery, s
   stopRequested = false;
   if (learningRate > 0) llm.set_learning_rate(learningRate);
 
+  const info = llm.info();
+  log('training run starting', {
+    device: llm.device_summary(),
+    softwareRenderer: llm.gpu_is_software(),
+    batchSize,
+    contextLen: info.context_len,
+    tokensPerStep: batchSize * info.context_len,
+    maxSteps: maxSteps || 'until stopped',
+    effort,
+    learningRate: learningRate > 0 ? learningRate : 'automatic',
+    params: info.params,
+  });
+
   const sliceMs = 120;
   const pauseMs = Math.max(0, Math.round(sliceMs * (1 - effort) / Math.max(effort, 0.05)));
   const startedAt = performance.now();
@@ -228,13 +262,32 @@ async function train({ batchSize, learningRate, maxSteps, effort, sampleEvery, s
     const sliceStart = performance.now();
     // Work for a slice...
     while (performance.now() - sliceStart < sliceMs) {
+      const stepStart = performance.now();
       const report = await llm.train_step(batchSize);
       if (!report) {
         return { steps, stopReason: 'no-data', elapsedSeconds: (performance.now() - startedAt) / 1000 };
       }
+      const stepMs = performance.now() - stepStart;
       steps += 1;
       tokens += report.tokens;
       smoothedLoss = smoothedLoss === null ? report.loss : smoothedLoss * 0.9 + report.loss * 0.1;
+
+      // The first step pays for allocating every training buffer on the
+      // device, so it is logged on its own rather than averaged in.
+      if (steps === 1) {
+        log(`first step ${stepMs.toFixed(0)} ms (includes allocating GPU training state)`,
+          JSON.parse(llm.gpu_report()));
+      }
+      if (steps <= 5 || steps % 25 === 0) {
+        log(
+          `step ${report.step.toLocaleString()}: ${stepMs.toFixed(1)} ms, ` +
+            `${(report.tokens / (stepMs / 1000)).toFixed(0)} tok/s, ` +
+            `loss ${report.loss.toFixed(4)}, |grad| ${report.grad_norm.toFixed(3)}, ` +
+            `lr ${report.lr.toExponential(2)}, ` +
+            `${report.dispatches} dispatches in ${report.submits} submits ` +
+            `(${(stepMs * 1000 / Math.max(report.dispatches, 1)).toFixed(1)} us each)`,
+        );
+      }
 
       const now = performance.now();
       if (now - lastPost >= PROGRESS_INTERVAL_MS) {
@@ -261,13 +314,16 @@ async function train({ batchSize, learningRate, maxSteps, effort, sampleEvery, s
     // same thing across stop/resume.
     if (sampleEvery > 0 && llm.step() >= nextSampleAt) {
       nextSampleAt = llm.step() + sampleEvery;
+      const sampleStart = performance.now();
       try {
         post('train-sample', {
           step: llm.step(),
           loss: smoothedLoss,
           text: await trainingSample(samplePrompt, sampleWords || 40),
         });
+        log(`sample generated in ${(performance.now() - sampleStart).toFixed(0)} ms`);
       } catch (error) {
+        log(`sample failed: ${(error && error.message) || error}`);
         post('train-sample', {
           step: llm.step(),
           loss: smoothedLoss,
@@ -283,11 +339,19 @@ async function train({ batchSize, learningRate, maxSteps, effort, sampleEvery, s
     await new Promise((resolve) => setTimeout(resolve, pauseMs));
   }
 
+  const elapsedSeconds = (performance.now() - startedAt) / 1000;
+  log(
+    `training run finished: ${steps} steps in ${elapsedSeconds.toFixed(1)} s ` +
+      `(${(tokens / Math.max(elapsedSeconds, 1e-6)).toFixed(0)} tok/s overall, ` +
+      `${((elapsedSeconds * 1000) / Math.max(steps, 1)).toFixed(0)} ms/step), ` +
+      `loss ${smoothedLoss === null ? '—' : smoothedLoss.toFixed(4)}, ` +
+      `reason ${stopRequested ? 'stopped' : 'done'}`,
+  );
   return {
     steps,
     loss: smoothedLoss,
     stopReason: stopRequested ? 'stopped' : 'done',
-    elapsedSeconds: (performance.now() - startedAt) / 1000,
+    elapsedSeconds,
   };
 }
 
@@ -383,9 +447,11 @@ const handlers = {
     // Training is GPU work. Without a device there is nothing to fall
     // back to, so say which of the two reasons stopped it.
     if (!llm.has_gpu()) {
+      log('cannot train: no WebGPU device. Training has no CPU path.');
       return { steps: 0, stopReason: 'no-gpu', elapsedSeconds: 0 };
     }
     if (!llm.can_train()) {
+      log('cannot train: not enough source text to fill one context window.');
       return { steps: 0, stopReason: 'no-data', elapsedSeconds: 0 };
     }
     const result = await train(payload);
