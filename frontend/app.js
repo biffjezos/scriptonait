@@ -269,10 +269,37 @@ async function syncAllSources() {
   }
 }
 
+/// The shape fields describe the model that exists, once one does.
+///
+/// They start at the defaults a new model would be built with, and until
+/// this ran they kept showing those defaults next to a loaded model with
+/// an entirely different shape — four layers on screen, eight in the
+/// model. With a model loaded the shape is fixed, so the fields state it
+/// and stop being editable.
+function renderModelShape(info) {
+  const fields = [
+    ['cfg-layers', info && info.layers],
+    ['cfg-hidden', info && info.hidden],
+    ['cfg-heads', info && info.heads],
+    ['cfg-kv-heads', info && info.kvHeads],
+    ['cfg-context', info && info.contextLen],
+    ['cfg-window', info && info.window],
+  ];
+  for (const [id, value] of fields) {
+    const field = $(id);
+    if (info) field.value = value;
+    field.disabled = Boolean(info);
+  }
+  $('shape-hint').textContent = info
+    ? "This model's shape. Fixed — training continues the model you have."
+    : 'New model shape:';
+}
+
 function renderModel(info) {
   model = info;
   $('generate-btn').disabled = !info;
   $('train-btn').disabled = !info;
+  renderModelShape(info);
   if (!info) return;
 
   const params = formatCount(info.params);
