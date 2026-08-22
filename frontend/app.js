@@ -184,11 +184,14 @@ function renderModel(info) {
   if (!info) return;
 
   const params = formatCount(info.params);
+  // The device is stated, never chosen. It's a fact about the machine,
+  // and the first question anyone asks about speed.
+  const where = info.usingGpu ? `running on ${info.device}` : 'running on the CPU (no WebGPU here)';
   setModelStatus(
     'ready',
     info.pretrained
-      ? `Ready — ${params} parameters, trained for ${formatCount(info.step)} steps.`
-      : `Untrained model created (${params} parameters). It will write nonsense until you fine-tune it.`,
+      ? `Ready — ${params} parameters, trained for ${formatCount(info.step)} steps, ${where}.`
+      : `Untrained model created (${params} parameters), ${where}. It will write nonsense until you fine-tune it.`,
   );
   $('model-details').innerHTML = `
     <dl>
@@ -199,6 +202,7 @@ function renderModel(info) {
       <div><dt>Context</dt><dd>${info.contextLen} tokens, ${info.window}-token attention window</dd></div>
       <div><dt>Vocabulary</dt><dd>${info.vocabSize} tokens</dd></div>
       <div><dt>Training steps</dt><dd>${formatCount(info.step)}</dd></div>
+      <div><dt>Generating on</dt><dd>${escapeHtml(info.device || 'CPU')}</dd></div>
     </dl>`;
   $('corpus-stats').textContent = info.sources
     ? `${info.sources} source${info.sources === 1 ? '' : 's'}, ${formatCount(info.corpusTokens)} tokens`
@@ -302,6 +306,16 @@ function escapeHtml(text) {
 // --- Generating --------------------------------------------------------
 
 let targetWords = 0;
+
+onStream('gpu-status', ({ available, device, reason }) => {
+  // Logged rather than shown: someone debugging why generation is slow
+  // wants the reason, and everyone else has it in the status line.
+  if (available) {
+    console.info(`scriptonait: generating on ${device}`);
+  } else {
+    console.info(`scriptonait: no WebGPU (${reason || 'unavailable'}), generating on the CPU`);
+  }
+});
 
 onStream('generate-piece', ({ piece }) => {
   const output = $('output');

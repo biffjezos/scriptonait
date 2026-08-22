@@ -305,6 +305,61 @@ fn strip_instruction_verbs(text: &str) -> String {
     words[start..].join(" ")
 }
 
+/// Tracks how much has been written and decides when to stop.
+///
+/// Extracted so the CPU and WebGPU generation paths share one copy of
+/// the rule rather than two that can drift. The rule: run to the target
+/// word count, then keep going only until the next sentence or paragraph
+/// boundary so the piece ends on a finished sentence, with a hard
+/// ceiling 40% over in case the model never produces one.
+pub struct LengthGuard {
+    target: Option<usize>,
+    words: usize,
+    /// Whether the previous piece ended mid-word, so the next one
+    /// continues it rather than starting a new word.
+    carry: bool,
+    stopped_by_length: bool,
+}
+
+impl LengthGuard {
+    pub fn new(target: Option<usize>) -> Self {
+        Self { target, words: 0, carry: false, stopped_by_length: false }
+    }
+
+    /// Token budget to give the generator: enough to reach the target
+    /// with room to find a boundary, and never unbounded.
+    pub fn token_budget(&self) -> usize {
+        let words = self.target.unwrap_or(600);
+        ((words as f32 * TOKENS_PER_WORD * 1.6) as usize).clamp(32, 8192)
+    }
+
+    /// Account for a newly generated piece. Returns false when the
+    /// generation should stop.
+    pub fn observe(&mut self, piece: &str) -> bool {
+        let (counted, ends_mid_word) = count_words(piece, self.carry);
+        self.words += counted;
+        self.carry = ends_mid_word;
+        let Some(target) = self.target else { return true };
+        if self.words >= target && ends_a_sentence(piece) {
+            self.stopped_by_length = true;
+            return false;
+        }
+        if self.words >= target * 7 / 5 {
+            self.stopped_by_length = true;
+            return false;
+        }
+        true
+    }
+
+    pub fn words(&self) -> usize {
+        self.words
+    }
+
+    pub fn stopped_by_length(&self) -> bool {
+        self.stopped_by_length
+    }
+}
+
 /// How a generated answer turned out.
 #[derive(Debug, Clone)]
 pub struct Response {
@@ -333,16 +388,8 @@ pub fn generate_response(
     on_progress: &mut dyn FnMut(&str, usize) -> bool,
 ) -> Response {
     let prompt_tokens = request.to_prompt_tokens(tokenizer);
-    let target = request.target_words;
-    // Without a target, cap at a sensible amount of text rather than
-    // running forever.
-    let budget_words = target.unwrap_or(600);
-    // Room to overshoot and still find a sentence boundary.
-    let max_new_tokens = ((budget_words as f32 * TOKENS_PER_WORD * 1.6) as usize).clamp(32, 8192);
-
-    let mut words = 0usize;
-    let mut carry_partial_word = false;
-    let mut stopped_by_length = false;
+    let mut guard = LengthGuard::new(request.target_words);
+    let max_new_tokens = guard.token_budget();
 
     let (text, reason) = generate::generate_stream(
         weights,
@@ -352,34 +399,18 @@ pub fn generate_response(
         max_new_tokens,
         sampling,
         &mut |piece, _| {
-            // Count words incrementally: a piece that starts mid-word
-            // continues the previous one rather than starting a new one.
-            let (counted, ends_mid_word) = count_words(piece, carry_partial_word);
-            words += counted;
-            carry_partial_word = ends_mid_word;
-
-            if !on_progress(piece, words) {
+            let keep_going = guard.observe(piece);
+            if !on_progress(piece, guard.words()) {
                 return false;
             }
-            if let Some(target) = target {
-                if words >= target && ends_a_sentence(piece) {
-                    stopped_by_length = true;
-                    return false;
-                }
-                // Hard ceiling: 40% over target and still no boundary.
-                if words >= target * 7 / 5 {
-                    stopped_by_length = true;
-                    return false;
-                }
-            }
-            true
+            keep_going
         },
     );
 
     Response {
         word_count: text.split_whitespace().count(),
         tokens_generated: tokenizer.encode(&text).len(),
-        stop_reason: if stopped_by_length { StopReason::Caller } else { reason },
+        stop_reason: if guard.stopped_by_length() { StopReason::Caller } else { reason },
         text,
     }
 }

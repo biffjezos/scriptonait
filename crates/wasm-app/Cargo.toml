@@ -18,7 +18,11 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 llm-core = { path = "../llm-core" }
+llm-gpu = { path = "../llm-gpu" }
 wasm-bindgen = "0.2"
+# #[wasm_bindgen]'s codegen for `async fn` needs this in scope to turn a
+# Rust Future into the JS Promise those methods return.
+wasm-bindgen-futures = "0.4"
 # For calling the JS token callback that streams generated text back to
 # the page as it arrives.
 js-sys = "0.3"

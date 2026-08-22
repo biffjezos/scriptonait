@@ -222,7 +222,7 @@ pub fn generate_stream(
 /// U+FFFD and consumed, matching what `String::from_utf8_lossy` does to
 /// the same bytes — which is what keeps the streamed text identical to
 /// the decoded whole.
-fn take_complete_chars(buf: &mut Vec<u8>) -> String {
+pub fn take_complete_chars(buf: &mut Vec<u8>) -> String {
     let mut out = String::new();
     loop {
         match std::str::from_utf8(buf) {

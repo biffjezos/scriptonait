@@ -8,8 +8,8 @@ name: Build and deploy to GitHub Pages
 #
 # It has to run here rather than in this project's development sandbox,
 # which has no route to crates.io, npmjs.org, or the wasm32 target
-# installer — so this workflow is also the only compiler wasm-app ever
-# sees, which is why every push runs the build job.
+# installer — so this workflow is also the only compiler llm-gpu and
+# wasm-app ever see, which is why every push runs the build job.
 
 on:
   # Every push runs the `build` job (compile + test), regardless of
@@ -48,7 +48,9 @@ jobs:
         with:
           workspaces: |
             crates/llm-core
+            crates/llm-gpu
             crates/wasm-app
+            crates/shader-check
 
       - name: Install wasm-pack
         uses: jetli/wasm-pack-action@v0.4.0
@@ -57,6 +59,14 @@ jobs:
 
       - name: Test the engine
         run: cargo test
+
+      - name: Compile every WGSL shader
+        # llm-gpu embeds its shaders with include_str! and only compiles
+        # them at create_shader_module time — in a browser, when the page
+        # first reaches for the GPU. Nothing in the Rust build looks at
+        # them, so naga (wgpu's own WGSL front end) checks them here
+        # instead of letting a typo reach a user's screen.
+        run: cargo test --manifest-path crates/shader-check/Cargo.toml
 
       - name: Build wasm-app -> frontend/pkg
         # +simd128 is what lets LLVM turn llm-core's dot/axpy inner loops

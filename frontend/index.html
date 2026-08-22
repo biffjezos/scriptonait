@@ -129,9 +129,18 @@
     <details class="panel" id="finetune-panel">
       <summary><h2>Fine-tune on your material</h2></summary>
       <p class="hint">
-        Optional, and slower than everything else on this page — it's real
-        training, running on your CPU. The shipped model was trained on a
-        server for hours; this bends it a little toward your text.
+        Optional, and the slowest thing on this page: this is real
+        training — forward pass, backward pass, optimizer — and it runs on
+        your CPU even when generation is running on your GPU, because
+        only the generation kernels are written in WGSL.
+      </p>
+      <p class="hint">
+        It does not train a model from nothing. The model this page loads
+        was already trained, on a GitHub Actions runner, from the
+        public-domain books and plays listed in
+        <code>corpus/manifest.tsv</code> — hours of it, off your machine.
+        Fine-tuning bends that model a little toward whatever you add
+        above.
       </p>
 
       <div class="settings-grid">

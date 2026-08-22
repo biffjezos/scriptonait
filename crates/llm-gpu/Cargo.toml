@@ -1,0 +1,32 @@
+# Standalone crate (see root Cargo.toml comment) — the WebGPU backend.
+# Needs the `wgpu` crate from crates.io, unavailable in every sandbox this
+# repo might be developed in, so it's kept out of the default workspace.
+[workspace]
+
+[package]
+name = "llm-gpu"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[lib]
+crate-type = ["rlib"]
+
+[dependencies]
+llm-core = { path = "../llm-core" }
+# Open lower bound (no `^`/exact pin) so this always resolves to whatever
+# the actual latest wgpu release is at build time (in CI, which has real
+# crates.io access — this sandbox doesn't). That matters here: wgpu 0.19
+# requests the `maxInterStageShaderComponents` device limit, which was
+# removed from the WebGPU spec (Chrome dropped it entirely as of v135) —
+# a since-fixed wgpu bug, not something worth chasing an exact version
+# number for blind.
+wgpu = ">=0.20"
+bytemuck = { version = "1", features = ["derive"] }
+futures-channel = "0.3"
+
+# Only used by the native dev/test binary (`examples/gpu_smoke_test.rs`) to
+# block on GPU futures; the wasm32 build (wasm-app) drives the same async
+# fns from JS via wasm-bindgen-futures instead.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+pollster = "0.3"

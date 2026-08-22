@@ -11,13 +11,15 @@
 //! caller controls its pace (see `worker.js`, which yields between steps
 //! against a time budget so a training run can't take over the machine).
 //!
-//! There is no backend selection. There used to be a WebGPU backend and
-//! a CPU/GPU toggle; both are gone. Briefly — the README has the longer
-//! version — the GPU kernels were never verified to compute the right
-//! numbers, they couldn't express the current architecture without a
-//! rewrite that also couldn't be verified, and the toggle's two
-//! independent weight copies were a bug factory. The CPU path, with a KV
-//! cache and a BPE vocabulary, is fast enough at this model size.
+//! Generation runs on the GPU when the browser has WebGPU, and on the
+//! CPU when it doesn't. That is a fact about the machine, not a setting:
+//! there is no toggle, the page just says which one it got.
+//!
+//! The two paths share their prompt handling, their sampling and their
+//! stopping rule (`llm_core::instruct::LengthGuard`) — what differs is
+//! only where the arithmetic happens. Both prefill on the CPU, because
+//! that forward pass is the gradient-checked one; the GPU takes over
+//! for the per-token decode, which is where the time goes.
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -32,6 +34,17 @@ use llm_core::instruct;
 use llm_core::tokenizer::Tokenizer;
 use llm_core::train::{TrainConfig, Trainer};
 
+/// A ready WebGPU device plus this model's weights uploaded to it.
+struct GpuBackend {
+    ctx: Rc<llm_gpu::GpuContext>,
+    model: llm_gpu::GpuModel,
+    /// Training step the uploaded weights came from, so fine-tuning
+    /// invalidates them instead of generating from stale ones.
+    uploaded_at_step: u64,
+    summary: String,
+    is_software: bool,
+}
+
 #[wasm_bindgen(start)]
 pub fn init_panic_hook() {
     console_error_panic_hook::set_once();
@@ -44,6 +57,7 @@ fn js_err(msg: impl std::fmt::Display) -> JsValue {
 struct Inner {
     trainer: Trainer,
     corpus: Corpus,
+    gpu: Option<GpuBackend>,
     train: TrainConfig,
     /// True when the weights came from a checkpoint rather than from
     /// random initialization — the difference between "this model can
@@ -149,6 +163,38 @@ pub struct StepReport {
     pub step: f64,
 }
 
+fn stop_reason_label(reason: StopReason) -> &'static str {
+    match reason {
+        StopReason::EndOfText => "end-of-text",
+        StopReason::Budget => "length",
+        StopReason::Caller => "stopped",
+    }
+}
+
+/// Hand one piece of text to the page. A callback that returns nothing
+/// means "keep going" — only an explicit `false` stops the generation —
+/// and one that throws stops it, because a page in that state has
+/// nowhere to put the rest.
+fn report(on_token: &js_sys::Function, piece: &str, words: usize) -> bool {
+    let piece = JsValue::from_str(piece);
+    let words = JsValue::from_f64(words as f64);
+    match on_token.call2(&JsValue::UNDEFINED, &piece, &words) {
+        Ok(value) => value.as_bool().unwrap_or(true),
+        Err(_) => false,
+    }
+}
+
+impl GenerationResult {
+    fn from_response(response: instruct::Response) -> Self {
+        Self {
+            text: response.text,
+            word_count: response.word_count as u32,
+            tokens_generated: response.tokens_generated as u32,
+            stop_reason: stop_reason_label(response.stop_reason).to_string(),
+        }
+    }
+}
+
 #[wasm_bindgen]
 pub struct WasmLLM(Rc<RefCell<Inner>>);
 
@@ -165,6 +211,7 @@ impl WasmLLM {
         Ok(WasmLLM(Rc::new(RefCell::new(Inner {
             trainer,
             corpus: Corpus::with_tokenizer(checkpoint.tokenizer),
+            gpu: None,
             // Fine-tuning a trained model wants a small, flat learning
             // rate: the point is to bend it toward your text, not to
             // re-run a pretraining schedule over it.
@@ -206,6 +253,7 @@ impl WasmLLM {
         Ok(WasmLLM(Rc::new(RefCell::new(Inner {
             trainer: Trainer::new(config, seed as u64),
             corpus: Corpus::with_tokenizer(tokenizer),
+            gpu: None,
             train: TrainConfig::default(),
             pretrained: false,
         }))))
@@ -242,26 +290,60 @@ impl WasmLLM {
         describe(&instruct::parse_prompt(&prompt))
     }
 
-    /// Suggested token budget for a prompt, so the UI can estimate how
-    /// long a generation will take before starting it.
-    pub fn estimated_tokens(&self, prompt: String) -> u32 {
-        let request = instruct::parse_prompt(&prompt);
-        (request.target_words.unwrap_or(600) as f32 * 1.6) as u32
+    /// Ask the browser for a WebGPU device and upload the weights to it.
+    ///
+    /// Call once after loading a model. Returns a short description of
+    /// what the browser actually gave us — a device name, or why there
+    /// isn't one. Failure is normal and is not an error: browsers
+    /// without WebGPU exist, and the CPU path is always there.
+    pub async fn init_gpu(&self) -> Result<String, JsValue> {
+        let (config, weights) = {
+            let inner = self.0.borrow();
+            (inner.trainer.config, inner.trainer.weights.clone())
+        };
+        if !llm_gpu::supports(&config) {
+            return Err(js_err("this model's shape is past what the GPU kernels handle"));
+        }
+        let ctx = Rc::new(llm_gpu::GpuContext::new().await.map_err(js_err)?);
+        let model = llm_gpu::GpuModel::upload(&ctx, &weights, &config).map_err(js_err)?;
+        let summary = ctx.adapter_summary.clone();
+        let is_software = ctx.is_software;
+        let step = self.0.borrow().trainer.step;
+        self.0.borrow_mut().gpu = Some(GpuBackend {
+            ctx,
+            model,
+            uploaded_at_step: step,
+            summary: summary.clone(),
+            is_software,
+        });
+        Ok(summary)
+    }
+
+    /// What generation will actually run on: a device description, or
+    /// "CPU". The page reports this rather than offering it as a choice.
+    pub fn device_summary(&self) -> String {
+        match &self.0.borrow().gpu {
+            Some(gpu) if gpu.is_software => format!("{} (software renderer)", gpu.summary),
+            Some(gpu) => gpu.summary.clone(),
+            None => "CPU".to_string(),
+        }
+    }
+
+    pub fn using_gpu(&self) -> bool {
+        self.0.borrow().gpu.is_some()
     }
 
     /// Generate an answer to `prompt`.
     ///
     /// `on_token` is called with `(piece: string, words: number)` as the
     /// text arrives; returning `false` from it stops the generation,
-    /// which is how the UI's Stop button works. It runs while this
-    /// object is borrowed, so it must not call back into `WasmLLM` —
-    /// post the piece onward and return.
+    /// which is how the UI's Stop button works.
     ///
     /// `extra_context`, if non-empty, is folded into the instruction's
     /// subject — that's how retrieved scenes and the story-state
     /// preamble get in without inventing a second prompt format.
     #[allow(clippy::too_many_arguments)]
-    pub fn generate(
+    pub async fn generate(
         &self,
         prompt: String,
         extra_context: String,
@@ -272,15 +354,7 @@ impl WasmLLM {
         seed: f64,
         on_token: &js_sys::Function,
     ) -> GenerationResult {
-        let inner = self.0.borrow();
-        let mut request = instruct::parse_prompt(&prompt);
-        if !extra_context.trim().is_empty() {
-            request.subject = if request.subject.is_empty() {
-                extra_context.trim().to_string()
-            } else {
-                format!("{}; {}", request.subject, extra_context.trim())
-            };
-        }
+        let request = self.build_request(&prompt, &extra_context);
         let sampling = SamplingConfig {
             temperature,
             top_k: top_k as usize,
@@ -290,40 +364,144 @@ impl WasmLLM {
             ..SamplingConfig::default()
         };
 
-        let undefined = JsValue::UNDEFINED;
+        // The GPU path needs the weights to match what was uploaded; a
+        // fine-tuning run since then invalidates them, and re-uploading
+        // mid-generation would be worse than just using the CPU.
+        let gpu_is_current = {
+            let inner = self.0.borrow();
+            inner.gpu.as_ref().is_some_and(|g| g.uploaded_at_step == inner.trainer.step)
+        };
+        if gpu_is_current {
+            match self.generate_on_gpu(&request, &sampling, on_token).await {
+                Ok(result) => return result,
+                Err(_) => {
+                    // A device that was lost or a kernel that failed:
+                    // drop it and finish on the CPU rather than handing
+                    // the user an error where a story should be.
+                    self.0.borrow_mut().gpu = None;
+                }
+            }
+        }
+        self.generate_on_cpu(&request, &sampling, on_token)
+    }
+
+    fn build_request(&self, prompt: &str, extra_context: &str) -> instruct::Request {
+        let mut request = instruct::parse_prompt(prompt);
+        if !extra_context.trim().is_empty() {
+            request.subject = if request.subject.is_empty() {
+                extra_context.trim().to_string()
+            } else {
+                format!("{}; {}", request.subject, extra_context.trim())
+            };
+        }
+        request
+    }
+
+    fn generate_on_cpu(
+        &self,
+        request: &instruct::Request,
+        sampling: &SamplingConfig,
+        on_token: &js_sys::Function,
+    ) -> GenerationResult {
+        let inner = self.0.borrow();
         let response = instruct::generate_response(
             &inner.trainer.weights,
             &inner.trainer.config,
             inner.corpus.tokenizer(),
-            &request,
-            &sampling,
-            &mut |piece, words| {
-                let piece = JsValue::from_str(piece);
-                let words = JsValue::from_f64(words as f64);
-                match on_token.call2(&undefined, &piece, &words) {
-                    // Only an explicit `false` stops it: a callback that
-                    // returns nothing is the common case and must not
-                    // read as "stop".
-                    Ok(value) => value.as_bool().unwrap_or(true),
-                    // A throwing callback stops generation rather than
-                    // being swallowed — it means the page is in a state
-                    // where continuing is pointless.
-                    Err(_) => false,
-                }
-            },
+            request,
+            sampling,
+            &mut |piece, words| report(on_token, piece, words),
         );
+        GenerationResult::from_response(response)
+    }
 
-        GenerationResult {
-            text: response.text,
-            word_count: response.word_count as u32,
-            tokens_generated: response.tokens_generated as u32,
-            stop_reason: match response.stop_reason {
-                StopReason::EndOfText => "end-of-text",
-                StopReason::Budget => "length",
-                StopReason::Caller => "stopped",
+    /// The same generation, decoded on the GPU.
+    ///
+    /// The prompt is prefilled on the CPU and its keys and values handed
+    /// to the GPU; from there each token is one dispatch batch and one
+    /// readback of the logits, with sampling and the stopping rule
+    /// staying on the CPU where they're tested.
+    async fn generate_on_gpu(
+        &self,
+        request: &instruct::Request,
+        sampling: &SamplingConfig,
+        on_token: &js_sys::Function,
+    ) -> Result<GenerationResult, String> {
+        let (weights, config, tokenizer, prompt_tokens) = {
+            let inner = self.0.borrow();
+            let tokenizer = inner.corpus.tokenizer().clone();
+            let prompt_tokens = request.to_prompt_tokens(&tokenizer);
+            (inner.trainer.weights.clone(), inner.trainer.config, tokenizer, prompt_tokens)
+        };
+
+        let (mut logits, cache) = llm_core::model::prefill(&weights, &config, &prompt_tokens);
+        let ctx = {
+            let mut inner = self.0.borrow_mut();
+            let gpu = inner.gpu.as_mut().ok_or("no GPU")?;
+            gpu.model.seed_from_cpu_cache(&gpu.ctx, &cache);
+            gpu.ctx.clone()
+        };
+
+        let mut guard = instruct::LengthGuard::new(request.target_words);
+        let max_new_tokens = guard.token_budget();
+        let mut rng = llm_core::rng::Rng::seed_from_u64(sampling.seed);
+        let mut produced: Vec<u32> = Vec::new();
+        let mut recent: Vec<u32> = prompt_tokens.clone();
+        let mut pending: Vec<u8> = Vec::new();
+        let mut stop_reason = StopReason::Budget;
+
+        for _ in 0..max_new_tokens {
+            let window = recent.len().saturating_sub(sampling.repetition_window);
+            let next = llm_core::generate::sample_with(&logits, sampling, &recent[window..], &mut rng);
+            if next == llm_core::tokenizer::EOS {
+                stop_reason = StopReason::EndOfText;
+                break;
             }
-            .to_string(),
+            produced.push(next);
+            recent.push(next);
+
+            pending.extend_from_slice(tokenizer.piece(next));
+            let piece = llm_core::generate::take_complete_chars(&mut pending);
+            let keep_going = guard.observe(&piece);
+            if !report(on_token, &piece, guard.words()) {
+                stop_reason = StopReason::Caller;
+                break;
+            }
+            if !keep_going {
+                stop_reason = StopReason::Caller;
+                break;
+            }
+
+            logits = {
+                let mut inner = self.0.borrow_mut();
+                let gpu = inner.gpu.as_mut().ok_or("no GPU")?;
+                gpu.model.decode_step(&ctx, next).await?
+            };
         }
+
+        if !pending.is_empty() {
+            let tail = String::from_utf8_lossy(&pending).into_owned();
+            report(on_token, &tail, guard.words());
+        }
+
+        let text = tokenizer.decode(&produced);
+        Ok(GenerationResult {
+            word_count: text.split_whitespace().count() as u32,
+            tokens_generated: produced.len() as u32,
+            stop_reason: stop_reason_label(if guard.stopped_by_length() {
+                StopReason::Caller
+            } else {
+                stop_reason
+            })
+            .to_string(),
+            text,
+        })
+    }
+
+    /// Suggested token budget for a prompt, so the UI can estimate how
+    /// long a generation will take before starting it.
+    pub fn estimated_tokens(&self, prompt: String) -> u32 {
+        instruct::LengthGuard::new(instruct::parse_prompt(&prompt).target_words).token_budget() as u32
     }
 
     // --- Sources (fine-tuning, retrieval, story state) -------------------
