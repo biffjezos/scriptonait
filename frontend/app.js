@@ -380,6 +380,7 @@ $('generate-btn').addEventListener('click', async () => {
   generating = true;
   $('generate-btn').disabled = true;
   $('stop-btn').hidden = false;
+  $('stop-btn').disabled = false;
   $('generate-status').hidden = false;
   $('qa-notes').hidden = true;
   $('output').textContent = '';
@@ -421,7 +422,15 @@ $('generate-btn').addEventListener('click', async () => {
   }
 });
 
-$('stop-btn').addEventListener('click', () => call('stop'));
+// Stop is fire-and-forget. The worker can only read it when its message
+// queue gets a turn, and a slow step or a long wasm call can hold that up
+// for a while — with a deadline on the reply, waiting for one turns a
+// working stop into "the worker didn't answer". The job itself reports
+// how it ended.
+$('stop-btn').addEventListener('click', () => {
+  $('stop-btn').disabled = true;
+  call('stop', {}, [], 0).catch(() => {});
+});
 
 function renderNotes(notes) {
   const box = $('qa-notes');
@@ -728,6 +737,23 @@ onStream('train-progress', (progress) => {
   drawLossChart();
 });
 
+// Samples from the model as it trains, newest first, so the top of the
+// list is always the current state of the writing.
+onStream('train-sample', ({ step, loss, text }) => {
+  const box = $('train-samples');
+  const block = document.createElement('div');
+  block.className = 'train-sample';
+  const head = document.createElement('div');
+  head.className = 'train-sample-head';
+  head.textContent = `step ${formatCount(step)}` +
+    (typeof loss === 'number' ? ` · loss ${loss.toFixed(3)}` : '');
+  const body = document.createElement('pre');
+  body.textContent = text;
+  block.append(head, body);
+  box.prepend(block);
+  while (box.children.length > 20) box.lastElementChild.remove();
+});
+
 $('train-btn').addEventListener('click', async () => {
   if (training) return;
   clearError();
@@ -735,9 +761,11 @@ $('train-btn').addEventListener('click', async () => {
   lossHistory.length = 0;
   $('train-btn').disabled = true;
   $('train-stop-btn').hidden = false;
+  $('train-stop-btn').disabled = false;
   $('train-status').hidden = false;
   $('loss-chart').hidden = false;
   $('train-stats').textContent = 'Starting…';
+  $('train-samples').replaceChildren();
 
   try {
     // One button, two jobs. With no model, make one first — nobody
@@ -769,6 +797,10 @@ $('train-btn').addEventListener('click', async () => {
       learningRate: chosenRate > 0 ? chosenRate : (fromScratch ? 3e-4 : 5e-5),
       maxSteps: Number($('train-steps').value),
       effort: Number($('train-effort').value),
+      // 0 turns sampling off; anything else is a step interval.
+      sampleEvery: $('sample-toggle').checked ? Number($('sample-every').value) : 0,
+      samplePrompt: $('sample-prompt').value.trim() || 'Write a 40 word scene.',
+      sampleWords: 40,
     }, [], 0);
 
     if (result.stopReason === 'no-data') {
@@ -793,7 +825,11 @@ $('train-btn').addEventListener('click', async () => {
   }
 });
 
-$('train-stop-btn').addEventListener('click', () => call('stop'));
+$('train-stop-btn').addEventListener('click', () => {
+  $('train-stop-btn').disabled = true;
+  $('train-stats').textContent = 'Stopping after this step…';
+  call('stop', {}, [], 0).catch(() => {});
+});
 
 function drawLossChart() {
   const canvas = $('loss-chart');

@@ -66,11 +66,21 @@
         </label>
       </div>
 
+      <div class="row">
+        <label class="checkbox-label">
+          <input type="checkbox" id="sample-toggle" /> Sample every
+        </label>
+        <input type="number" id="sample-every" value="50" min="1" max="100000" />
+        <span class="hint">steps, from:</span>
+        <input type="text" id="sample-prompt" value="Write a 40 word scene." />
+      </div>
+
       <div id="train-status" class="job-status" hidden>
         <div class="progress"><div class="bar" id="train-progress-bar"></div></div>
         <p id="train-stats" class="stats"></p>
       </div>
       <canvas id="loss-chart" width="640" height="140" hidden></canvas>
+      <div id="train-samples" class="train-samples"></div>
 
       <details class="advanced">
         <summary>Training settings</summary>

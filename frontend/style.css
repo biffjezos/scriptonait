@@ -511,3 +511,38 @@ select {
   border-radius: 6px;
   background: var(--panel-bg);
 }
+
+.train-samples {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  margin-top: 0.75rem;
+}
+
+.train-sample {
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 0.5rem 0.75rem;
+}
+
+.train-sample-head {
+  font-size: 0.8rem;
+  color: var(--text-dim);
+  margin-bottom: 0.25rem;
+}
+
+.train-sample pre {
+  margin: 0;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-size: 0.9rem;
+}
+
+#sample-prompt {
+  flex: 1;
+  min-width: 12rem;
+}
+
+#sample-every {
+  width: 6rem;
+}
