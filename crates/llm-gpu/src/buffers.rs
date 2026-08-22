@@ -85,3 +85,50 @@ pub async fn read_f32(device: &wgpu::Device, queue: &wgpu::Queue, buffer: &wgpu:
     staging.unmap();
     result
 }
+
+/// Reads several buffers back to the host as one flat, concatenated
+/// `Vec<f32>` (in `buffers` order) with exactly one host-device
+/// synchronization point, instead of one per buffer. Each `read_f32` call
+/// is a real, expensive round trip (map a staging buffer, wait for the GPU
+/// to finish everything queued so far, copy the data back) - calling it
+/// once per tensor when reading, say, every weight tensor in a model (as
+/// `GpuModel::read_all_weights` used to) means dozens of those round trips
+/// for what's logically one read. This instead does every
+/// `copy_buffer_to_buffer` into one combined staging buffer within a
+/// single command buffer, submits once, and maps/awaits once - see
+/// `GpuModel::train_step`'s docs for the same fix applied to loss readback.
+pub async fn read_f32_concat(device: &wgpu::Device, queue: &wgpu::Queue, buffers: &[(&wgpu::Buffer, usize)]) -> Vec<f32> {
+    let total_len: usize = buffers.iter().map(|(_, len)| len).sum();
+    let byte_total = (total_len * std::mem::size_of::<f32>()) as u64;
+    let staging = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("readback-concat-staging"),
+        size: byte_total,
+        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("readback-concat") });
+    let mut offset = 0u64;
+    for (buffer, len) in buffers {
+        let byte_len = (*len * std::mem::size_of::<f32>()) as u64;
+        encoder.copy_buffer_to_buffer(buffer, 0, &staging, offset, byte_len);
+        offset += byte_len;
+    }
+    queue.submit(Some(encoder.finish()));
+
+    let slice = staging.slice(..);
+    let (tx, rx) = futures_channel::oneshot::channel();
+    slice.map_async(wgpu::MapMode::Read, move |result| {
+        let _ = tx.send(result);
+    });
+    let _ = device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None });
+    rx.await
+        .expect("map_async callback dropped without firing")
+        .expect("failed to map GPU buffer for readback");
+
+    let data = slice.get_mapped_range().expect("buffer was just confirmed mapped above");
+    let result: Vec<f32> = bytemuck::cast_slice(&data).to_vec();
+    drop(data);
+    staging.unmap();
+    result
+}
