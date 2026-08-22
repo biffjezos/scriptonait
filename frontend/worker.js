@@ -61,6 +61,17 @@ const BENCHMARK_PLACEHOLDER_TEXT = 'the quick brown fox jumps over the lazy dog.
 const BENCHMARK_WARMUP_TIMEOUT_MS = 90_000;
 const BENCHMARK_STEP_TIMEOUT_MS = 20_000;
 
+// GpuContext::new() only requests a device/adapter and creates pipeline
+// *objects* - it doesn't dispatch anything, so it doesn't pay the lazy
+// shader-compile cost the benchmark's warmup timeout above is sized for.
+// It should normally finish in well under a second; this is generous
+// headroom, not an expected duration.
+const GPU_INIT_TIMEOUT_MS = 30_000;
+// Real per-step time has been observed around 20-25s on modest hardware -
+// this is a "the device is dead" backstop, not a performance budget, so it
+// sits well above that rather than tracking it closely.
+const TRAIN_STEP_GPU_TIMEOUT_MS = 120_000;
+
 function withTimeout(promise, ms, label) {
   return Promise.race([
     promise,
@@ -150,7 +161,14 @@ async function trainingLoop() {
     const t0 = performance.now();
     if (trainParams.useGpu) {
       lr = effectiveLr(trainParams.lr, gpuStepCounter);
-      loss = await llm.train_step_gpu(trainParams.batchSize, lr, gpuStepCounter);
+      // A bounded wait, not a real per-step budget: if the GPU device
+      // itself hangs mid-step (a driver-level watchdog reset, e.g. Windows'
+      // DXGI_ERROR_DEVICE_HUNG - a real failure mode, not hypothetical),
+      // this call would otherwise never resolve or reject and training
+      // would silently sit there forever with no feedback at all. Sized
+      // well above any real step time so it doesn't fire on a merely slow
+      // step.
+      loss = await withTimeout(llm.train_step_gpu(trainParams.batchSize, lr, gpuStepCounter), TRAIN_STEP_GPU_TIMEOUT_MS, 'GPU train step');
       gpuStepCounter += 1;
       step = gpuStepCounter;
     } else {
@@ -269,7 +287,7 @@ async function handleMessage(msg) {
       };
       if (trainParams.useGpu && !gpuInitialized) {
         try {
-          await llm.init_gpu();
+          await withTimeout(llm.init_gpu(), GPU_INIT_TIMEOUT_MS, 'GPU init');
           gpuInitialized = true;
           post({ type: 'gpuReady' });
         } catch (err) {
@@ -351,7 +369,7 @@ async function handleMessage(msg) {
 
     case 'initGpu': {
       try {
-        await llm.init_gpu();
+        await withTimeout(llm.init_gpu(), GPU_INIT_TIMEOUT_MS, 'GPU init');
         gpuInitialized = true;
         post({ type: 'gpuReady' });
       } catch (err) {

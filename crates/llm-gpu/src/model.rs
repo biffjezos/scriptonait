@@ -653,10 +653,21 @@ impl GpuModel {
     }
 
     /// Runs the forward pass over `tokens`, populating `self.hidden`,
-    /// `self.logits`, and every per-layer cache buffer. Records into the
-    /// caller's shared `encoder` rather than submitting anything itself -
-    /// see the `dispatch_*` helpers' module docs for why.
-    fn forward(&self, encoder: &mut wgpu::CommandEncoder, ctx: &GpuContext, tokens: &[u32]) -> usize {
+    /// `self.logits`, and every per-layer cache buffer. Submits once per
+    /// layer (plus once for the embedding gather and once for the final
+    /// norm/head) rather than either once per dispatch (the original,
+    /// extremely slow scheme - thousands of submits/step, see the
+    /// `dispatch_*` helpers' docs) or once for this whole call (which this
+    /// crate briefly did: batching the ~17 dispatches of every layer of an
+    /// entire sequence into one submission pushed some individual
+    /// submissions' real GPU execution time close to - and on slower/
+    /// thermally-throttled hardware, past - the ~2s window Windows' TDR
+    /// watchdog allows a single GPU command batch before assuming the
+    /// device is hung and forcibly resetting it. One submit per layer
+    /// keeps each command buffer's real execution time far below that
+    /// regardless of how slow the GPU is, while still cutting total
+    /// submits by roughly `num_layers` compared to one-per-dispatch.
+    fn forward(&self, ctx: &GpuContext, tokens: &[u32]) -> usize {
         let t_len = tokens.len();
         let h = self.config.hidden_dim;
         let heads = self.config.num_heads;
@@ -666,37 +677,49 @@ impl GpuModel {
         let vocab = self.config.vocab_size();
 
         write_u32(&ctx.queue, &self.ids, tokens);
-        dispatch_gather(encoder, ctx, &self.embed, &self.ids, &self.hidden, t_len, h);
-
-        for (layer, lc) in self.layers.iter().zip(&self.layer_caches) {
-            dispatch_gather(encoder, ctx, &layer.w.ple, &self.ids, &self.ple_scratch, t_len, h);
-            dispatch_add_inplace(encoder, ctx, &self.hidden, &self.ple_scratch, t_len * h);
-            // hidden now holds h_after_ple for this layer; snapshot it into the cache.
-            copy_buffer(encoder, &self.hidden, &lc.h_after_ple, t_len * h);
-
-            dispatch_rmsnorm(encoder, ctx, &lc.h_after_ple, &layer.w.attn_norm_gain, &lc.normed1, &lc.inv_rms1, t_len, h);
-            dispatch_linear(encoder, ctx, &lc.normed1, &layer.w.wq, &lc.q, t_len, h, h);
-            dispatch_linear(encoder, ctx, &lc.normed1, &layer.w.wk, &lc.k, t_len, h, h);
-            dispatch_linear(encoder, ctx, &lc.normed1, &layer.w.wv, &lc.v, t_len, h, h);
-            dispatch_rope(encoder, ctx, &lc.q, t_len, heads, head_dim, false);
-            dispatch_rope(encoder, ctx, &lc.k, t_len, heads, head_dim, false);
-            dispatch_attention(encoder, ctx, &lc.q, &lc.k, &lc.v, &lc.concat, &lc.probs, t_len, heads, head_dim, window);
-            dispatch_linear(encoder, ctx, &lc.concat, &layer.w.wo, &self.attn_out, t_len, h, h);
-            dispatch_add_inplace(encoder, ctx, &self.hidden, &self.attn_out, t_len * h);
-            copy_buffer(encoder, &self.hidden, &lc.h_after_attn, t_len * h);
-
-            dispatch_rmsnorm(encoder, ctx, &lc.h_after_attn, &layer.w.mlp_norm_gain, &lc.normed2, &lc.inv_rms2, t_len, h);
-            dispatch_linear(encoder, ctx, &lc.normed2, &layer.w.w_gate, &lc.gate, t_len, h, ffn);
-            dispatch_linear(encoder, ctx, &lc.normed2, &layer.w.w_up, &lc.up, t_len, h, ffn);
-            dispatch_swiglu(encoder, ctx, &lc.gate, &lc.up, &self.act, t_len * ffn);
-            dispatch_linear(encoder, ctx, &self.act, &layer.w.w_down, &self.mlp_out, t_len, ffn, h);
-            dispatch_add_inplace(encoder, ctx, &self.hidden, &self.mlp_out, t_len * h);
+        {
+            let mut encoder = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("fwd-embed") });
+            dispatch_gather(&mut encoder, ctx, &self.embed, &self.ids, &self.hidden, t_len, h);
+            ctx.queue.submit(Some(encoder.finish()));
         }
 
-        copy_buffer(encoder, &self.hidden, &self.h_final, t_len * h);
-        dispatch_rmsnorm(encoder, ctx, &self.h_final, &self.final_norm_gain, &self.final_normed, &self.final_inv_rms, t_len, h);
-        // Weight-tied output head: logits = final_normed @ embed^T.
-        dispatch_linear(encoder, ctx, &self.final_normed, &self.embed, &self.logits, t_len, h, vocab);
+        for (layer, lc) in self.layers.iter().zip(&self.layer_caches) {
+            let mut encoder = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("fwd-layer") });
+
+            dispatch_gather(&mut encoder, ctx, &layer.w.ple, &self.ids, &self.ple_scratch, t_len, h);
+            dispatch_add_inplace(&mut encoder, ctx, &self.hidden, &self.ple_scratch, t_len * h);
+            // hidden now holds h_after_ple for this layer; snapshot it into the cache.
+            copy_buffer(&mut encoder, &self.hidden, &lc.h_after_ple, t_len * h);
+
+            dispatch_rmsnorm(&mut encoder, ctx, &lc.h_after_ple, &layer.w.attn_norm_gain, &lc.normed1, &lc.inv_rms1, t_len, h);
+            dispatch_linear(&mut encoder, ctx, &lc.normed1, &layer.w.wq, &lc.q, t_len, h, h);
+            dispatch_linear(&mut encoder, ctx, &lc.normed1, &layer.w.wk, &lc.k, t_len, h, h);
+            dispatch_linear(&mut encoder, ctx, &lc.normed1, &layer.w.wv, &lc.v, t_len, h, h);
+            dispatch_rope(&mut encoder, ctx, &lc.q, t_len, heads, head_dim, false);
+            dispatch_rope(&mut encoder, ctx, &lc.k, t_len, heads, head_dim, false);
+            dispatch_attention(&mut encoder, ctx, &lc.q, &lc.k, &lc.v, &lc.concat, &lc.probs, t_len, heads, head_dim, window);
+            dispatch_linear(&mut encoder, ctx, &lc.concat, &layer.w.wo, &self.attn_out, t_len, h, h);
+            dispatch_add_inplace(&mut encoder, ctx, &self.hidden, &self.attn_out, t_len * h);
+            copy_buffer(&mut encoder, &self.hidden, &lc.h_after_attn, t_len * h);
+
+            dispatch_rmsnorm(&mut encoder, ctx, &lc.h_after_attn, &layer.w.mlp_norm_gain, &lc.normed2, &lc.inv_rms2, t_len, h);
+            dispatch_linear(&mut encoder, ctx, &lc.normed2, &layer.w.w_gate, &lc.gate, t_len, h, ffn);
+            dispatch_linear(&mut encoder, ctx, &lc.normed2, &layer.w.w_up, &lc.up, t_len, h, ffn);
+            dispatch_swiglu(&mut encoder, ctx, &lc.gate, &lc.up, &self.act, t_len * ffn);
+            dispatch_linear(&mut encoder, ctx, &self.act, &layer.w.w_down, &self.mlp_out, t_len, ffn, h);
+            dispatch_add_inplace(&mut encoder, ctx, &self.hidden, &self.mlp_out, t_len * h);
+
+            ctx.queue.submit(Some(encoder.finish()));
+        }
+
+        {
+            let mut encoder = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("fwd-head") });
+            copy_buffer(&mut encoder, &self.hidden, &self.h_final, t_len * h);
+            dispatch_rmsnorm(&mut encoder, ctx, &self.h_final, &self.final_norm_gain, &self.final_normed, &self.final_inv_rms, t_len, h);
+            // Weight-tied output head: logits = final_normed @ embed^T.
+            dispatch_linear(&mut encoder, ctx, &self.final_normed, &self.embed, &self.logits, t_len, h, vocab);
+            ctx.queue.submit(Some(encoder.finish()));
+        }
 
         t_len
     }
@@ -711,9 +734,7 @@ impl GpuModel {
             return Err(format!("tokens.len()={t_len} must be in 1..={}", self.config.context_len));
         }
         let vocab = self.config.vocab_size();
-        let mut encoder = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("forward-last-logits") });
-        self.forward(&mut encoder, ctx, tokens);
-        ctx.queue.submit(Some(encoder.finish()));
+        self.forward(ctx, tokens);
         let all_logits = read_f32(&ctx.device, &ctx.queue, &self.logits, t_len * vocab).await;
         Ok(all_logits[(t_len - 1) * vocab..t_len * vocab].to_vec())
     }
@@ -782,7 +803,8 @@ impl GpuModel {
     /// `forward`, given `d_logits` already populated (see
     /// `dispatch_cross_entropy`). Fills `self.grad_*` (assumed
     /// zeroed beforehand by the caller). Mirrors `llm_core::model::backward`.
-    fn backward(&self, encoder: &mut wgpu::CommandEncoder, ctx: &GpuContext, tokens: &[u32]) {
+    /// Submits once per layer, same reasoning as `forward` - see its docs.
+    fn backward(&self, ctx: &GpuContext, tokens: &[u32]) {
         let t_len = tokens.len();
         let h = self.config.hidden_dim;
         let heads = self.config.num_heads;
@@ -791,32 +813,36 @@ impl GpuModel {
         let ffn = self.config.ffn_dim();
         let vocab = self.config.vocab_size();
 
-        // Output head (tied with embed): logits = final_normed @ embed^T.
-        dispatch_linear_bwd(encoder, ctx, &self.d_logits, &self.final_normed, &self.embed, &self.d_normed, &self.grad_embed, t_len, h, vocab);
-
-        dispatch_rmsnorm_bwd(encoder, ctx, &self.d_normed, &self.h_final, &self.final_norm_gain, &self.final_inv_rms, &self.d_hidden, &self.grad_final_norm_gain, t_len, h);
+        {
+            let mut encoder = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("bwd-head") });
+            // Output head (tied with embed): logits = final_normed @ embed^T.
+            dispatch_linear_bwd(&mut encoder, ctx, &self.d_logits, &self.final_normed, &self.embed, &self.d_normed, &self.grad_embed, t_len, h, vocab);
+            dispatch_rmsnorm_bwd(&mut encoder, ctx, &self.d_normed, &self.h_final, &self.final_norm_gain, &self.final_inv_rms, &self.d_hidden, &self.grad_final_norm_gain, t_len, h);
+            ctx.queue.submit(Some(encoder.finish()));
+        }
 
         for (layer_idx, layer) in self.layers.iter().enumerate().rev() {
             let lc = &self.layer_caches[layer_idx];
             let lg = &self.grad_layers[layer_idx];
+            let mut encoder = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("bwd-layer") });
 
             // --- MLP branch (residual: h_after_attn + mlp_out) ---
             // d_mlp_out = d_hidden (residual splits equally); act = swiglu(gate,up).
-            dispatch_swiglu(encoder, ctx, &lc.gate, &lc.up, &self.act, t_len * ffn);
-            dispatch_linear_bwd(encoder, ctx, &self.d_hidden, &self.act, &layer.w.w_down, &self.d_act, &lg.w_down, t_len, ffn, h);
-            dispatch_swiglu_bwd(encoder, ctx, &self.d_act, &lc.gate, &lc.up, &self.d_gate, &self.d_up, t_len * ffn);
-            dispatch_linear_bwd(encoder, ctx, &self.d_gate, &lc.normed2, &layer.w.w_gate, &self.d_normed, &lg.w_gate, t_len, h, ffn);
-            dispatch_linear_bwd(encoder, ctx, &self.d_up, &lc.normed2, &layer.w.w_up, &self.d_normed_tmp, &lg.w_up, t_len, h, ffn);
-            dispatch_add_inplace(encoder, ctx, &self.d_normed, &self.d_normed_tmp, t_len * h);
+            dispatch_swiglu(&mut encoder, ctx, &lc.gate, &lc.up, &self.act, t_len * ffn);
+            dispatch_linear_bwd(&mut encoder, ctx, &self.d_hidden, &self.act, &layer.w.w_down, &self.d_act, &lg.w_down, t_len, ffn, h);
+            dispatch_swiglu_bwd(&mut encoder, ctx, &self.d_act, &lc.gate, &lc.up, &self.d_gate, &self.d_up, t_len * ffn);
+            dispatch_linear_bwd(&mut encoder, ctx, &self.d_gate, &lc.normed2, &layer.w.w_gate, &self.d_normed, &lg.w_gate, t_len, h, ffn);
+            dispatch_linear_bwd(&mut encoder, ctx, &self.d_up, &lc.normed2, &layer.w.w_up, &self.d_normed_tmp, &lg.w_up, t_len, h, ffn);
+            dispatch_add_inplace(&mut encoder, ctx, &self.d_normed, &self.d_normed_tmp, t_len * h);
 
-            dispatch_rmsnorm_bwd(encoder, ctx, &self.d_normed, &lc.h_after_attn, &layer.w.mlp_norm_gain, &lc.inv_rms2, &self.d_normed_tmp, &lg.mlp_norm_gain, t_len, h);
+            dispatch_rmsnorm_bwd(&mut encoder, ctx, &self.d_normed, &lc.h_after_attn, &layer.w.mlp_norm_gain, &lc.inv_rms2, &self.d_normed_tmp, &lg.mlp_norm_gain, t_len, h);
             // d_h_after_attn = d_hidden (pass-through) + d_normed_tmp (norm branch); accumulate into d_hidden in place.
-            dispatch_add_inplace(encoder, ctx, &self.d_hidden, &self.d_normed_tmp, t_len * h);
+            dispatch_add_inplace(&mut encoder, ctx, &self.d_hidden, &self.d_normed_tmp, t_len * h);
 
             // --- Attention branch (residual: h_after_ple + attn_out) ---
-            dispatch_linear_bwd(encoder, ctx, &self.d_hidden, &lc.concat, &layer.w.wo, &self.d_concat, &lg.wo, t_len, h, h);
+            dispatch_linear_bwd(&mut encoder, ctx, &self.d_hidden, &lc.concat, &layer.w.wo, &self.d_concat, &lg.wo, t_len, h, h);
             dispatch_attention_bwd(
-                encoder,
+                &mut encoder,
                 ctx,
                 &self.d_concat,
                 &lc.q,
@@ -832,26 +858,32 @@ impl GpuModel {
                 head_dim,
                 window,
             );
-            dispatch_rope(encoder, ctx, &self.d_q, t_len, heads, head_dim, true);
-            dispatch_rope(encoder, ctx, &self.d_k, t_len, heads, head_dim, true);
+            dispatch_rope(&mut encoder, ctx, &self.d_q, t_len, heads, head_dim, true);
+            dispatch_rope(&mut encoder, ctx, &self.d_k, t_len, heads, head_dim, true);
 
-            dispatch_linear_bwd(encoder, ctx, &self.d_q, &lc.normed1, &layer.w.wq, &self.d_normed, &lg.wq, t_len, h, h);
-            dispatch_linear_bwd(encoder, ctx, &self.d_k, &lc.normed1, &layer.w.wk, &self.d_normed_tmp, &lg.wk, t_len, h, h);
-            dispatch_add_inplace(encoder, ctx, &self.d_normed, &self.d_normed_tmp, t_len * h);
-            dispatch_linear_bwd(encoder, ctx, &self.d_v, &lc.normed1, &layer.w.wv, &self.d_normed_tmp, &lg.wv, t_len, h, h);
-            dispatch_add_inplace(encoder, ctx, &self.d_normed, &self.d_normed_tmp, t_len * h);
+            dispatch_linear_bwd(&mut encoder, ctx, &self.d_q, &lc.normed1, &layer.w.wq, &self.d_normed, &lg.wq, t_len, h, h);
+            dispatch_linear_bwd(&mut encoder, ctx, &self.d_k, &lc.normed1, &layer.w.wk, &self.d_normed_tmp, &lg.wk, t_len, h, h);
+            dispatch_add_inplace(&mut encoder, ctx, &self.d_normed, &self.d_normed_tmp, t_len * h);
+            dispatch_linear_bwd(&mut encoder, ctx, &self.d_v, &lc.normed1, &layer.w.wv, &self.d_normed_tmp, &lg.wv, t_len, h, h);
+            dispatch_add_inplace(&mut encoder, ctx, &self.d_normed, &self.d_normed_tmp, t_len * h);
 
-            dispatch_rmsnorm_bwd(encoder, ctx, &self.d_normed, &lc.h_after_ple, &layer.w.attn_norm_gain, &lc.inv_rms1, &self.d_normed_tmp, &lg.attn_norm_gain, t_len, h);
+            dispatch_rmsnorm_bwd(&mut encoder, ctx, &self.d_normed, &lc.h_after_ple, &layer.w.attn_norm_gain, &lc.inv_rms1, &self.d_normed_tmp, &lg.attn_norm_gain, t_len, h);
             // d_h_after_ple = d_hidden (pass-through) + d_normed_tmp (norm branch).
-            dispatch_add_inplace(encoder, ctx, &self.d_hidden, &self.d_normed_tmp, t_len * h);
+            dispatch_add_inplace(&mut encoder, ctx, &self.d_hidden, &self.d_normed_tmp, t_len * h);
 
             // PLE residual add: gradient passes through unchanged (already
             // in d_hidden) and also scatters into this layer's PLE grad.
-            dispatch_embedding_scatter_add(encoder, ctx, &self.d_hidden, &self.ids, &lg.ple, t_len, h, vocab);
+            dispatch_embedding_scatter_add(&mut encoder, ctx, &self.d_hidden, &self.ids, &lg.ple, t_len, h, vocab);
+
+            ctx.queue.submit(Some(encoder.finish()));
         }
 
-        // Input embedding gather (the other half of the tied embed/head gradient).
-        dispatch_embedding_scatter_add(encoder, ctx, &self.d_hidden, &self.ids, &self.grad_embed, t_len, h, vocab);
+        {
+            let mut encoder = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("bwd-embed") });
+            // Input embedding gather (the other half of the tied embed/head gradient).
+            dispatch_embedding_scatter_add(&mut encoder, ctx, &self.d_hidden, &self.ids, &self.grad_embed, t_len, h, vocab);
+            ctx.queue.submit(Some(encoder.finish()));
+        }
     }
 
     /// Dev/sanity-check tool: runs forward, cross-entropy, and backward
@@ -874,14 +906,20 @@ impl GpuModel {
         let vocab = self.config.vocab_size();
 
         let lens = self.tensor_lens();
-        let mut encoder = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("debug-grad-embed") });
-        self.zero_all(&mut encoder, ctx, &self.grad_buffers(), &lens);
+        {
+            let mut encoder = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("debug-grad-embed-zero") });
+            self.zero_all(&mut encoder, ctx, &self.grad_buffers(), &lens);
+            ctx.queue.submit(Some(encoder.finish()));
+        }
 
-        self.forward(&mut encoder, ctx, tokens);
+        self.forward(ctx, tokens);
         write_u32(&ctx.queue, &self.targets, targets);
-        dispatch_cross_entropy(&mut encoder, ctx, &self.logits, &self.targets, &self.d_logits, &self.loss_per_row, t_len);
-        self.backward(&mut encoder, ctx, tokens);
-        ctx.queue.submit(Some(encoder.finish()));
+        {
+            let mut encoder = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("debug-grad-embed-ce") });
+            dispatch_cross_entropy(&mut encoder, ctx, &self.logits, &self.targets, &self.d_logits, &self.loss_per_row, t_len);
+            ctx.queue.submit(Some(encoder.finish()));
+        }
+        self.backward(ctx, tokens);
 
         Ok(read_f32(&ctx.device, &ctx.queue, &self.grad_embed, vocab * h).await)
     }
@@ -913,13 +951,13 @@ impl GpuModel {
 
         let lens = self.tensor_lens();
 
-        // Three command buffers per step (one per phase below), not one
-        // per dispatch and not one for the whole step: batching the whole
-        // step into a single command buffer would work too, but keeping
-        // per-sequence chunks bounds how much GPU work is in flight in any
-        // one submission - a conservative margin against driver/OS
-        // watchdogs on unfamiliar hardware, at a cost of a few extra
-        // submits that's negligible next to the thousands this replaces.
+        // Not one submit per dispatch (thousands per step, dominated by
+        // submission overhead) and not one submit for the whole step
+        // either (individual submissions large enough to risk tripping a
+        // driver/OS watchdog like Windows' TDR on slower hardware - see
+        // forward's docs). forward/backward submit once per layer
+        // internally; everything else here is cheap elementwise work
+        // batched into one submission per phase.
         {
             let mut encoder = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("train-step-zero-accum") });
             self.zero_all(&mut encoder, ctx, &self.grad_accum_buffers(), &lens);
@@ -932,24 +970,37 @@ impl GpuModel {
             let input = &batch.inputs[start..start + t_len];
             let target = &batch.targets[start..start + t_len];
 
-            let mut encoder = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("train-step-sequence") });
-
-            self.zero_all(&mut encoder, ctx, &self.grad_buffers(), &lens);
-
-            self.forward(&mut encoder, ctx, input);
-            write_u32(&ctx.queue, &self.targets, target);
-            dispatch_cross_entropy(&mut encoder, ctx, &self.logits, &self.targets, &self.d_logits, &self.loss_per_row, t_len);
-            dispatch_add_inplace(&mut encoder, ctx, &self.loss_accum, &self.loss_per_row, t_len);
-
-            self.backward(&mut encoder, ctx, input);
-
-            // grad_accum_buffers()/grad_buffers() are built from the same
-            // shape list as `lens`, so all three zip up in lockstep.
-            for ((accum, g), &len) in self.grad_accum_buffers().into_iter().zip(self.grad_buffers()).zip(&lens) {
-                dispatch_add_inplace(&mut encoder, ctx, accum, g, len);
+            // zero/cross-entropy/grad-accum are all cheap elementwise
+            // kernels (zero-fill, add) - fast enough that batching all of
+            // them into one submission each isn't a TDR risk, unlike
+            // forward/backward's matrix multiplies. Those two now manage
+            // their own per-layer submissions internally (see their docs).
+            {
+                let mut encoder = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("train-step-zero-grad") });
+                self.zero_all(&mut encoder, ctx, &self.grad_buffers(), &lens);
+                ctx.queue.submit(Some(encoder.finish()));
             }
 
-            ctx.queue.submit(Some(encoder.finish()));
+            self.forward(ctx, input);
+            write_u32(&ctx.queue, &self.targets, target);
+            {
+                let mut encoder = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("train-step-ce") });
+                dispatch_cross_entropy(&mut encoder, ctx, &self.logits, &self.targets, &self.d_logits, &self.loss_per_row, t_len);
+                dispatch_add_inplace(&mut encoder, ctx, &self.loss_accum, &self.loss_per_row, t_len);
+                ctx.queue.submit(Some(encoder.finish()));
+            }
+
+            self.backward(ctx, input);
+
+            {
+                let mut encoder = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("train-step-grad-accum") });
+                // grad_accum_buffers()/grad_buffers() are built from the same
+                // shape list as `lens`, so all three zip up in lockstep.
+                for ((accum, g), &len) in self.grad_accum_buffers().into_iter().zip(self.grad_buffers()).zip(&lens) {
+                    dispatch_add_inplace(&mut encoder, ctx, accum, g, len);
+                }
+                ctx.queue.submit(Some(encoder.finish()));
+            }
         }
 
         {
