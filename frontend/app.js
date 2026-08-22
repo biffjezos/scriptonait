@@ -369,6 +369,12 @@ function refreshCorpusStatsFromWorker(msg) {
 function setTrainingButtons(isTraining) {
   el('start-train-btn').disabled = isTraining;
   el('stop-train-btn').disabled = !isTraining;
+  // These share the GpuModel's scratch buffers with the training loop -
+  // running one while training is active races both operations against
+  // each other (see the matching worker-side guard). Disable instead of
+  // relying on the worker to just reject the message.
+  el('debug-compare-btn').disabled = isTraining;
+  el('debug-compare-gradient-btn').disabled = isTraining;
 }
 
 function renderQaNotes(notes) {
@@ -452,10 +458,17 @@ async function refreshSourcesList() {
   }
 
   if (!modelCreated) {
+    // This is a raw character count straight from the stored text - it
+    // will not match the "N training tokens" figure shown once a model
+    // exists (that one comes from the worker after cleaning/tokenizing:
+    // whitespace and HTML get stripped, and byte-level tokens don't map
+    // 1:1 to JS string characters for anything non-ASCII). Both numbers
+    // are correct; they're just measuring different things at different
+    // points in the pipeline, not a discrepancy in the source data.
     const totalChars = sources.reduce((sum, s) => sum + s.rawText.length, 0);
     el('corpus-stats').textContent =
       `${sources.length} source${sources.length === 1 ? '' : 's'}, ${totalChars.toLocaleString()} ` +
-      'characters (raw). Create a model above to start training on these.';
+      'characters (raw) — create a model above to see the actual training token count.';
   }
 }
 

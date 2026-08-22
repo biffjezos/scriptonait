@@ -303,6 +303,18 @@ async function handleMessage(msg) {
 
     case 'generate': {
       try {
+        // Generation on the GPU path (or syncing GPU-trained weights back
+        // to the CPU) touches the same GpuModel scratch buffers the
+        // training loop is actively writing to - nothing serializes GPU
+        // work between separate worker messages, so running this
+        // concurrently with training corrupts both operations' in-flight
+        // state instead of erroring cleanly. Refuse outright rather than
+        // silently producing garbage; see the matching guard on the debug
+        // compare handlers below for the same reasoning.
+        if (training && (msg.useGpu || llm.gpu_training_dirty())) {
+          post({ type: 'error', context: 'generate', message: 'Stop training first — GPU generation shares GPU state with the running training loop and can\'t safely run at the same time.' });
+          break;
+        }
         // GPU training only updates the GPU-resident weights (see
         // train_step_gpu's docs) — bring the CPU copy up to date first so
         // generation (CPU or GPU) reflects the latest training.
@@ -349,6 +361,16 @@ async function handleMessage(msg) {
     }
 
     case 'debugCompareGpuCpu': {
+      // Shares the GpuModel's scratch buffers with the training loop -
+      // running this while training is active corrupts both, since
+      // nothing serializes GPU work between separate worker messages (see
+      // the matching guard on 'generate' above). Refuse instead of
+      // silently producing a misleading "large diff" that looks like a
+      // kernel bug but is really two operations racing each other.
+      if (training) {
+        post({ type: 'error', context: 'debugCompareGpuCpu', message: 'Stop training first — this shares GPU state with the running training loop and can\'t safely run at the same time.' });
+        break;
+      }
       try {
         const maxDiff = await llm.debug_compare_gpu_cpu(msg.prompt);
         post({ type: 'debugCompareResult', maxDiff });
@@ -359,6 +381,10 @@ async function handleMessage(msg) {
     }
 
     case 'debugCompareGpuCpuGradient': {
+      if (training) {
+        post({ type: 'error', context: 'debugCompareGpuCpuGradient', message: 'Stop training first — this shares GPU state with the running training loop and can\'t safely run at the same time.' });
+        break;
+      }
       try {
         const maxDiff = await llm.debug_compare_gpu_cpu_gradient(msg.prompt);
         post({ type: 'debugCompareGradientResult', maxDiff });
