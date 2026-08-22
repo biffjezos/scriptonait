@@ -103,15 +103,74 @@ fn axpy(dst: &mut [f32], src: &[f32], scale: f32) {
     }
 }
 
+/// How many rows (or output channels) the blocked kernels below process
+/// against one shared operand at a time.
+///
+/// The matmuls in this file are all "contract along the last axis" —
+/// every output element is a dot product of one `x` row with one `w`
+/// row — so the naive loop order reads the *entire* weight matrix once
+/// per token. For the tied output head that matrix is `vocab * hidden`
+/// floats; at an 8k BPE vocab that's tens of MB streamed from RAM per
+/// token, and the arithmetic sits waiting on memory the whole time.
+///
+/// Processing `BLOCK` rows against each weight row before moving on cuts
+/// that traffic by a factor of `BLOCK` — the weight row is loaded once
+/// and used four times, and the four `x` rows it's used against stay in
+/// L1. Four is deliberate: the kernels hold `BLOCK * 4` float lanes of
+/// accumulator, which is 16 vector registers — the whole SSE2 register
+/// file, and half of AVX's. Eight spills.
+const BLOCK: usize = 4;
+
+/// Dot one weight row against up to `BLOCK` consecutive rows of `x`,
+/// reading the weight row once for all of them.
+///
+/// The body is `BLOCK` plain `dot` calls, not one hand-fused kernel over
+/// five interleaved iterators: the fused version looks like it should be
+/// faster and measures three times *slower*, because interleaving that
+/// many `chunks_exact` iterators is a shape LLVM gives up vectorizing.
+/// The win here is loop order, not the inner kernel — `w_row` is loaded
+/// from L1 for all `n` rows instead of from RAM for one.
+#[inline]
+fn dot_block(x_block: &[f32], in_dim: usize, n: usize, w_row: &[f32]) -> [f32; BLOCK] {
+    debug_assert!(n <= BLOCK);
+    debug_assert_eq!(w_row.len(), in_dim);
+    let mut out = [0.0f32; BLOCK];
+    for r in 0..n {
+        out[r] = dot(&x_block[r * in_dim..(r + 1) * in_dim], w_row);
+    }
+    out
+}
+
+/// `dst_row_j += scales[j] * src` for up to `BLOCK` consecutive rows of
+/// `dst`, reading `src` once for all of them. The mirror image of
+/// `dot_block`, and the reason both backward passes stream their large
+/// operand a quarter as many times as the naive loop would.
+#[inline]
+fn axpy_block(dst_block: &mut [f32], dim: usize, n: usize, scales: &[f32; BLOCK], src: &[f32]) {
+    debug_assert!(n <= BLOCK);
+    debug_assert_eq!(src.len(), dim);
+    for j in 0..n {
+        if scales[j] == 0.0 {
+            continue;
+        }
+        axpy(&mut dst_block[j * dim..(j + 1) * dim], src, scales[j]);
+    }
+}
+
 /// `y[rows,out_dim] = x[rows,in_dim] @ w[out_dim,in_dim]^T`, no bias.
 pub fn linear_fwd(x: &[f32], w: &[f32], rows: usize, in_dim: usize, out_dim: usize) -> Vec<f32> {
     let mut y = vec![0.0f32; rows * out_dim];
-    for r in 0..rows {
-        let x_row = &x[r * in_dim..(r + 1) * in_dim];
-        let y_row = &mut y[r * out_dim..(r + 1) * out_dim];
-        for (o, y_o) in y_row.iter_mut().enumerate() {
-            *y_o = dot(x_row, &w[o * in_dim..(o + 1) * in_dim]);
+    let mut r0 = 0;
+    while r0 < rows {
+        let n = BLOCK.min(rows - r0);
+        let x_block = &x[r0 * in_dim..(r0 + n) * in_dim];
+        for o in 0..out_dim {
+            let vals = dot_block(x_block, in_dim, n, &w[o * in_dim..(o + 1) * in_dim]);
+            for (r, v) in vals.iter().take(n).enumerate() {
+                y[(r0 + r) * out_dim + o] = *v;
+            }
         }
+        r0 += BLOCK;
     }
     y
 }
@@ -123,7 +182,9 @@ pub fn linear_fwd(x: &[f32], w: &[f32], rows: usize, in_dim: usize, out_dim: usi
 /// (`out_dim * in_dim` floats, far past L1 for real layer sizes) for every
 /// single token, which is what made this the most expensive op in the
 /// backward pass; keeping the two passes apart lets each one stream over
-/// memory it can actually keep hot.
+/// memory it can actually keep hot. Both passes are then blocked by
+/// `BLOCK` (see `dot_block`), so the operand that doesn't fit in cache is
+/// streamed a quarter as many times.
 pub fn linear_bwd(
     dy: &[f32],
     x: &[f32],
@@ -135,28 +196,46 @@ pub fn linear_bwd(
     let mut dx = vec![0.0f32; rows * in_dim];
     let mut dw = vec![0.0f32; out_dim * in_dim];
 
-    // dx[r] = sum_o dy[r,o] * w[o]
-    for r in 0..rows {
-        let dy_row = &dy[r * out_dim..(r + 1) * out_dim];
-        let dx_row = &mut dx[r * in_dim..(r + 1) * in_dim];
-        for (o, &dyo) in dy_row.iter().enumerate() {
-            if dyo == 0.0 {
+    // dx[r] = sum_o dy[r,o] * w[o]   -- w[o] read once per block of rows.
+    let mut r0 = 0;
+    while r0 < rows {
+        let n = BLOCK.min(rows - r0);
+        let dx_block = &mut dx[r0 * in_dim..(r0 + n) * in_dim];
+        for o in 0..out_dim {
+            let mut scales = [0.0f32; BLOCK];
+            let mut any = false;
+            for (r, s) in scales.iter_mut().take(n).enumerate() {
+                *s = dy[(r0 + r) * out_dim + o];
+                any |= *s != 0.0;
+            }
+            if !any {
                 continue;
             }
-            axpy(dx_row, &w[o * in_dim..(o + 1) * in_dim], dyo);
+            axpy_block(dx_block, in_dim, n, &scales, &w[o * in_dim..(o + 1) * in_dim]);
         }
+        r0 += BLOCK;
     }
 
-    // dw[o] = sum_r dy[r,o] * x[r]
-    for o in 0..out_dim {
-        let dw_row = &mut dw[o * in_dim..(o + 1) * in_dim];
+    // dw[o] = sum_r dy[r,o] * x[r]   -- x[r] read once per block of
+    // output channels, and the block of dw rows being accumulated into
+    // (BLOCK * in_dim floats) stays in L1 across the whole row loop.
+    let mut o0 = 0;
+    while o0 < out_dim {
+        let n = BLOCK.min(out_dim - o0);
+        let dw_block = &mut dw[o0 * in_dim..(o0 + n) * in_dim];
         for r in 0..rows {
-            let dyo = dy[r * out_dim + o];
-            if dyo == 0.0 {
+            let mut scales = [0.0f32; BLOCK];
+            let mut any = false;
+            for (j, s) in scales.iter_mut().take(n).enumerate() {
+                *s = dy[r * out_dim + o0 + j];
+                any |= *s != 0.0;
+            }
+            if !any {
                 continue;
             }
-            axpy(dw_row, &x[r * in_dim..(r + 1) * in_dim], dyo);
+            axpy_block(dw_block, in_dim, n, &scales, &x[r * in_dim..(r + 1) * in_dim]);
         }
+        o0 += BLOCK;
     }
 
     (dx, dw)

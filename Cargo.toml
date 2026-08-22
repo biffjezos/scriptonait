@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/llm-core",
+    "crates/llm-bench",
 ]
 # crates/llm-gpu and crates/wasm-app are deliberately NOT workspace members.
 # They pull in wgpu / wasm-bindgen (and need the wasm32 target), so they're
@@ -14,9 +15,11 @@ version = "0.1.0"
 edition = "2021"
 license = "MIT"
 
+# Native release builds (llm-core's tests, llm-bench, the llm-train CLI
+# that does the actual pretraining). Speed, not size: nothing built from
+# this workspace is shipped to a browser. `crates/wasm-app` is its own
+# workspace and carries its own profile for the wasm bundle.
 [profile.release]
-opt-level = "z"
-lto = true
+opt-level = 3
+lto = "thin"
 codegen-units = 1
-panic = "abort"
-strip = true
