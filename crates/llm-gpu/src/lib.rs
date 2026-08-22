@@ -20,5 +20,5 @@ mod buffers;
 mod context;
 mod model;
 
-pub use context::{GpuContext, MAX_GPU_WINDOW};
+pub use context::{GpuContext, Kernel, ParamsPool, MAX_GPU_WINDOW};
 pub use model::{supports, GpuModel};

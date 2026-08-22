@@ -25,5 +25,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     for (var t: u32 = 0u; t < p.rows; t = t + 1u) {
         acc = acc + dy[t * p.dim + i] * x[t * p.dim + i] * inv_rms[t];
     }
-    dgain[i] = acc;
+    // Accumulates, so a whole batch adds into one gradient buffer the
+    // caller zeroes once per step (see linear_bwd_dw.wgsl).
+    dgain[i] = dgain[i] + acc;
 }

@@ -52,11 +52,49 @@ pub fn write_u32(queue: &wgpu::Queue, buffer: &wgpu::Buffer, data: &[u32]) {
     queue.write_buffer(buffer, 0, bytemuck::cast_slice(data));
 }
 
+/// Waits for `map_async` on a staging buffer and turns the result into a
+/// plain `Result`.
+///
+/// A failed map is not a bug in the caller and must never abort the wasm
+/// module: by far the most likely cause is that the *device* went away
+/// mid-step (a driver reset / TDR after a long-running submission, a
+/// browser-initiated device loss, or the tab losing its GPU on a
+/// suspend). Panicking here took the whole wasm instance down with it,
+/// which left every later call — including the training loop's own next
+/// step — hanging until an unrelated 120s timeout fired, reporting a
+/// timeout for what was really a lost device.
+async fn await_mapped(
+    device: &wgpu::Device,
+    slice: wgpu::BufferSlice<'_>,
+) -> Result<(), String> {
+    let (tx, rx) = futures_channel::oneshot::channel();
+    slice.map_async(wgpu::MapMode::Read, move |result| {
+        let _ = tx.send(result);
+    });
+    let _ = device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None });
+    match rx.await {
+        Err(_) => Err("GPU readback was cancelled before it completed (the device was most \
+                       likely lost mid-step)"
+            .to_string()),
+        Ok(Err(err)) => Err(format!(
+            "GPU readback failed ({err:?}). This usually means the WebGPU device was lost \
+             — commonly a driver watchdog reset after a long-running step. Training on CPU, \
+             or a smaller model/batch size, avoids it."
+        )),
+        Ok(Ok(())) => Ok(()),
+    }
+}
+
 /// Copies `buffer`'s first `len` f32s back to the host. Async because
 /// `wgpu`'s buffer mapping is inherently async (mandatory on the web,
 /// where the browser's WebGPU implementation is a JS Promise underneath);
 /// natively this resolves as soon as `device.poll(PollType::Wait)` returns.
-pub async fn read_f32(device: &wgpu::Device, queue: &wgpu::Queue, buffer: &wgpu::Buffer, len: usize) -> Vec<f32> {
+pub async fn read_f32(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    buffer: &wgpu::Buffer,
+    len: usize,
+) -> Result<Vec<f32>, String> {
     let byte_len = (len * std::mem::size_of::<f32>()) as u64;
     let staging = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("readback-staging"),
@@ -70,20 +108,15 @@ pub async fn read_f32(device: &wgpu::Device, queue: &wgpu::Queue, buffer: &wgpu:
     queue.submit(Some(encoder.finish()));
 
     let slice = staging.slice(..);
-    let (tx, rx) = futures_channel::oneshot::channel();
-    slice.map_async(wgpu::MapMode::Read, move |result| {
-        let _ = tx.send(result);
-    });
-    let _ = device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None });
-    rx.await
-        .expect("map_async callback dropped without firing")
-        .expect("failed to map GPU buffer for readback");
+    await_mapped(device, slice).await?;
 
-    let data = slice.get_mapped_range().expect("buffer was just confirmed mapped above");
+    let data = slice
+        .get_mapped_range()
+        .map_err(|err| format!("GPU buffer reported mapped but could not be read: {err:?}"))?;
     let result: Vec<f32> = bytemuck::cast_slice(&data).to_vec();
     drop(data);
     staging.unmap();
-    result
+    Ok(result)
 }
 
 /// Reads several buffers back to the host as one flat, concatenated
@@ -97,7 +130,11 @@ pub async fn read_f32(device: &wgpu::Device, queue: &wgpu::Queue, buffer: &wgpu:
 /// `copy_buffer_to_buffer` into one combined staging buffer within a
 /// single command buffer, submits once, and maps/awaits once - see
 /// `GpuModel::train_step`'s docs for the same fix applied to loss readback.
-pub async fn read_f32_concat(device: &wgpu::Device, queue: &wgpu::Queue, buffers: &[(&wgpu::Buffer, usize)]) -> Vec<f32> {
+pub async fn read_f32_concat(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    buffers: &[(&wgpu::Buffer, usize)],
+) -> Result<Vec<f32>, String> {
     let total_len: usize = buffers.iter().map(|(_, len)| len).sum();
     let byte_total = (total_len * std::mem::size_of::<f32>()) as u64;
     let staging = device.create_buffer(&wgpu::BufferDescriptor {
@@ -117,18 +154,13 @@ pub async fn read_f32_concat(device: &wgpu::Device, queue: &wgpu::Queue, buffers
     queue.submit(Some(encoder.finish()));
 
     let slice = staging.slice(..);
-    let (tx, rx) = futures_channel::oneshot::channel();
-    slice.map_async(wgpu::MapMode::Read, move |result| {
-        let _ = tx.send(result);
-    });
-    let _ = device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None });
-    rx.await
-        .expect("map_async callback dropped without firing")
-        .expect("failed to map GPU buffer for readback");
+    await_mapped(device, slice).await?;
 
-    let data = slice.get_mapped_range().expect("buffer was just confirmed mapped above");
+    let data = slice
+        .get_mapped_range()
+        .map_err(|err| format!("GPU buffer reported mapped but could not be read: {err:?}"))?;
     let result: Vec<f32> = bytemuck::cast_slice(&data).to_vec();
     drop(data);
     staging.unmap();
-    result
+    Ok(result)
 }

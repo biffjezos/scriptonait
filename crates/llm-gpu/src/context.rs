@@ -3,6 +3,7 @@
 //! plumbing doesn't get lost in the "what does the model compute" logic.
 
 use std::borrow::Cow;
+use std::cell::{Cell, RefCell};
 
 /// The largest sliding-window attention span this backend's naive
 /// (per-thread local-array) attention kernel supports — see
@@ -11,42 +12,114 @@ use std::borrow::Cow;
 /// fall back to the CPU backend instead of using this one.
 pub const MAX_GPU_WINDOW: usize = 256;
 
+/// A compute pipeline plus its bind group layout.
+///
+/// The layout is fetched once at build time rather than by calling
+/// `pipeline.get_bind_group_layout(0)` on every dispatch: that call
+/// allocates a fresh layout object each time, and on the web it is a
+/// round trip into the browser's WebGPU implementation — thousands of
+/// them per training step, for a value that never changes.
+pub struct Kernel {
+    pub pipeline: Kernel,
+    pub layout: wgpu::BindGroupLayout,
+}
+
 pub struct Pipelines {
-    pub linear: wgpu::ComputePipeline,
-    pub add_inplace: wgpu::ComputePipeline,
-    pub embedding_gather: wgpu::ComputePipeline,
-    pub rmsnorm: wgpu::ComputePipeline,
-    pub rope: wgpu::ComputePipeline,
-    pub attention: wgpu::ComputePipeline,
-    pub swiglu: wgpu::ComputePipeline,
+    pub linear: Kernel,
+    pub add_inplace: Kernel,
+    pub embedding_gather: Kernel,
+    pub rmsnorm: Kernel,
+    pub rope: Kernel,
+    pub attention: Kernel,
+    pub swiglu: Kernel,
     // Training-only (backward pass + optimizer) kernels.
-    pub linear_bwd_dx: wgpu::ComputePipeline,
-    pub linear_bwd_dw: wgpu::ComputePipeline,
-    pub rmsnorm_bwd_dx: wgpu::ComputePipeline,
-    pub rmsnorm_bwd_dgain: wgpu::ComputePipeline,
-    pub swiglu_bwd: wgpu::ComputePipeline,
-    pub attention_bwd_dscore: wgpu::ComputePipeline,
-    pub attention_bwd_dq: wgpu::ComputePipeline,
-    pub attention_bwd_dkdv: wgpu::ComputePipeline,
-    pub embedding_scatter_add: wgpu::ComputePipeline,
-    pub cross_entropy: wgpu::ComputePipeline,
-    pub zero: wgpu::ComputePipeline,
-    pub scale_inplace: wgpu::ComputePipeline,
-    pub adam_update: wgpu::ComputePipeline,
+    pub linear_bwd_dx: Kernel,
+    pub linear_bwd_dw: Kernel,
+    pub rmsnorm_bwd_dx: Kernel,
+    pub rmsnorm_bwd_dgain: Kernel,
+    pub swiglu_bwd: Kernel,
+    pub attention_bwd_dscore: Kernel,
+    pub attention_bwd_dq: Kernel,
+    pub attention_bwd_dkdv: Kernel,
+    pub embedding_scatter_add: Kernel,
+    pub cross_entropy: Kernel,
+    pub zero: Kernel,
+    pub scale_inplace: Kernel,
+    pub adam_update: Kernel,
+}
+
+/// A recycled pool of tiny uniform buffers, one per dispatch.
+///
+/// Every dispatch needs its own few-word `Params` buffer, and the buffer
+/// has to stay distinct from its neighbours' because several dispatches
+/// are encoded before the queue submit that runs them. Creating one per
+/// dispatch (which is what this replaces) meant thousands of real GPU
+/// buffer allocations per training step, each a round trip through the
+/// browser's WebGPU implementation. The buffers here are created once and
+/// rewritten with `queue.write_buffer`, which is ordered against the
+/// submits that consume them, so a slot handed out again on a later step
+/// can never disturb work already submitted.
+pub struct ParamsPool {
+    buffers: RefCell<Vec<wgpu::Buffer>>,
+    cursor: Cell<usize>,
+}
+
+impl ParamsPool {
+    fn new() -> Self {
+        Self { buffers: RefCell::new(Vec::new()), cursor: Cell::new(0) }
+    }
+
+    /// Starts handing slots out from the beginning again. Call once at
+    /// the start of each top-level GPU operation (a training step, one
+    /// generation forward pass), never mid-encoding.
+    pub fn reset(&self) {
+        self.cursor.set(0);
+    }
+
+    /// The next free slot, written with `value`. `wgpu::Buffer` is a
+    /// cheap reference-counted handle, so the clone is a refcount bump,
+    /// not an allocation.
+    pub fn alloc<T: bytemuck::Pod>(&self, device: &wgpu::Device, queue: &wgpu::Queue, value: T) -> wgpu::Buffer {
+        const SLOT_BYTES: u64 = 32; // every Params struct here is <= 32 bytes
+        debug_assert!(std::mem::size_of::<T>() as u64 <= SLOT_BYTES);
+        let index = self.cursor.get();
+        self.cursor.set(index + 1);
+        let mut buffers = self.buffers.borrow_mut();
+        if index == buffers.len() {
+            buffers.push(device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("params-pool-slot"),
+                size: SLOT_BYTES,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }));
+        }
+        let buffer = buffers[index].clone();
+        drop(buffers);
+        queue.write_buffer(&buffer, 0, bytemuck::bytes_of(&value));
+        buffer
+    }
 }
 
 pub struct GpuContext {
     pub device: wgpu::Device,
     pub queue: wgpu::Queue,
     pub pipelines: Pipelines,
+    pub params: ParamsPool,
+    /// What the browser actually gave us. Reported to the UI because
+    /// "training is slow" has very different answers depending on whether
+    /// this is a real GPU or a software rasterizer.
+    pub adapter_summary: String,
+    /// True when the adapter is a CPU/software implementation (SwiftShader,
+    /// WARP, lavapipe) rather than real hardware.
+    pub is_software: bool,
 }
 
-fn make_pipeline(device: &wgpu::Device, label: &str, source: &str) -> wgpu::ComputePipeline {
+fn make_pipeline(device: &wgpu::Device, label: &str, source: &str) -> Kernel {
     let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some(label),
         source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(source)),
     });
-    device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+    let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
         label: Some(label),
         // `None` asks wgpu to derive the bind group layout from the shader
         // itself instead of us hand-declaring one that has to be kept in
@@ -56,7 +129,9 @@ fn make_pipeline(device: &wgpu::Device, label: &str, source: &str) -> wgpu::Comp
         entry_point: Some("main"),
         compilation_options: wgpu::PipelineCompilationOptions::default(),
         cache: None,
-    })
+    });
+    let layout = pipeline.get_bind_group_layout(0);
+    Kernel { pipeline, layout }
 }
 
 impl GpuContext {
@@ -68,7 +143,13 @@ impl GpuContext {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
         let adapter = instance
             .request_adapter(&wgpu::RequestAdapterOptions {
-                power_preference: wgpu::PowerPreference::LowPower,
+                // HighPerformance, not LowPower: on a laptop with both
+                // an integrated and a discrete GPU, LowPower explicitly
+                // asks the browser for the *integrated* one. That is a
+                // reasonable default for drawing a UI and precisely the
+                // wrong one for training a model, which is the only
+                // reason this backend exists.
+                power_preference: wgpu::PowerPreference::HighPerformance,
                 compatible_surface: None,
                 force_fallback_adapter: false,
                 ..Default::default()
@@ -146,6 +227,16 @@ impl GpuContext {
             adam_update: make_pipeline(&device, "adam_update", include_str!("shaders/adam_update.wgsl")),
         };
 
-        Ok(Self { device, queue, pipelines })
+        let info = adapter.get_info();
+        let is_software = info.device_type == wgpu::DeviceType::Cpu;
+        let adapter_summary = format!(
+            "{} ({:?}, {:?}){}",
+            info.name,
+            info.backend,
+            info.device_type,
+            if is_software { " — SOFTWARE renderer, not a real GPU" } else { "" }
+        );
+
+        Ok(Self { device, queue, pipelines, params: ParamsPool::new(), adapter_summary, is_software })
     }
 }

@@ -24,8 +24,8 @@ use llm_core::config::ModelConfig;
 use llm_core::corpus::Batch;
 use llm_core::model::ModelWeights;
 
-use crate::buffers::{read_f32, read_f32_concat, storage_f32, uniform, upload_f32, upload_u32, write_u32};
-use crate::context::{GpuContext, MAX_GPU_WINDOW};
+use crate::buffers::{read_f32, read_f32_concat, storage_f32, upload_f32, upload_u32, write_u32};
+use crate::context::{GpuContext, Kernel, MAX_GPU_WINDOW};
 
 fn ceil_div(a: usize, b: usize) -> u32 {
     ((a + b - 1) / b) as u32
@@ -40,14 +40,14 @@ struct P4 {
     d: u32,
 }
 
-fn dispatch(encoder: &mut wgpu::CommandEncoder, ctx: &GpuContext, pipeline: &wgpu::ComputePipeline, entries: &[wgpu::BindGroupEntry], workgroups: (u32, u32, u32)) {
+fn dispatch(encoder: &mut wgpu::CommandEncoder, ctx: &GpuContext, kernel: &Kernel, entries: &[wgpu::BindGroupEntry], workgroups: (u32, u32, u32)) {
     let bind_group = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: None,
-        layout: &pipeline.get_bind_group_layout(0),
+        layout: &kernel.layout,
         entries,
     });
     let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: None, timestamp_writes: None });
-    pass.set_pipeline(pipeline);
+    pass.set_pipeline(&kernel.pipeline);
     pass.set_bind_group(0, &bind_group, &[]);
     pass.dispatch_workgroups(workgroups.0, workgroups.1, workgroups.2);
 }
@@ -70,18 +70,20 @@ fn dispatch(encoder: &mut wgpu::CommandEncoder, ctx: &GpuContext, pipeline: &wgp
 // thousands of unnecessary round trips.
 
 fn dispatch_linear(encoder: &mut wgpu::CommandEncoder, ctx: &GpuContext, x: &wgpu::Buffer, w: &wgpu::Buffer, y: &wgpu::Buffer, rows: usize, in_dim: usize, out_dim: usize) {
-    let params = uniform(&ctx.device, "linear-params", P4 { a: rows as u32, b: in_dim as u32, c: out_dim as u32, d: 0 });
+    let params = ctx.params.alloc(&ctx.device, &ctx.queue, P4 { a: rows as u32, b: in_dim as u32, c: out_dim as u32, d: 0 });
     let entries = [
         wgpu::BindGroupEntry { binding: 0, resource: params.as_entire_binding() },
         wgpu::BindGroupEntry { binding: 1, resource: x.as_entire_binding() },
         wgpu::BindGroupEntry { binding: 2, resource: w.as_entire_binding() },
         wgpu::BindGroupEntry { binding: 3, resource: y.as_entire_binding() },
     ];
-    dispatch(encoder, ctx, &ctx.pipelines.linear, &entries, (ceil_div(rows, 8), ceil_div(out_dim, 8), 1));
+    // 16x16 tiles, and gid.x indexes out_dim / gid.y indexes rows —
+    // must match shaders/linear.wgsl's dispatch convention.
+    dispatch(encoder, ctx, &ctx.pipelines.linear, &entries, (ceil_div(out_dim, 16), ceil_div(rows, 16), 1));
 }
 
 fn dispatch_add_inplace(encoder: &mut wgpu::CommandEncoder, ctx: &GpuContext, dst: &wgpu::Buffer, src: &wgpu::Buffer, len: usize) {
-    let params = uniform(&ctx.device, "add-params", P4 { a: len as u32, b: 0, c: 0, d: 0 });
+    let params = ctx.params.alloc(&ctx.device, &ctx.queue, P4 { a: len as u32, b: 0, c: 0, d: 0 });
     let entries = [
         wgpu::BindGroupEntry { binding: 0, resource: params.as_entire_binding() },
         wgpu::BindGroupEntry { binding: 1, resource: dst.as_entire_binding() },
@@ -91,7 +93,7 @@ fn dispatch_add_inplace(encoder: &mut wgpu::CommandEncoder, ctx: &GpuContext, ds
 }
 
 fn dispatch_gather(encoder: &mut wgpu::CommandEncoder, ctx: &GpuContext, table: &wgpu::Buffer, ids: &wgpu::Buffer, out: &wgpu::Buffer, t_len: usize, hidden: usize) {
-    let params = uniform(&ctx.device, "gather-params", P4 { a: t_len as u32, b: hidden as u32, c: 0, d: 0 });
+    let params = ctx.params.alloc(&ctx.device, &ctx.queue, P4 { a: t_len as u32, b: hidden as u32, c: 0, d: 0 });
     let entries = [
         wgpu::BindGroupEntry { binding: 0, resource: params.as_entire_binding() },
         wgpu::BindGroupEntry { binding: 1, resource: table.as_entire_binding() },
@@ -112,7 +114,7 @@ struct RmsnormParams {
 
 #[allow(clippy::too_many_arguments)]
 fn dispatch_rmsnorm(encoder: &mut wgpu::CommandEncoder, ctx: &GpuContext, x: &wgpu::Buffer, gain: &wgpu::Buffer, y: &wgpu::Buffer, inv_rms_out: &wgpu::Buffer, rows: usize, dim: usize) {
-    let params = uniform(&ctx.device, "rmsnorm-params", RmsnormParams { rows: rows as u32, dim: dim as u32, eps: 1e-6, _pad: 0 });
+    let params = ctx.params.alloc(&ctx.device, &ctx.queue, RmsnormParams { rows: rows as u32, dim: dim as u32, eps: 1e-6, _pad: 0 });
     let entries = [
         wgpu::BindGroupEntry { binding: 0, resource: params.as_entire_binding() },
         wgpu::BindGroupEntry { binding: 1, resource: x.as_entire_binding() },
@@ -124,7 +126,7 @@ fn dispatch_rmsnorm(encoder: &mut wgpu::CommandEncoder, ctx: &GpuContext, x: &wg
 }
 
 fn dispatch_rope(encoder: &mut wgpu::CommandEncoder, ctx: &GpuContext, x: &wgpu::Buffer, t_len: usize, heads: usize, head_dim: usize, inverse: bool) {
-    let params = uniform(&ctx.device, "rope-params", P4 { a: t_len as u32, b: heads as u32, c: head_dim as u32, d: inverse as u32 });
+    let params = ctx.params.alloc(&ctx.device, &ctx.queue, P4 { a: t_len as u32, b: heads as u32, c: head_dim as u32, d: inverse as u32 });
     let entries = [
         wgpu::BindGroupEntry { binding: 0, resource: params.as_entire_binding() },
         wgpu::BindGroupEntry { binding: 1, resource: x.as_entire_binding() },
@@ -146,7 +148,7 @@ fn dispatch_attention(
     head_dim: usize,
     window: usize,
 ) {
-    let params = uniform(&ctx.device, "attn-params", P4 { a: t_len as u32, b: heads as u32, c: head_dim as u32, d: window as u32 });
+    let params = ctx.params.alloc(&ctx.device, &ctx.queue, P4 { a: t_len as u32, b: heads as u32, c: head_dim as u32, d: window as u32 });
     let entries = [
         wgpu::BindGroupEntry { binding: 0, resource: params.as_entire_binding() },
         wgpu::BindGroupEntry { binding: 1, resource: q.as_entire_binding() },
@@ -159,7 +161,7 @@ fn dispatch_attention(
 }
 
 fn dispatch_swiglu(encoder: &mut wgpu::CommandEncoder, ctx: &GpuContext, gate: &wgpu::Buffer, up: &wgpu::Buffer, out: &wgpu::Buffer, len: usize) {
-    let params = uniform(&ctx.device, "swiglu-params", P4 { a: len as u32, b: 0, c: 0, d: 0 });
+    let params = ctx.params.alloc(&ctx.device, &ctx.queue, P4 { a: len as u32, b: 0, c: 0, d: 0 });
     let entries = [
         wgpu::BindGroupEntry { binding: 0, resource: params.as_entire_binding() },
         wgpu::BindGroupEntry { binding: 1, resource: gate.as_entire_binding() },
@@ -172,25 +174,27 @@ fn dispatch_swiglu(encoder: &mut wgpu::CommandEncoder, ctx: &GpuContext, gate: &
 // --- Backward-pass dispatch helpers -----------------------------------
 
 fn dispatch_linear_bwd_dx(encoder: &mut wgpu::CommandEncoder, ctx: &GpuContext, dy: &wgpu::Buffer, w: &wgpu::Buffer, dx: &wgpu::Buffer, rows: usize, in_dim: usize, out_dim: usize) {
-    let params = uniform(&ctx.device, "lbdx-params", P4 { a: rows as u32, b: in_dim as u32, c: out_dim as u32, d: 0 });
+    let params = ctx.params.alloc(&ctx.device, &ctx.queue, P4 { a: rows as u32, b: in_dim as u32, c: out_dim as u32, d: 0 });
     let entries = [
         wgpu::BindGroupEntry { binding: 0, resource: params.as_entire_binding() },
         wgpu::BindGroupEntry { binding: 1, resource: dy.as_entire_binding() },
         wgpu::BindGroupEntry { binding: 2, resource: w.as_entire_binding() },
         wgpu::BindGroupEntry { binding: 3, resource: dx.as_entire_binding() },
     ];
-    dispatch(encoder, ctx, &ctx.pipelines.linear_bwd_dx, &entries, (ceil_div(rows, 8), ceil_div(in_dim, 8), 1));
+    // gid.x indexes in_dim, gid.y indexes rows — see shaders/linear_bwd_dx.wgsl.
+    dispatch(encoder, ctx, &ctx.pipelines.linear_bwd_dx, &entries, (ceil_div(in_dim, 16), ceil_div(rows, 16), 1));
 }
 
 fn dispatch_linear_bwd_dw(encoder: &mut wgpu::CommandEncoder, ctx: &GpuContext, dy: &wgpu::Buffer, x: &wgpu::Buffer, dw: &wgpu::Buffer, rows: usize, in_dim: usize, out_dim: usize) {
-    let params = uniform(&ctx.device, "lbdw-params", P4 { a: rows as u32, b: in_dim as u32, c: out_dim as u32, d: 0 });
+    let params = ctx.params.alloc(&ctx.device, &ctx.queue, P4 { a: rows as u32, b: in_dim as u32, c: out_dim as u32, d: 0 });
     let entries = [
         wgpu::BindGroupEntry { binding: 0, resource: params.as_entire_binding() },
         wgpu::BindGroupEntry { binding: 1, resource: dy.as_entire_binding() },
         wgpu::BindGroupEntry { binding: 2, resource: x.as_entire_binding() },
         wgpu::BindGroupEntry { binding: 3, resource: dw.as_entire_binding() },
     ];
-    dispatch(encoder, ctx, &ctx.pipelines.linear_bwd_dw, &entries, (ceil_div(out_dim, 8), ceil_div(in_dim, 8), 1));
+    // gid.x indexes in_dim, gid.y indexes out_dim — see shaders/linear_bwd_dw.wgsl.
+    dispatch(encoder, ctx, &ctx.pipelines.linear_bwd_dw, &entries, (ceil_div(in_dim, 16), ceil_div(out_dim, 16), 1));
 }
 
 /// Runs both halves of a linear layer's backward pass.
@@ -212,7 +216,7 @@ fn dispatch_rmsnorm_bwd(
     rows: usize,
     dim: usize,
 ) {
-    let params_dx = uniform(&ctx.device, "rbdx-params", P4 { a: rows as u32, b: dim as u32, c: 0, d: 0 });
+    let params_dx = ctx.params.alloc(&ctx.device, &ctx.queue, P4 { a: rows as u32, b: dim as u32, c: 0, d: 0 });
     let entries_dx = [
         wgpu::BindGroupEntry { binding: 0, resource: params_dx.as_entire_binding() },
         wgpu::BindGroupEntry { binding: 1, resource: dy.as_entire_binding() },
@@ -223,7 +227,7 @@ fn dispatch_rmsnorm_bwd(
     ];
     dispatch(encoder, ctx, &ctx.pipelines.rmsnorm_bwd_dx, &entries_dx, (ceil_div(rows, 64), 1, 1));
 
-    let params_dg = uniform(&ctx.device, "rbdg-params", P4 { a: rows as u32, b: dim as u32, c: 0, d: 0 });
+    let params_dg = ctx.params.alloc(&ctx.device, &ctx.queue, P4 { a: rows as u32, b: dim as u32, c: 0, d: 0 });
     let entries_dg = [
         wgpu::BindGroupEntry { binding: 0, resource: params_dg.as_entire_binding() },
         wgpu::BindGroupEntry { binding: 1, resource: dy.as_entire_binding() },
@@ -235,7 +239,7 @@ fn dispatch_rmsnorm_bwd(
 }
 
 fn dispatch_swiglu_bwd(encoder: &mut wgpu::CommandEncoder, ctx: &GpuContext, d_act: &wgpu::Buffer, gate: &wgpu::Buffer, up: &wgpu::Buffer, dgate: &wgpu::Buffer, dup: &wgpu::Buffer, len: usize) {
-    let params = uniform(&ctx.device, "sgbwd-params", P4 { a: len as u32, b: 0, c: 0, d: 0 });
+    let params = ctx.params.alloc(&ctx.device, &ctx.queue, P4 { a: len as u32, b: 0, c: 0, d: 0 });
     let entries = [
         wgpu::BindGroupEntry { binding: 0, resource: params.as_entire_binding() },
         wgpu::BindGroupEntry { binding: 1, resource: d_act.as_entire_binding() },
@@ -268,7 +272,7 @@ fn dispatch_attention_bwd(
     head_dim: usize,
     window: usize,
 ) {
-    let params = uniform(&ctx.device, "abwd-params", P4 { a: t_len as u32, b: heads as u32, c: head_dim as u32, d: window as u32 });
+    let params = ctx.params.alloc(&ctx.device, &ctx.queue, P4 { a: t_len as u32, b: heads as u32, c: head_dim as u32, d: window as u32 });
 
     let entries_score = [
         wgpu::BindGroupEntry { binding: 0, resource: params.as_entire_binding() },
@@ -279,7 +283,7 @@ fn dispatch_attention_bwd(
     ];
     dispatch(encoder, ctx, &ctx.pipelines.attention_bwd_dscore, &entries_score, (ceil_div(t_len, 8), ceil_div(heads, 8), 1));
 
-    let params_q = uniform(&ctx.device, "abwdq-params", P4 { a: t_len as u32, b: heads as u32, c: head_dim as u32, d: window as u32 });
+    let params_q = ctx.params.alloc(&ctx.device, &ctx.queue, P4 { a: t_len as u32, b: heads as u32, c: head_dim as u32, d: window as u32 });
     let entries_q = [
         wgpu::BindGroupEntry { binding: 0, resource: params_q.as_entire_binding() },
         wgpu::BindGroupEntry { binding: 1, resource: d_score_scratch.as_entire_binding() },
@@ -288,7 +292,7 @@ fn dispatch_attention_bwd(
     ];
     dispatch(encoder, ctx, &ctx.pipelines.attention_bwd_dq, &entries_q, (ceil_div(t_len, 8), ceil_div(heads, 8), 1));
 
-    let params_kv = uniform(&ctx.device, "abwdkv-params", P4 { a: t_len as u32, b: heads as u32, c: head_dim as u32, d: window as u32 });
+    let params_kv = ctx.params.alloc(&ctx.device, &ctx.queue, P4 { a: t_len as u32, b: heads as u32, c: head_dim as u32, d: window as u32 });
     let entries_kv = [
         wgpu::BindGroupEntry { binding: 0, resource: params_kv.as_entire_binding() },
         wgpu::BindGroupEntry { binding: 1, resource: d_score_scratch.as_entire_binding() },
@@ -302,7 +306,7 @@ fn dispatch_attention_bwd(
 }
 
 fn dispatch_embedding_scatter_add(encoder: &mut wgpu::CommandEncoder, ctx: &GpuContext, d_rows: &wgpu::Buffer, ids: &wgpu::Buffer, table_grad: &wgpu::Buffer, t_len: usize, hidden: usize, vocab: usize) {
-    let params = uniform(&ctx.device, "embgrad-params", P4 { a: t_len as u32, b: hidden as u32, c: vocab as u32, d: 0 });
+    let params = ctx.params.alloc(&ctx.device, &ctx.queue, P4 { a: t_len as u32, b: hidden as u32, c: vocab as u32, d: 0 });
     let entries = [
         wgpu::BindGroupEntry { binding: 0, resource: params.as_entire_binding() },
         wgpu::BindGroupEntry { binding: 1, resource: d_rows.as_entire_binding() },
@@ -313,7 +317,7 @@ fn dispatch_embedding_scatter_add(encoder: &mut wgpu::CommandEncoder, ctx: &GpuC
 }
 
 fn dispatch_cross_entropy(encoder: &mut wgpu::CommandEncoder, ctx: &GpuContext, logits: &wgpu::Buffer, targets: &wgpu::Buffer, d_logits: &wgpu::Buffer, loss_out: &wgpu::Buffer, t_len: usize) {
-    let params = uniform(&ctx.device, "ce-params", P4 { a: t_len as u32, b: 0, c: 0, d: 0 });
+    let params = ctx.params.alloc(&ctx.device, &ctx.queue, P4 { a: t_len as u32, b: 0, c: 0, d: 0 });
     let entries = [
         wgpu::BindGroupEntry { binding: 0, resource: params.as_entire_binding() },
         wgpu::BindGroupEntry { binding: 1, resource: logits.as_entire_binding() },
@@ -325,7 +329,7 @@ fn dispatch_cross_entropy(encoder: &mut wgpu::CommandEncoder, ctx: &GpuContext, 
 }
 
 fn dispatch_zero(encoder: &mut wgpu::CommandEncoder, ctx: &GpuContext, buf: &wgpu::Buffer, len: usize) {
-    let params = uniform(&ctx.device, "zero-params", P4 { a: len as u32, b: 0, c: 0, d: 0 });
+    let params = ctx.params.alloc(&ctx.device, &ctx.queue, P4 { a: len as u32, b: 0, c: 0, d: 0 });
     let entries = [
         wgpu::BindGroupEntry { binding: 0, resource: params.as_entire_binding() },
         wgpu::BindGroupEntry { binding: 1, resource: buf.as_entire_binding() },
@@ -343,7 +347,7 @@ struct ScaleParams {
 }
 
 fn dispatch_scale(encoder: &mut wgpu::CommandEncoder, ctx: &GpuContext, buf: &wgpu::Buffer, scale: f32, len: usize) {
-    let params = uniform(&ctx.device, "scale-params", ScaleParams { len: len as u32, scale, _p0: 0, _p1: 0 });
+    let params = ctx.params.alloc(&ctx.device, &ctx.queue, ScaleParams { len: len as u32, scale, _p0: 0, _p1: 0 });
     let entries = [
         wgpu::BindGroupEntry { binding: 0, resource: params.as_entire_binding() },
         wgpu::BindGroupEntry { binding: 1, resource: buf.as_entire_binding() },
@@ -362,7 +366,7 @@ struct AdamParams {
 
 #[allow(clippy::too_many_arguments)]
 fn dispatch_adam(encoder: &mut wgpu::CommandEncoder, ctx: &GpuContext, w: &wgpu::Buffer, g: &wgpu::Buffer, m: &wgpu::Buffer, v: &wgpu::Buffer, lr: f32, bias1: f32, bias2: f32, len: usize) {
-    let params = uniform(&ctx.device, "adam-params", AdamParams { len: len as u32, lr, bias1, bias2 });
+    let params = ctx.params.alloc(&ctx.device, &ctx.queue, AdamParams { len: len as u32, lr, bias1, bias2 });
     let entries = [
         wgpu::BindGroupEntry { binding: 0, resource: params.as_entire_binding() },
         wgpu::BindGroupEntry { binding: 1, resource: w.as_entire_binding() },
@@ -486,10 +490,6 @@ pub struct GpuModel {
     grad_layers: Vec<GpuLayerTensors>,
     grad_final_norm_gain: wgpu::Buffer,
 
-    grad_accum_embed: wgpu::Buffer,
-    grad_accum_layers: Vec<GpuLayerTensors>,
-    grad_accum_final_norm_gain: wgpu::Buffer,
-
     adam_m_embed: wgpu::Buffer,
     adam_m_layers: Vec<GpuLayerTensors>,
     adam_m_final_norm_gain: wgpu::Buffer,
@@ -604,9 +604,6 @@ impl GpuModel {
             grad_layers: mk_layer_tensors("grad"),
             grad_final_norm_gain: storage_f32(device, "grad_final_norm_gain", h, false),
 
-            grad_accum_embed: storage_f32(device, "grad_accum_embed", vocab * h, false),
-            grad_accum_layers: mk_layer_tensors("grad_accum"),
-            grad_accum_final_norm_gain: storage_f32(device, "grad_accum_final_norm_gain", h, false),
 
             adam_m_embed: storage_f32(device, "adam_m_embed", vocab * h, false),
             adam_m_layers: mk_layer_tensors("adam_m"),
@@ -729,13 +726,14 @@ impl GpuModel {
     /// all a caller doing next-token sampling needs. Reuses this model's
     /// scratch buffers, so it's not safe to call concurrently with itself.
     pub async fn forward_last_logits(&self, ctx: &GpuContext, tokens: &[u32]) -> Result<Vec<f32>, String> {
+        ctx.params.reset();
         let t_len = tokens.len();
         if t_len == 0 || t_len > self.config.context_len {
             return Err(format!("tokens.len()={t_len} must be in 1..={}", self.config.context_len));
         }
         let vocab = self.config.vocab_size();
         self.forward(ctx, tokens);
-        let all_logits = read_f32(&ctx.device, &ctx.queue, &self.logits, t_len * vocab).await;
+        let all_logits = read_f32(&ctx.device, &ctx.queue, &self.logits, t_len * vocab).await?;
         Ok(all_logits[(t_len - 1) * vocab..t_len * vocab].to_vec())
     }
 
@@ -766,6 +764,7 @@ impl GpuModel {
         v.push(&self.final_norm_gain);
         v
     }
+
     fn grad_buffers(&self) -> Vec<&wgpu::Buffer> {
         let mut v = vec![&self.grad_embed];
         for l in &self.grad_layers {
@@ -774,14 +773,7 @@ impl GpuModel {
         v.push(&self.grad_final_norm_gain);
         v
     }
-    fn grad_accum_buffers(&self) -> Vec<&wgpu::Buffer> {
-        let mut v = vec![&self.grad_accum_embed];
-        for l in &self.grad_accum_layers {
-            v.extend(l.buffers());
-        }
-        v.push(&self.grad_accum_final_norm_gain);
-        v
-    }
+
     fn adam_m_buffers(&self) -> Vec<&wgpu::Buffer> {
         let mut v = vec![&self.adam_m_embed];
         for l in &self.adam_m_layers {
@@ -802,7 +794,10 @@ impl GpuModel {
     /// Backward pass for the sequence most recently run through
     /// `forward`, given `d_logits` already populated (see
     /// `dispatch_cross_entropy`). Fills `self.grad_*` (assumed
-    /// zeroed beforehand by the caller). Mirrors `llm_core::model::backward`.
+    /// zeroed beforehand by the caller). Every gradient kernel
+    /// accumulates (`grad += ...`), so calling this once per sequence
+    /// sums a whole batch into one buffer set — mirrors
+    /// `llm_core::model::backward_into`.
     /// Submits once per layer, same reasoning as `forward` - see its docs.
     fn backward(&self, ctx: &GpuContext, tokens: &[u32]) {
         let t_len = tokens.len();
@@ -898,6 +893,7 @@ impl GpuModel {
     /// backward pass — see `wasm-app`'s `debug_compare_gpu_cpu_gradient`,
     /// which does exactly that comparison.
     pub async fn debug_grad_embed(&self, ctx: &GpuContext, tokens: &[u32], targets: &[u32]) -> Result<Vec<f32>, String> {
+        ctx.params.reset();
         let t_len = tokens.len();
         if t_len == 0 || t_len != self.config.context_len {
             return Err(format!("tokens.len()={t_len} must equal this model's context_len ({})", self.config.context_len));
@@ -921,7 +917,7 @@ impl GpuModel {
         }
         self.backward(ctx, tokens);
 
-        Ok(read_f32(&ctx.device, &ctx.queue, &self.grad_embed, vocab * h).await)
+        read_f32(&ctx.device, &ctx.queue, &self.grad_embed, vocab * h).await
     }
 
     /// Samples nothing itself (the caller already sampled `batch` via
@@ -948,6 +944,10 @@ impl GpuModel {
             ));
         }
         let t_len = batch.context_len;
+        // Hands out per-dispatch uniform slots from the top again; safe
+        // here and only here, since nothing from the previous step is
+        // still being encoded (its loss readback already completed).
+        ctx.params.reset();
 
         let lens = self.tensor_lens();
 
@@ -959,8 +959,8 @@ impl GpuModel {
         // internally; everything else here is cheap elementwise work
         // batched into one submission per phase.
         {
-            let mut encoder = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("train-step-zero-accum") });
-            self.zero_all(&mut encoder, ctx, &self.grad_accum_buffers(), &lens);
+            let mut encoder = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("train-step-zero") });
+            self.zero_all(&mut encoder, ctx, &self.grad_buffers(), &lens);
             dispatch_zero(&mut encoder, ctx, &self.loss_accum, t_len);
             ctx.queue.submit(Some(encoder.finish()));
         }
@@ -969,17 +969,6 @@ impl GpuModel {
             let start = b * t_len;
             let input = &batch.inputs[start..start + t_len];
             let target = &batch.targets[start..start + t_len];
-
-            // zero/cross-entropy/grad-accum are all cheap elementwise
-            // kernels (zero-fill, add) - fast enough that batching all of
-            // them into one submission each isn't a TDR risk, unlike
-            // forward/backward's matrix multiplies. Those two now manage
-            // their own per-layer submissions internally (see their docs).
-            {
-                let mut encoder = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("train-step-zero-grad") });
-                self.zero_all(&mut encoder, ctx, &self.grad_buffers(), &lens);
-                ctx.queue.submit(Some(encoder.finish()));
-            }
 
             self.forward(ctx, input);
             write_u32(&ctx.queue, &self.targets, target);
@@ -990,22 +979,19 @@ impl GpuModel {
                 ctx.queue.submit(Some(encoder.finish()));
             }
 
+            // No per-sequence zero-then-add of the whole gradient set any
+            // more: every gradient kernel accumulates (see
+            // linear_bwd_dw.wgsl), so the batch adds straight into one
+            // buffer set that was zeroed once above. That removed two
+            // full passes over every gradient tensor per sequence - for a
+            // 15M-parameter model at batch 16, about a gigabyte of
+            // pointless memory traffic and ~2600 dispatches per step.
             self.backward(ctx, input);
-
-            {
-                let mut encoder = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("train-step-grad-accum") });
-                // grad_accum_buffers()/grad_buffers() are built from the same
-                // shape list as `lens`, so all three zip up in lockstep.
-                for ((accum, g), &len) in self.grad_accum_buffers().into_iter().zip(self.grad_buffers()).zip(&lens) {
-                    dispatch_add_inplace(&mut encoder, ctx, accum, g, len);
-                }
-                ctx.queue.submit(Some(encoder.finish()));
-            }
         }
 
         {
             let mut encoder = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("train-step-scale-and-adam") });
-            for (buf, &len) in self.grad_accum_buffers().into_iter().zip(&lens) {
+            for (buf, &len) in self.grad_buffers().into_iter().zip(&lens) {
                 dispatch_scale(&mut encoder, ctx, buf, 1.0 / batch.batch_size as f32, len);
             }
 
@@ -1014,7 +1000,7 @@ impl GpuModel {
             let bias1 = 1.0 - 0.9f32.powi(step as i32);
             let bias2 = 1.0 - 0.999f32.powi(step as i32);
             let weight_bufs = self.weight_buffers();
-            let grad_bufs = self.grad_accum_buffers();
+            let grad_bufs = self.grad_buffers();
             let m_bufs = self.adam_m_buffers();
             let v_bufs = self.adam_v_buffers();
             for i in 0..weight_bufs.len() {
@@ -1028,7 +1014,7 @@ impl GpuModel {
         // tokens, then mean over the batch) - just reordered, since
         // addition is commutative/associative and every sequence has the
         // same t_len.
-        let accum = read_f32(&ctx.device, &ctx.queue, &self.loss_accum, t_len).await;
+        let accum = read_f32(&ctx.device, &ctx.queue, &self.loss_accum, t_len).await?;
         let total_loss: f32 = accum.iter().sum();
         Ok(total_loss / (t_len * batch.batch_size) as f32)
     }
@@ -1049,7 +1035,7 @@ impl GpuModel {
     /// sync weights this backend trained back to the canonical CPU copy
     /// (see `wasm-app`'s `sync_weights_from_gpu`), since `train_step`
     /// only ever updates the GPU-resident copy.
-    pub async fn read_all_weights(&self, ctx: &GpuContext) -> Vec<f32> {
+    pub async fn read_all_weights(&self, ctx: &GpuContext) -> Result<Vec<f32>, String> {
         let lens = self.tensor_lens();
         let bufs: Vec<(&wgpu::Buffer, usize)> = self.weight_buffers().into_iter().zip(lens).collect();
         read_f32_concat(&ctx.device, &ctx.queue, &bufs).await
