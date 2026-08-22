@@ -204,11 +204,26 @@ button.secondary,
 }
 
 
+.sources-toolbar {
+  display: flex;
+  gap: 0.5rem;
+  margin-top: 0.5rem;
+}
+
+.sources-toolbar input {
+  flex: 1;
+  min-width: 8rem;
+}
+
+/* Hundreds of sources scroll inside the panel instead of pushing the
+   rest of the page - including the Train button - off the screen. */
 .sources-list {
   display: flex;
   flex-direction: column;
   gap: 0.5rem;
   margin-top: 0.5rem;
+  max-height: 22rem;
+  overflow-y: auto;
 }
 
 .empty-hint {
@@ -219,6 +234,7 @@ button.secondary,
 .source-item {
   display: flex;
   align-items: center;
+  flex-shrink: 0;
   gap: 0.75rem;
   padding: 0.5rem 0.75rem;
   border: 1px solid var(--border);

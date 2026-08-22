@@ -508,16 +508,38 @@ function newSourceId() {
     : `${Date.now()}-${Math.random().toString(36).slice(2)}`;
 }
 
+// A few hundred sources is a normal amount to load at once, and a few
+// hundred rows is not a list anybody can use: it buries the rest of the
+// page, and every render would rebuild all of it. The list scrolls
+// (capped in CSS), rows above this many are not drawn at all, and the
+// filter is how you reach the ones that aren't.
+const MAX_SOURCE_ROWS = 50;
+let sourceFilter = '';
+
 /// Draw the list from memory. Synchronous on purpose: nothing it needs
 /// can be slow, so nothing can stop it running.
 function renderSources() {
   const list = $('sources-list');
+  const toolbar = $('sources-toolbar');
+  // The filter and Remove all only exist to make a long list usable, so
+  // they stay out of the way of a short one.
+  toolbar.hidden = sources.length <= MAX_SOURCE_ROWS && !sourceFilter;
+  const needle = sourceFilter.toLowerCase();
+  const matches = needle
+    ? sources.filter((source) => (source.title || '').toLowerCase().includes(needle))
+    : sources;
+
   if (sources.length === 0) {
     list.innerHTML = '<p class="empty-hint">Nothing added yet.</p>';
+  } else if (matches.length === 0) {
+    list.innerHTML = `<p class="empty-hint">No source matches "${escapeHtml(sourceFilter)}".</p>`;
   } else {
-    list.innerHTML = sources
-      .map(
-        (source) => `
+    const shown = matches.slice(0, MAX_SOURCE_ROWS);
+    const hidden = matches.length - shown.length;
+    list.innerHTML =
+      shown
+        .map(
+          (source) => `
         <div class="source-item" data-id="${source.id}">
           <div class="meta">
             <span class="title">${escapeHtml(source.title)}</span>
@@ -526,15 +548,49 @@ function renderSources() {
           </div>
           <button type="button" class="secondary remove-source" data-id="${source.id}">Remove</button>
         </div>`,
-      )
-      .join('');
-    for (const button of list.querySelectorAll('.remove-source')) {
-      button.addEventListener('click', () => removeSource(button.dataset.id));
-    }
+        )
+        .join('') +
+      (hidden > 0
+        ? `<p class="empty-hint">${hidden.toLocaleString()} more not shown — filter by name to reach them.</p>`
+        : '');
   }
   updateSourceSummary(sources);
   updateGuidance();
 }
+
+// One listener on the container instead of one per row: with hundreds of
+// sources, re-binding a button per row on every render is the expensive
+// part of drawing the list.
+$('sources-list').addEventListener('click', (event) => {
+  const button = event.target.closest('.remove-source');
+  if (button) removeSource(button.dataset.id);
+});
+
+$('sources-filter').addEventListener('input', (event) => {
+  sourceFilter = event.target.value.trim();
+  renderSources();
+});
+
+$('remove-all-btn').addEventListener('click', async () => {
+  if (sources.length === 0) return;
+  if (!confirm(`Remove all ${sources.length.toLocaleString()} sources? This can't be undone.`)) {
+    return;
+  }
+  const removed = sources;
+  sources = [];
+  sourceFilter = '';
+  $('sources-filter').value = '';
+  renderSources();
+  for (const source of removed) {
+    await persist('deleting a source', () => db.deleteSource(source.id));
+    try {
+      renderModel(await call('remove-source', { id: source.id }));
+    } catch (error) {
+      /* no model loaded: it was only ever in the list */
+    }
+  }
+  await refreshStoryState();
+});
 
 async function removeSource(id) {
   sources = sources.filter((source) => source.id !== id);
@@ -671,6 +727,17 @@ async function addSources(entries) {
   updateSourceSummary(sources, added ? `added ${added}` : '');
 }
 
+// Across a few hundred sources these run to thousands of entries, and a
+// paragraph of comma-separated names tells nobody anything. Show the
+// first handful and count the rest.
+const MAX_NAMES_SHOWN = 25;
+
+function nameList(names) {
+  const shown = names.slice(0, MAX_NAMES_SHOWN);
+  const hidden = names.length - shown.length;
+  return escapeHtml(shown.join(', ')) + (hidden > 0 ? ` <span class="hint">+${hidden.toLocaleString()} more</span>` : '');
+}
+
 async function refreshStoryState() {
   const box = $('story-state');
   try {
@@ -680,8 +747,8 @@ async function refreshStoryState() {
       return;
     }
     const parts = [];
-    if (state.characters.length) parts.push(`<strong>Characters:</strong> ${escapeHtml(state.characters.join(', '))}`);
-    if (state.locations.length) parts.push(`<strong>Locations:</strong> ${escapeHtml(state.locations.join(', '))}`);
+    if (state.characters.length) parts.push(`<strong>Characters:</strong> ${nameList(state.characters)}`);
+    if (state.locations.length) parts.push(`<strong>Locations:</strong> ${nameList(state.locations)}`);
     if (state.sceneCount) parts.push(`<strong>Scenes:</strong> ${state.sceneCount}`);
     box.innerHTML = `${parts.join('<br />')}<p class="hint">Found by looking at line shapes, not by understanding the text — unusual formatting can fool it.</p>`;
     box.hidden = false;
