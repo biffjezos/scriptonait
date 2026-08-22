@@ -502,10 +502,10 @@ const handlers = {
 
   /// Learn a BPE vocabulary from the loaded sources, then rebuild the
   /// (untrained) model and its GPU state around it.
-  async 'learn-vocabulary'({ targetVocabSize = 4096 }) {
+  async 'learn-vocabulary'({ maxVocabSize = 8192 }) {
     const before = llm.vocab_size();
     const started = performance.now();
-    const size = llm.learn_vocabulary(targetVocabSize);
+    const size = llm.learn_vocabulary(maxVocabSize);
     if (size === before) {
       log(`vocabulary unchanged (${size} tokens) - a trained model keeps the one it learned with`);
       return { vocabSize: size, changed: false };

@@ -47,6 +47,19 @@ impl Default for Corpus {
     }
 }
 
+/// How large a vocabulary a corpus of `chars` bytes can support.
+///
+/// Roughly one merge per 200 bytes of text, floored at 512 and with the
+/// byte alphabet always included. The shape of the rule matters more than
+/// the constant: a merge that appears twice in the whole corpus teaches
+/// the model nothing and still costs a row of the embedding table, which
+/// at these model sizes is real capacity taken from attention and the
+/// MLP. Somebody pasting one scene gets a small vocabulary; somebody
+/// loading a shelf of scripts gets the ceiling.
+pub fn suggested_vocab_size(chars: usize) -> usize {
+    (tokenizer::BASE_VOCAB_SIZE + chars / 200).max(512)
+}
+
 impl Corpus {
     pub fn new() -> Self {
         Self {
@@ -99,14 +112,22 @@ impl Corpus {
     /// merges have to be learned before a model exists, because the
     /// vocabulary size fixes the model's embedding table.
     ///
+    /// `max_vocab_size` is a ceiling, not a target: the vocabulary
+    /// actually learned scales with how much text there is
+    /// (`suggested_vocab_size`), because a merge learned from two
+    /// occurrences is noise, and every row costs `vocab * hidden`
+    /// parameters whether it earns them or not.
+    ///
     /// Returns the resulting vocabulary size, or `None` when there is no
     /// text to learn from.
-    pub fn learn_vocabulary(&mut self, target_vocab_size: usize) -> Option<usize> {
+    pub fn learn_vocabulary(&mut self, max_vocab_size: usize) -> Option<usize> {
         let texts: Vec<&str> = self.order.iter().filter_map(|id| self.cleaned_text.get(id).map(|s| s.as_str())).collect();
         if texts.is_empty() {
             return None;
         }
-        let tokenizer = Tokenizer::train(&texts, target_vocab_size);
+        let chars: usize = texts.iter().map(|t| t.len()).sum();
+        let target = suggested_vocab_size(chars).min(max_vocab_size);
+        let tokenizer = Tokenizer::train(&texts, target);
         let size = tokenizer.vocab_size();
         self.set_tokenizer(tokenizer);
         Some(size)
@@ -336,6 +357,15 @@ mod tests {
         assert!(vocab > tokenizer::BASE_VOCAB_SIZE, "no merges were learned");
         let after = c.total_tokens();
         assert!(after < before, "expected fewer tokens after BPE, {before} -> {after}");
+    }
+
+    #[test]
+    fn vocabulary_size_scales_with_the_corpus() {
+        // A scene: a small vocabulary. A shelf of scripts: the ceiling.
+        assert_eq!(suggested_vocab_size(0), 512);
+        assert_eq!(suggested_vocab_size(2_000), 512);
+        assert!(suggested_vocab_size(200_000) > 1_000);
+        assert!(suggested_vocab_size(5_000_000) > 4_096);
     }
 
     #[test]

@@ -601,11 +601,15 @@ impl WasmLLM {
     /// with it. Returns the new vocabulary size, or 0 when there is no
     /// text yet.
     ///
+    /// `max_vocab_size` is a ceiling. What is actually learned scales with
+    /// how much text this visitor loaded — their vocabulary, their model,
+    /// their machine; nothing here is shared with anyone else's session.
+    ///
     /// Must happen before a model is created: the vocabulary size fixes
     /// the embedding table. Without it every token is one byte, which
     /// costs about four times the tokens - and therefore four times the
     /// training time - for the same text.
-    pub fn learn_vocabulary(&self, target_vocab_size: u32) -> u32 {
+    pub fn learn_vocabulary(&self, max_vocab_size: u32) -> u32 {
         let inner = &mut *self.0.borrow_mut();
         let current = inner.corpus.tokenizer().vocab_size() as u32;
         // A trained model's weights are indexed by the vocabulary that
@@ -614,7 +618,7 @@ impl WasmLLM {
         if inner.step > 0 || inner.pretrained {
             return current;
         }
-        let Some(size) = inner.corpus.learn_vocabulary(target_vocab_size as usize) else {
+        let Some(size) = inner.corpus.learn_vocabulary(max_vocab_size as usize) else {
             return current;
         };
         // The embedding table is one row per token, so a new vocabulary
