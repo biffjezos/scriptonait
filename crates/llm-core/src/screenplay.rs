@@ -50,6 +50,64 @@ const TRANSITION_WORDS: &[&str] = &[
     "CONTINUED",
 ];
 
+/// All-caps lines that sit right above dialogue but name a moment, a
+/// shot, or an edit rather than a speaker. These clear every shape check
+/// (short, all caps, a lowercase line under them), so they have to be
+/// named explicitly.
+const NON_CHARACTER_CUES: &[&str] = &[
+    "BACK TO SCENE",
+    "BEAT",
+    "CONTINUOUS",
+    "DAY",
+    "DELETED",
+    "END INTERCUT",
+    "END MONTAGE",
+    "FLASHBACK",
+    "LATER",
+    "MOMENTS LATER",
+    "MONTAGE",
+    "MORNING",
+    "NIGHT",
+    "OMITTED",
+    "PAUSE",
+    "SAME",
+    "SILENCE",
+    "SYNOPSIS",
+    "VARIOUS",
+];
+
+/// Words a shot or camera direction starts with. A line beginning with
+/// one describes the frame ("ANGLE ON DELILAH", "CLOSE ON LOGAN", "BACK
+/// TO LAURA") and is followed by prose, so the dialogue check alone lets
+/// every one of them through as a "character".
+const SHOT_PREFIXES: &[&str] = &[
+    "ANGLE",
+    "ANOTHER ANGLE",
+    "BACK TO",
+    "CLOSE ",
+    "CLOSER ",
+    "CU ",
+    "END ON",
+    "EXTREME ",
+    "FULL SHOT",
+    "HIGH ANGLE",
+    "INSERT",
+    "INTERCUT",
+    "LOW ANGLE",
+    "MACRO ",
+    "MEDIUM ",
+    "NEW ANGLE",
+    "ON ",
+    "PANNING",
+    "POV",
+    "REVEAL",
+    "REVERSE",
+    "SERIES OF",
+    "TIGHT ",
+    "TILT",
+    "WIDE",
+];
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SceneHeading {
     pub raw: String,
@@ -158,7 +216,17 @@ pub fn is_character_cue(line: &str) -> bool {
     if !looks_like_shouting_caps || !name_part.chars().any(|c| c.is_ascii_alphabetic()) {
         return false;
     }
-    !TRANSITION_WORDS.contains(&name_part)
+    if TRANSITION_WORDS.contains(&name_part) || NON_CHARACTER_CUES.contains(&name_part) {
+        return false;
+    }
+    // A cue is a name, so it doesn't end in a sentence's punctuation.
+    // Action written in caps does ("ALTITUDE.", "HIS HAND."), and that one
+    // check removes most of what a caps-heavy shooting script otherwise
+    // contributes to the character list.
+    if name_part.ends_with('.') || name_part.ends_with(',') || name_part.ends_with('-') {
+        return false;
+    }
+    !SHOT_PREFIXES.iter().any(|p| name_part.starts_with(p))
 }
 
 /// The bare character name (parenthetical stripped) if `line` is a cue.
@@ -190,16 +258,25 @@ fn looks_like_dialogue(line: &str) -> bool {
 }
 
 /// Scans `text` line by line, collecting scene headings and character
-/// cues in first-seen order. A candidate cue only counts as a character
-/// if the next non-empty line looks like dialogue (contains a lowercase
-/// letter) rather than another all-caps line — real character cues are
-/// always followed by their dialogue, whereas non-screenplay all-caps
-/// text (shooting-script section/shot codes like `A1`, `SECTION TIMING`,
-/// timing tables) tends to run in consecutive all-caps lines with nothing
-/// in between, which would otherwise all get swept up as "characters".
+/// cues in first-seen order.
+///
+/// Beyond looking like a name, a candidate cue has to clear three things,
+/// because a caps-heavy shooting script is full of lines that don't:
+///
+/// * a blank line above it - a cue opens a dialogue block, whereas a
+///   wryly ("THOUGHTFULLY") or a caps fragment inside an action paragraph
+///   sits directly under another line;
+/// * dialogue below it - the next non-empty line has to contain a
+///   lowercase letter, so runs of all-caps section/shot codes don't sweep
+///   each other up;
+/// * a second appearance in the same text - people in a screenplay speak
+///   more than once, one-off caps fragments ("CCCP MARKINGS") do not.
+///   This does drop characters with a single line, which is the right way
+///   round: a short list that is right beats a long list that is noise.
 pub fn extract_story_state(text: &str) -> StoryState {
     let mut state = StoryState::default();
     let lines: Vec<&str> = text.lines().collect();
+    let mut cues: Vec<String> = Vec::new();
     for (i, &line) in lines.iter().enumerate() {
         if let Some(heading) = parse_scene_heading(line) {
             state.scene_count += 1;
@@ -208,12 +285,20 @@ pub fn extract_story_state(text: &str) -> StoryState {
             }
             continue;
         }
+        if i > 0 && !lines[i - 1].trim().is_empty() {
+            continue;
+        }
         let Some(name) = character_name(line) else { continue };
         let next_line = lines[i + 1..].iter().find(|l| !l.trim().is_empty());
         if !next_line.is_some_and(|l| looks_like_dialogue(l)) {
             continue;
         }
-        push_unique(&mut state.characters, name);
+        cues.push(name);
+    }
+    for (i, name) in cues.iter().enumerate() {
+        if cues[..i].contains(name) {
+            push_unique(&mut state.characters, name.clone());
+        }
     }
     state
 }
@@ -289,7 +374,10 @@ digit phone number in the top corner.
           Crunch.  Returned home.
 
 The area code is identified.  The first three numbers
-suddenly fixed, leaving only seven flowing columns.";
+suddenly fixed, leaving only seven flowing columns.
+
+                    CYPHER (V.O.)
+          Nothing else. Not a thing.";
 
     #[test]
     fn detects_scene_headings() {
@@ -396,7 +484,10 @@ Out.
 EXT. GARDEN - NIGHT
 
 JANE
-It's cold.";
+It's cold.
+
+JOHN
+Then go inside.";
         let state = extract_story_state(script);
         assert_eq!(state.scene_count, 2);
         assert_eq!(state.characters, vec!["JANE".to_string(), "JOHN".to_string()]);
@@ -462,7 +553,13 @@ Hello there.
 BOB
 
 ALICE
-Hi Bob.";
+Hi Bob.
+
+JANE
+Still here.
+
+ALICE
+So I see.";
         let state = extract_story_state(script);
         // BOB is immediately followed by another all-caps line (ALICE), so
         // it reads as two consecutive section-style markers rather than a
@@ -471,9 +568,59 @@ Hi Bob.";
     }
 
     #[test]
+    fn rejects_caps_action_wrylies_and_shot_lines() {
+        // Every stray line here showed up as a "character" before these
+        // rules existed, from a real caps-heavy shooting script.
+        let script = "\
+FLOYD reaches for the handset, checking the readout.
+
+ALTITUDE.
+
+The needle drops.
+
+HAND.
+
+His fingers close around it.
+
+FLOYD
+Bring us in.
+THOUGHTFULLY.
+It has been a long trip.
+
+ANGLE ON FLOYD
+
+He waits for the docking light.
+
+PAUSE
+
+The light comes on.
+
+FLOYD
+There it is.";
+        let state = extract_story_state(script);
+        assert_eq!(state.characters, vec!["FLOYD".to_string()]);
+    }
+
+    #[test]
+    fn one_off_caps_fragments_are_dropped() {
+        let script = "\
+CCCP MARKINGS
+
+The hull is stencilled along its length.
+
+SMYSLOV
+Good to see you.
+
+SMYSLOV
+Sit, please.";
+        let state = extract_story_state(script);
+        assert_eq!(state.characters, vec!["SMYSLOV".to_string()]);
+    }
+
+    #[test]
     fn merge_deduplicates() {
-        let mut a = extract_story_state("INT. KITCHEN - DAY\n\nJANE\nHi.");
-        let b = extract_story_state("EXT. GARDEN - NIGHT\n\nJANE\nBye.\n\nJOHN\nWhat?");
+        let mut a = extract_story_state("INT. KITCHEN - DAY\n\nJANE\nHi.\n\nJANE\nStill here.");
+        let b = extract_story_state("EXT. GARDEN - NIGHT\n\nJANE\nBye.\n\nJOHN\nWhat?\n\nJOHN\nWait.");
         a.merge(&b);
         assert_eq!(a.characters, vec!["JANE".to_string(), "JOHN".to_string()]);
         assert_eq!(a.locations, vec!["KITCHEN".to_string(), "GARDEN".to_string()]);
@@ -487,7 +634,7 @@ Hi Bob.";
 
     #[test]
     fn prompt_preamble_lists_characters_and_locations() {
-        let state = extract_story_state("INT. KITCHEN - DAY\n\nJANE\nHi.");
+        let state = extract_story_state("INT. KITCHEN - DAY\n\nJANE\nHi.\n\nJANE\nBye.");
         let preamble = state.as_prompt_preamble();
         assert!(preamble.contains("Characters so far: JANE"));
         assert!(preamble.contains("Locations so far: KITCHEN"));

@@ -139,7 +139,7 @@ mod tests {
     #[test]
     fn unseen_characters_are_flagged_as_info() {
         let known = StoryState { characters: vec!["JANE".to_string()], ..Default::default() };
-        let note = new_characters("JOHN\nHi Jane.", &known).unwrap();
+        let note = new_characters("JOHN\nHi Jane.\n\nJOHN\nStill me.", &known).unwrap();
         assert_eq!(note.severity, Severity::Info);
         assert!(note.message.contains("JOHN"));
     }

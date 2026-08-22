@@ -306,8 +306,8 @@ mod tests {
     #[test]
     fn story_state_aggregates_across_sources_and_updates_on_remove() {
         let mut c = Corpus::new();
-        c.upsert("a", "INT. KITCHEN - DAY\n\nJANE\nHi.", false);
-        c.upsert("b", "EXT. GARDEN - NIGHT\n\nJOHN\nBye.", false);
+        c.upsert("a", "INT. KITCHEN - DAY\n\nJANE\nHi.\n\nJANE\nStill here.", false);
+        c.upsert("b", "EXT. GARDEN - NIGHT\n\nJOHN\nBye.\n\nJOHN\nReally.", false);
         let state = c.story_state();
         assert_eq!(state.characters, vec!["JANE".to_string(), "JOHN".to_string()]);
         assert_eq!(state.scene_count, 2);

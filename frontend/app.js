@@ -737,21 +737,24 @@ onStream('train-progress', (progress) => {
   drawLossChart();
 });
 
-// Samples from the model as it trains, newest first, so the top of the
-// list is always the current state of the writing.
+// Samples from the model as it trains. One card, rewritten in place:
+// the point is watching the writing change, and a stack of twenty stale
+// cards buries the only one worth reading.
 onStream('train-sample', ({ step, loss, text }) => {
   const box = $('train-samples');
-  const block = document.createElement('div');
-  block.className = 'train-sample';
-  const head = document.createElement('div');
-  head.className = 'train-sample-head';
-  head.textContent = `step ${formatCount(step)}` +
-    (typeof loss === 'number' ? ` · loss ${loss.toFixed(3)}` : '');
-  const body = document.createElement('pre');
-  body.textContent = text;
-  block.append(head, body);
-  box.prepend(block);
-  while (box.children.length > 20) box.lastElementChild.remove();
+  let block = box.firstElementChild;
+  if (!block) {
+    block = document.createElement('div');
+    block.className = 'train-sample';
+    const head = document.createElement('div');
+    head.className = 'train-sample-head';
+    const body = document.createElement('pre');
+    block.append(head, body);
+    box.replaceChildren(block);
+  }
+  block.firstElementChild.textContent = `step ${formatCount(step)}` +
+    (typeof loss === 'number' ? ` \u00b7 loss ${loss.toFixed(3)}` : '');
+  block.lastElementChild.textContent = text;
 });
 
 $('train-btn').addEventListener('click', async () => {
