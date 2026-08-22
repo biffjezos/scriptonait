@@ -369,6 +369,12 @@ function refreshCorpusStatsFromWorker(msg) {
 function setTrainingButtons(isTraining) {
   el('start-train-btn').disabled = isTraining;
   el('stop-train-btn').disabled = !isTraining;
+  // These share the GpuModel's scratch buffers with the training loop -
+  // running one while training is active races both operations against
+  // each other (see the matching worker-side guard). Disable instead of
+  // relying on the worker to just reject the message.
+  el('debug-compare-btn').disabled = isTraining;
+  el('debug-compare-gradient-btn').disabled = isTraining;
 }
 
 function renderQaNotes(notes) {
