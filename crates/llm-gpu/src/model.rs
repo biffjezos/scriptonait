@@ -361,8 +361,10 @@ impl GpuModel {
             normed: buffers::storage_f32(&ctx.device, "normed", hidden, false),
             inv_rms: buffers::storage_f32(&ctx.device, "inv_rms", 1, false),
             q: buffers::storage_f32(&ctx.device, "q", hidden, false),
-            k: buffers::storage_f32(&ctx.device, "k", kv_dim, false),
-            v: buffers::storage_f32(&ctx.device, "v", kv_dim, false),
+            // Copied into the ring cache after RoPE, so both need
+            // COPY_SRC - which is what `readable` adds.
+            k: buffers::storage_f32(&ctx.device, "k", kv_dim, true),
+            v: buffers::storage_f32(&ctx.device, "v", kv_dim, true),
             attn: buffers::storage_f32(&ctx.device, "attn", hidden, false),
             proj: buffers::storage_f32(&ctx.device, "proj", hidden.max(ffn), false),
             gate: buffers::storage_f32(&ctx.device, "gate", ffn, false),
