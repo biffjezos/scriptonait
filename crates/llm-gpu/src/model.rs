@@ -24,7 +24,7 @@ use llm_core::config::ModelConfig;
 use llm_core::corpus::Batch;
 use llm_core::model::ModelWeights;
 
-use crate::buffers::{read_f32, storage_f32, uniform, upload_f32, upload_u32, write_u32};
+use crate::buffers::{read_f32, read_f32_concat, storage_f32, uniform, upload_f32, upload_u32, write_u32};
 use crate::context::{GpuContext, MAX_GPU_WINDOW};
 
 fn ceil_div(a: usize, b: usize) -> u32 {
@@ -1051,11 +1051,8 @@ impl GpuModel {
     /// only ever updates the GPU-resident copy.
     pub async fn read_all_weights(&self, ctx: &GpuContext) -> Vec<f32> {
         let lens = self.tensor_lens();
-        let mut out = Vec::with_capacity(lens.iter().sum());
-        for (buf, &len) in self.weight_buffers().into_iter().zip(&lens) {
-            out.extend(read_f32(&ctx.device, &ctx.queue, buf, len).await);
-        }
-        out
+        let bufs: Vec<(&wgpu::Buffer, usize)> = self.weight_buffers().into_iter().zip(lens).collect();
+        read_f32_concat(&ctx.device, &ctx.queue, &bufs).await
     }
 }
 
