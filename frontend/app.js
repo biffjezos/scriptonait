@@ -895,6 +895,53 @@ onStream('train-progress', (progress) => {
 // one worth reading, which is the current one.
 // What the held-out curve is saying to do about the corpus. It appears
 // when the numbers earn it and stays until the next run.
+// A new best held-out loss: keep a copy of this model, because training
+// continues past it and the last model of a run is usually not its best.
+let bestSaveInFlight = false;
+onStream('train-best', async ({ step, validationLoss }) => {
+  if (bestSaveInFlight || !model) return;
+  bestSaveInFlight = true;
+  try {
+    const { bytes } = await call('export-checkpoint');
+    await db.putBestModel({ bytes, step, params: model.params, validationLoss });
+    console.info(
+      `[scriptonait] kept the best model so far (held-out ${validationLoss.toFixed(3)} ` +
+        `at step ${step.toLocaleString()})`,
+    );
+    renderBestModel({ step, validationLoss });
+  } catch (error) {
+    console.warn('[scriptonait] could not keep the best model:', error);
+  } finally {
+    bestSaveInFlight = false;
+  }
+});
+
+/// Show what the best kept model is, and offer to go back to it.
+function renderBestModel(best) {
+  const row = $('best-model');
+  if (!best) {
+    row.hidden = true;
+    return;
+  }
+  $('best-model-text').textContent =
+    `Best so far: held-out ${best.validationLoss.toFixed(3)} at step ${best.step.toLocaleString()}.`;
+  row.hidden = false;
+}
+
+$('restore-best-btn').addEventListener('click', async () => {
+  const best = await db.getBestModel();
+  if (!best) return;
+  if (!confirm(`Go back to the model from step ${best.step.toLocaleString()}? The current one is replaced.`)) {
+    return;
+  }
+  setModelStatus('loading', 'Restoring the best model…');
+  renderModel(await call('load-model', { bytes: best.bytes }, [], 0));
+  await syncAllSources();
+  await refreshStoryState();
+  await saveModel();
+  console.info('[scriptonait] restored the best model');
+});
+
 onStream('train-advice', ({ advice, step }) => {
   const box = $('train-advice');
   box.textContent = `At step ${step.toLocaleString()}: ${advice}`;
@@ -1198,5 +1245,11 @@ async function restoreModel() {
   setModelStatus('absent', 'No model yet.');
   updateGuidance();
   await restoreModel();
+  try {
+    const best = await db.getBestModel();
+    if (best) renderBestModel(best);
+  } catch (error) {
+    console.warn('[scriptonait] could not read the best model:', error);
+  }
   updateGuidance();
 })();

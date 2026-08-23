@@ -315,6 +315,7 @@ async function train({ batchSize, learningRate, maxSteps, effort, sampleEvery, s
   // help more than more steps.
   const heldOut = [];
   let lastAdvice = null;
+  let bestValidation = null;
 
   while (!stopRequested && (maxSteps <= 0 || steps < maxSteps)) {
     const sliceStart = performance.now();
@@ -381,6 +382,14 @@ async function train({ batchSize, learningRate, maxSteps, effort, sampleEvery, s
             `step ${llm.step().toLocaleString()}: held-out loss ${measured.toFixed(4)}` +
               (gap === null ? '' : ` (training ${smoothedLoss.toFixed(4)}, gap ${gap.toFixed(4)})`),
           );
+          // A run's best model is rarely its last, and training past the
+          // best is exactly what a small corpus makes it do. Tell the
+          // page whenever this is the best held-out loss so far so it can
+          // keep a copy.
+          if (bestValidation === null || measured < bestValidation) {
+            bestValidation = measured;
+            post('train-best', { step: llm.step(), validationLoss: measured });
+          }
           const advice = corpusAdvice(heldOut, smoothedLoss);
           if (advice && advice !== lastAdvice) {
             lastAdvice = advice;
