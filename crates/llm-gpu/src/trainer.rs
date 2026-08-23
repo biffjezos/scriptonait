@@ -501,6 +501,100 @@ impl GpuTrainer {
         })
     }
 
+    /// Times each kernel on its own, at the shapes a step actually uses.
+    ///
+    /// The phase profile says forward and backward are the whole step;
+    /// this says which kernels inside them. Each case runs `reps` times
+    /// back to back with one sync at the end, so per-dispatch host cost
+    /// is amortized and what is left is the kernel itself. Multiplied by
+    /// how many times a step runs it, that is where a step's time lives.
+    pub async fn profile_kernels(&mut self, ctx: &GpuContext, reps: u32) -> Result<String, String> {
+        let c = self.config;
+        let t = self.t_len;
+        let (h, kv, ffn, vocab) = (c.hidden_dim, c.kv_dim(), c.ffn_dim(), c.vocab_size());
+        let band = ops::band_width(t, c.effective_window());
+        let layers = c.num_layers;
+        let reps = reps.max(1);
+        let tensors = self.grads.slots.len();
+
+        // (label, how many of these a single sequence's step runs)
+        let cases: [(&str, usize); 14] = [
+            ("linear q/o (h x h)", 2 * layers),
+            ("linear k/v (h x kv)", 2 * layers),
+            ("linear gate/up (h x ffn)", 2 * layers),
+            ("linear down (ffn x h)", layers),
+            ("linear head (h x vocab)", 1),
+            ("linear_bwd_dw (h x ffn)", 2 * layers),
+            ("linear_bwd_dx (h x ffn)", 2 * layers),
+            ("attention_fwd", layers),
+            ("attention_bwd (3 kernels)", layers),
+            ("rmsnorm", 2 * layers),
+            ("rmsnorm_bwd (dx + dgain)", 4 * layers),
+            ("rope", 2 * layers),
+            ("swiglu", 2 * layers),
+            ("adam (all tensors)", 1),
+        ];
+
+        let mut rows = Vec::with_capacity(cases.len());
+        for (case, (label, per_step)) in cases.iter().enumerate() {
+            // One warm run, uncounted: the first dispatch of a pipeline
+            // pays for whatever the driver does lazily.
+            for round in 0..2 {
+                ctx.params.reset();
+                let start = Instant::now();
+                let mut chunks = Chunks::new(ctx, 64);
+                let times = if round == 0 { 1 } else { reps };
+                for _ in 0..times {
+                    self.encode_profile_case(&mut chunks, ctx, case, band);
+                }
+                chunks.flush();
+                self.sync(ctx).await?;
+                if round == 1 {
+                    let each = start.elapsed().as_secs_f64() * 1000.0 / reps as f64;
+                    rows.push(format!(
+                        "{{\"kernel\":{:?},\"msEach\":{:.3},\"perStep\":{},\"msPerStep\":{:.1}}}",
+                        label,
+                        each,
+                        per_step,
+                        each * *per_step as f64
+                    ));
+                }
+            }
+        }
+        let _ = (kv, vocab, tensors);
+        Ok(format!("[{}]", rows.join(",")))
+    }
+
+    /// One kernel of `profile_kernels`, encoded against real buffers of
+    /// the right shape. Nothing here is read back: the numbers it writes
+    /// are overwritten by the next real step.
+    fn encode_profile_case(&self, chunks: &mut Chunks, ctx: &GpuContext, case: usize, band: usize) {
+        let c = &self.config;
+        let t = self.t_len;
+        let (h, kv, ffn, vocab) = (c.hidden_dim, c.kv_dim(), c.ffn_dim(), c.vocab_size());
+        let acts = &self.acts[0];
+        let s = &self.scratch;
+        match case {
+            0 => dispatch_linear(chunks.enc(), ctx, &acts.normed1, self.weights.layer(0, T_WQ), &acts.q, t, h, h),
+            1 => dispatch_linear(chunks.enc(), ctx, &acts.normed1, self.weights.layer(0, T_WK), &acts.k, t, h, kv),
+            2 => dispatch_linear(chunks.enc(), ctx, &acts.normed2, self.weights.layer(0, T_W_GATE), &acts.gate, t, h, ffn),
+            3 => dispatch_linear(chunks.enc(), ctx, &s.act, self.weights.layer(0, T_W_DOWN), &s.tmp_h, t, ffn, h),
+            4 => dispatch_linear(chunks.enc(), ctx, &s.final_normed, self.weights.embed(), &s.logits, t, h, vocab),
+            5 => self.dispatch_linear_bwd_dw(chunks, ctx, &s.d_gate, &acts.normed2, self.grads.layer(0, T_W_GATE), t, h, ffn),
+            6 => self.dispatch_linear_bwd_dx(chunks, ctx, &s.d_gate, self.weights.layer(0, T_W_GATE), &s.d_a, t, h, ffn),
+            7 => self.dispatch_attention_fwd(chunks, ctx, acts, band),
+            8 => self.dispatch_attention_bwd(chunks, ctx, acts, band),
+            9 => self.dispatch_rmsnorm(chunks, ctx, &s.hidden, self.weights.layer(0, T_ATTN_GAIN), &acts.normed1, &acts.inv_rms1, h),
+            10 => {
+                self.dispatch_rmsnorm_bwd_dx(chunks, ctx, &s.d_a, &acts.h_in, self.weights.layer(0, T_ATTN_GAIN), &acts.inv_rms1, &s.d_c, h);
+                self.dispatch_rmsnorm_bwd_dgain(chunks, ctx, &s.d_a, &acts.h_in, &acts.inv_rms1, self.grads.layer(0, T_ATTN_GAIN), h);
+            }
+            11 => self.dispatch_rope(chunks, ctx, &acts.q, c.num_heads, false),
+            12 => dispatch_swiglu(chunks.enc(), ctx, &acts.gate, &acts.up, &s.act, t * ffn),
+            _ => self.encode_adam(chunks, ctx, 0.0, 0.0, 0.0),
+        }
+    }
+
     /// Loss on a batch the model is not trained on: forward pass and
     /// cross-entropy, no backward pass and no optimizer step, so nothing
     /// about the model changes.

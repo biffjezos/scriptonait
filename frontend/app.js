@@ -893,6 +893,16 @@ onStream('train-progress', (progress) => {
 // event, so the box holds this card and nothing else no matter what was
 // in it before. Never append - a stack of stale samples buries the only
 // one worth reading, which is the current one.
+// What the held-out curve is saying to do about the corpus. It appears
+// when the numbers earn it and stays until the next run.
+onStream('train-advice', ({ advice, step }) => {
+  const box = $('train-advice');
+  box.textContent = `At step ${step.toLocaleString()}: ${advice}`;
+  box.hidden = false;
+  console.info(`[scriptonait] advice: ${advice}`);
+  notify('Your model has stopped improving', advice);
+});
+
 onStream('train-sample', ({ step, loss, text }) => {
   const box = $('train-samples');
   let block = box.firstElementChild;
@@ -922,6 +932,7 @@ $('train-btn').addEventListener('click', async () => {
   $('loss-chart').hidden = false;
   $('train-stats').textContent = 'Starting…';
   $('train-samples').replaceChildren();
+  $('train-advice').hidden = true;
 
   try {
     // One button, two jobs. With no model, make one first — nobody
@@ -1096,6 +1107,14 @@ window.scriptonait = {
   /// result. Returns the rows too, but the log is the point - and it
   /// catches its own failure, so a missing model prints one line instead
   /// of an unhandled rejection.
+  /// Times each kernel at this model's shapes and logs a table sorted by
+  /// how much of a step it accounts for.
+  kernels: (reps = 20) =>
+    call('profile-kernels', { reps }, [], 0).catch((error) => {
+      console.error(`[scriptonait] kernels: ${(error && error.message) || error}`);
+      return null;
+    }),
+
   profile: (batchSize = 2) =>
     call('profile', { batchSize }, [], 0).catch((error) => {
       console.error(`[scriptonait] profile: ${(error && error.message) || error}`);

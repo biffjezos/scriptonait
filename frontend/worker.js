@@ -311,6 +311,10 @@ async function train({ batchSize, learningRate, maxSteps, effort, sampleEvery, s
   const validateEvery = 25;
   let nextValidateAt = llm.step() + validateEvery;
   let validationLoss = null;
+  // Held-out losses in order, so the run can say when more text would
+  // help more than more steps.
+  const heldOut = [];
+  let lastAdvice = null;
 
   while (!stopRequested && (maxSteps <= 0 || steps < maxSteps)) {
     const sliceStart = performance.now();
@@ -371,11 +375,18 @@ async function train({ batchSize, learningRate, maxSteps, effort, sampleEvery, s
         const measured = await llm.validation_loss(batchSize);
         if (measured >= 0) {
           validationLoss = measured;
+          heldOut.push(measured);
           const gap = smoothedLoss === null ? null : measured - smoothedLoss;
           log(
             `step ${llm.step().toLocaleString()}: held-out loss ${measured.toFixed(4)}` +
               (gap === null ? '' : ` (training ${smoothedLoss.toFixed(4)}, gap ${gap.toFixed(4)})`),
           );
+          const advice = corpusAdvice(heldOut, smoothedLoss);
+          if (advice && advice !== lastAdvice) {
+            lastAdvice = advice;
+            log(`advice: ${advice}`);
+            post('train-advice', { advice, step: llm.step() });
+          }
         }
       } catch (error) {
         log(`held-out loss failed: ${(error && error.message) || error}`);
@@ -428,6 +439,42 @@ async function train({ batchSize, learningRate, maxSteps, effort, sampleEvery, s
     stopReason: stopRequested ? 'stopped' : 'done',
     elapsedSeconds,
   };
+}
+
+/// What the two loss curves are saying, in a sentence, or null while
+/// they are still saying "keep going".
+///
+/// Training loss falls whether a model is learning the language or
+/// memorizing the corpus. Held-out loss is what separates those, and the
+/// two signals worth acting on are: it stopped improving (this corpus
+/// has taught what it can), or it started rising while training loss
+/// falls (the model is memorizing). Both have the same answer - more
+/// text - and both are invisible unless somebody watches the numbers,
+/// so the run watches them.
+function corpusAdvice(heldOut, trainingLoss) {
+  const WINDOW = 5; // about 125 steps at the validation cadence
+  if (heldOut.length < WINDOW * 2) return null;
+  const mean = (xs) => xs.reduce((a, b) => a + b, 0) / xs.length;
+  const now = mean(heldOut.slice(-WINDOW));
+  const before = mean(heldOut.slice(-WINDOW * 2, -WINDOW));
+  const improvement = before - now;
+  const gap = trainingLoss === null ? 0 : now - trainingLoss;
+
+  if (improvement < -0.01) {
+    return (
+      'held-out loss is rising while training loss falls - the model has started memorizing your ' +
+      'text rather than learning from it. Add more source material, or stop here and keep the ' +
+      'model as it is.'
+    );
+  }
+  if (improvement < 0.01) {
+    return gap > 0.3
+      ? 'held-out loss has flattened and sits well above training loss - this corpus has taught ' +
+        'what it can. More text will help more than more steps.'
+      : 'held-out loss has flattened. More text, a bigger model or a higher learning rate would ' +
+        'each do more than more steps at this setting.';
+  }
+  return null;
 }
 
 /// A lost or reset device is the one failure worth naming precisely: it
@@ -550,6 +597,20 @@ const handlers = {
 
   /// Learn a BPE vocabulary from the loaded sources, then rebuild the
   /// (untrained) model and its GPU state around it.
+  async 'profile-kernels'({ reps = 20 }) {
+    if (!llm.has_gpu()) return { error: 'no GPU device' };
+    if (training) return { error: 'a training run is in flight - press Stop, then profile' };
+    const rows = JSON.parse(await llm.profile_kernels(reps));
+    rows.sort((a, b) => b.msPerStep - a.msPerStep);
+    for (const row of rows) {
+      log(
+        `kernel ${row.kernel.padEnd(28)} ${row.msEach.toFixed(3)} ms each ` +
+          `x${row.perStep} per sequence = ${row.msPerStep.toFixed(1)} ms`,
+      );
+    }
+    return { rows };
+  },
+
   async 'learn-vocabulary'({ maxVocabSize = 8192 }) {
     const before = llm.vocab_size();
     const started = performance.now();

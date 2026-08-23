@@ -293,6 +293,15 @@ impl WasmLLM {
         result
     }
 
+    /// Time each kernel at this model's shapes, as JSON. What the phase
+    /// profile is to a step, this is to a phase.
+    pub async fn profile_kernels(&self, reps: u32) -> Result<String, JsValue> {
+        self.acquire()?;
+        let result = self.profile_kernels_inner(reps).await;
+        self.release();
+        result
+    }
+
     /// The Adam moment buffers, serialized. Saved beside the checkpoint
     /// so a restored model resumes with its momentum instead of jolting.
     pub async fn export_optimizer(&self) -> Result<Vec<u8>, JsValue> {
@@ -964,6 +973,25 @@ impl WasmLLM {
             p.adam,
             report.tokens,
         ))
+    }
+
+    async fn profile_kernels_inner(&self, reps: u32) -> Result<String, JsValue> {
+        let (ctx, trainer) = {
+            let inner = &mut *self.0.borrow_mut();
+            let Some(gpu) = inner.gpu.as_mut() else {
+                return Err(js_err("profiling needs a GPU device"));
+            };
+            (Rc::clone(&gpu.ctx), gpu.trainer.take())
+        };
+        let Some(mut trainer) = trainer else {
+            return Err(js_err("no training state yet — train a few steps first"));
+        };
+        let result = trainer.profile_kernels(&ctx, reps).await;
+        let inner = &mut *self.0.borrow_mut();
+        if let Some(gpu) = inner.gpu.as_mut() {
+            gpu.trainer = Some(trainer);
+        }
+        result.map_err(js_err)
     }
 
     async fn validation_loss_inner(&self, batch_size: u32) -> Result<f32, JsValue> {
