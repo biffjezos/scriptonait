@@ -939,6 +939,17 @@ const lossHistory = [];
 /// Held-out loss, with the index into `lossHistory` it was measured at,
 /// so the two curves share a time axis despite different cadences.
 const validationHistory = [];
+/// Loss on a fixed set of *training* windows, drawn exactly as the
+/// held-out set is drawn.
+///
+/// The blue per-step curve cannot be compared with the held-out one:
+/// 40% of training windows start at a source's opening and no held-out
+/// window ever does, so the two separate as soon as the model learns
+/// what an opening looks like — a few hundred steps in, long before
+/// anything could be memorized. This third curve is the fair
+/// comparison, and the distance between it and the amber one is the
+/// only gap worth reading.
+const probeHistory = [];
 
 onStream('train-progress', (progress) => {
   setProgress('train-progress-bar', progress.fractionDone);
@@ -960,6 +971,9 @@ onStream('train-progress', (progress) => {
       validationHistory[validationHistory.length - 1].loss !== progress.validationLoss)
   ) {
     validationHistory.push({ at: lossHistory.length - 1, loss: progress.validationLoss });
+    if (typeof progress.trainingProbe === 'number' && progress.trainingProbe >= 0) {
+      probeHistory.push({ at: lossHistory.length - 1, loss: progress.trainingProbe });
+    }
   }
   drawLossChart();
 });
@@ -1330,6 +1344,7 @@ $('train-btn').addEventListener('click', async () => {
   lastPhaseKey = null;
   lossHistory.length = 0;
   validationHistory.length = 0;
+  probeHistory.length = 0;
   $('train-btn').disabled = true;
   $('train-stop-btn').hidden = false;
   $('train-stop-btn').disabled = false;
@@ -1461,7 +1476,9 @@ function drawLossChart() {
   ctx.clearRect(0, 0, width, height);
   if (lossHistory.length < 2) return;
 
-  const points = lossHistory.concat(validationHistory.map((p) => p.loss));
+  const points = lossHistory
+    .concat(validationHistory.map((p) => p.loss))
+    .concat(probeHistory.map((p) => p.loss));
   const min = Math.min(...points);
   const max = Math.max(...points);
   const span = max - min || 1;
@@ -1478,27 +1495,36 @@ function drawLossChart() {
   });
   ctx.stroke();
 
-  if (validationHistory.length > 1) {
-    ctx.strokeStyle = '#e0af68';
+  /// Both fixed-set curves, positioned by where in the run they were
+  /// measured so they line up in time rather than by index.
+  const drawMeasured = (series, colour, dashed) => {
+    if (series.length < 2) return;
+    ctx.strokeStyle = colour;
     ctx.lineWidth = 2;
+    ctx.setLineDash(dashed ? [4, 3] : []);
     ctx.beginPath();
-    validationHistory.forEach((point, i) => {
-      // Positioned by where in the run it was measured, so the two
-      // curves line up in time rather than by index.
+    series.forEach((point, i) => {
       const x = (point.at / Math.max(lossHistory.length - 1, 1)) * width;
       const y = yFor(point.loss);
       if (i === 0) ctx.moveTo(x, y);
       else ctx.lineTo(x, y);
     });
     ctx.stroke();
-  }
+    ctx.setLineDash([]);
+  };
+  // Dashed, and the same blue as the per-step curve: it is training
+  // loss, measured the way held-out loss is measured. The gap that
+  // matters is between this and the amber one.
+  drawMeasured(probeHistory, '#7aa2f7', true);
+  drawMeasured(validationHistory, '#e0af68', false);
 
   ctx.fillStyle = '#8891a8';
   ctx.font = '11px system-ui, sans-serif';
   ctx.fillText(max.toFixed(3), 4, 12);
   ctx.fillText(min.toFixed(3), 4, height - 4);
   ctx.fillStyle = '#7aa2f7';
-  ctx.fillText('training', width - 108, 12);
+  ctx.fillText('training', width - 168, 12);
+  ctx.fillText('· same windows', width - 122, 12);
   ctx.fillStyle = '#e0af68';
   ctx.fillText('held-out', width - 52, 12);
 }

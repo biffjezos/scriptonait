@@ -73,7 +73,11 @@ const PLATEAU_MIN_DELTA = 0.005;
 /// which is the property every rule built on their difference assumed
 /// and did not have.
 const VALIDATION_WINDOWS = 16;
-const VALIDATE_EVERY = 50;
+/// Every hundred steps rather than every fifty, because two fixed sets
+/// are measured now instead of one and the pair has to cost what the
+/// single noisy measurement did. At a five-thousand-step run that is
+/// still fifty points on the curve.
+const VALIDATE_EVERY = 100;
 
 /// Tokens that must have gone through the model before anything is said
 /// about the corpus or about overfitting.
@@ -997,6 +1001,10 @@ async function train({ batchSize, learningRate, maxSteps, effort, sampleEvery, s
   /// is produced.
   let lastQuality = null;
   let lastBitsPerByte = 0;
+  // Loss on a fixed set of training windows, drawn exactly as the
+  // held-out set is. The only training number held-out loss can honestly
+  // be compared with.
+  let trainingProbe = null;
   // Held-out measurements since the last one that was actually better.
   let sinceImprovement = 0;
   let bestSeen = null;
@@ -1056,6 +1064,7 @@ async function train({ batchSize, learningRate, maxSteps, effort, sampleEvery, s
           loss: report.loss,
           smoothedLoss,
           validationLoss,
+          trainingProbe,
           lr: report.lr,
           gradNorm: report.grad_norm,
           elapsedSeconds: elapsed,
@@ -1071,17 +1080,30 @@ async function train({ batchSize, learningRate, maxSteps, effort, sampleEvery, s
       nextValidateAt = llm.step() + validateEvery;
       try {
         const measured = await llm.validation_loss(VALIDATION_WINDOWS);
+        // The comparable training number: the same number of windows,
+        // drawn the same way, from the text the model does train on.
+        // The per-step loss cannot play this role — 40% of training
+        // windows start at a source's opening, no held-out window ever
+        // does, and the model learns openings within a few hundred
+        // steps. The gap that opens there is a sampling difference, not
+        // memorization, and it is what made the overfitting warning fire
+        // at a tenth of an epoch.
+        const probe = await llm.training_probe_loss(VALIDATION_WINDOWS);
         if (measured >= 0) {
           validationLoss = measured;
           heldOut.push(measured);
-          const gap = smoothedLoss === null ? null : measured - smoothedLoss;
+          // Measured against the probe, not against the per-step loss.
+          const gap = probe >= 0 ? measured - probe : null;
+          if (probe >= 0) trainingProbe = probe;
           // Bits per byte rather than nats per token: comparable
           // between two vocabularies, and against a reference anybody
           // can check — gzip lands around 2.5 on English prose.
           const bpb = JSON.parse(llm.evaluate('', measured)).bitsPerByte;
           log(
-            `step ${llm.step().toLocaleString()}: held-out loss ${measured.toFixed(4)}` +
-              (gap === null ? '' : ` (training ${smoothedLoss.toFixed(4)}, gap ${gap.toFixed(4)})`) +
+            `step ${llm.step().toLocaleString()}: held-out ${measured.toFixed(4)}` +
+              (probe >= 0 ? `, same-shaped training windows ${probe.toFixed(4)}` : '') +
+              (gap === null ? '' : `, gap ${gap.toFixed(4)}`) +
+              (smoothedLoss === null ? '' : `, per-step loss ${smoothedLoss.toFixed(4)}`) +
               (bpb > 0 ? `, ${bpb.toFixed(3)} bits per byte` : ''),
           );
           lastBitsPerByte = bpb;
@@ -1132,7 +1154,7 @@ async function train({ batchSize, learningRate, maxSteps, effort, sampleEvery, s
           }
           lastPhase = reportPlan({
             heldOut,
-            trainingLoss: smoothedLoss,
+            trainingLoss: trainingProbe,
             stepsDone: steps,
             tokensPerStep,
             msPerStep: recentStepMs,
@@ -1140,7 +1162,7 @@ async function train({ batchSize, learningRate, maxSteps, effort, sampleEvery, s
             quality: lastQuality,
             bitsPerByte: lastBitsPerByte,
           });
-          const advice = corpusAdvice(heldOut, smoothedLoss, JSON.parse(llm.training_plan()).tokensSeen);
+          const advice = corpusAdvice(heldOut, trainingProbe, JSON.parse(llm.training_plan()).tokensSeen);
           if (advice && advice !== lastAdvice) {
             lastAdvice = advice;
             log(`advice: ${advice}`);

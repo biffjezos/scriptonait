@@ -339,6 +339,15 @@ impl WasmLLM {
         result
     }
 
+    /// Loss on a fixed set of *training* windows, drawn exactly as the
+    /// held-out set is drawn. The number to compare held-out against.
+    pub async fn training_probe_loss(&self, batch_size: u32) -> Result<f32, JsValue> {
+        self.acquire()?;
+        let result = self.fixed_set_loss(batch_size, false).await;
+        self.release();
+        result
+    }
+
     /// Time each kernel at this model's shapes, as JSON. What the phase
     /// profile is to a step, this is to a phase.
     pub async fn profile_kernels(&self, reps: u32) -> Result<String, JsValue> {
@@ -1211,6 +1220,19 @@ impl WasmLLM {
     }
 
     async fn validation_loss_inner(&self, batch_size: u32) -> Result<f32, JsValue> {
+        self.fixed_set_loss(batch_size, true).await
+    }
+
+    /// Loss on one of the two fixed sets: held-out text, or training
+    /// text drawn the same way.
+    ///
+    /// Both exist so their difference means something. The per-step
+    /// training loss cannot be compared with held-out loss, because 40%
+    /// of training windows start at a source's opening and no held-out
+    /// window ever does — so the two diverge as soon as the model learns
+    /// what an opening looks like, which is not overfitting and happens
+    /// within a few hundred steps.
+    async fn fixed_set_loss(&self, batch_size: u32, held_out: bool) -> Result<f32, JsValue> {
         let batch = {
             let inner = &mut *self.0.borrow_mut();
             if inner.gpu.as_ref().is_none_or(|gpu| gpu.trainer.is_none()) {
@@ -1221,7 +1243,12 @@ impl WasmLLM {
             // measurement makes consecutive numbers differ by which text
             // they happened to pick, and at a few thousand tokens a
             // measurement that term is larger than the learning.
-            match inner.corpus.validation_batch(batch_size as usize, context_len) {
+            let picked = if held_out {
+                inner.corpus.validation_batch(batch_size as usize, context_len)
+            } else {
+                inner.corpus.training_probe_batch(batch_size as usize, context_len)
+            };
+            match picked {
                 Some(batch) => batch,
                 None => return Ok(-1.0),
             }

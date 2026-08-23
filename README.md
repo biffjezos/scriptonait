@@ -65,9 +65,15 @@ device the page says so and does not train.
   what would actually help, named with the number behind it. Sources are
   classified by line shape (film scripts, novels, essays, verse), so a
   corpus that is all one thing is told so.
-- Live loss chart with two curves — training loss and held-out loss, on
-  one axis, because the gap between them is what says whether the model
-  is learning the language or memorizing your text.
+- Live loss chart with three curves on one axis: per-step training loss,
+  held-out loss, and training loss measured on a fixed set of windows
+  drawn exactly as the held-out set is. That third one exists because
+  the first two cannot honestly be compared — 40% of training windows
+  start at a source's opening and no held-out window ever does, so the
+  two separate as soon as the model learns what an opening looks like,
+  a few hundred steps in and long before anything could be memorized.
+  The gap worth reading is between the dashed curve and the held-out
+  one.
 - Samples the model as it trains, into a single card that updates in
   place.
 - The trained model and its optimizer state are saved to the browser
