@@ -142,6 +142,13 @@ function formatCount(n) {
 function formatDuration(seconds) {
   if (!isFinite(seconds) || seconds < 0) return '—';
   if (seconds < 60) return `${seconds.toFixed(0)}s`;
+  // Past an hour, minutes-and-seconds stops being readable: a planned
+  // run's estimate is often hours, and "214m30s" is not an answer.
+  if (seconds >= 3600) {
+    const h = Math.floor(seconds / 3600);
+    const m = Math.round((seconds % 3600) / 60);
+    return `${h}h${String(m).padStart(2, '0')}m`;
+  }
   const m = Math.floor(seconds / 60);
   const s = Math.round(seconds % 60);
   return `${m}m${String(s).padStart(2, '0')}s`;
@@ -290,6 +297,7 @@ async function syncAllSources() {
     await syncSource(source);
   }
   await reportDuplicates();
+  await refreshPlan();
 }
 
 /// Say when the same text is loaded twice.
@@ -990,6 +998,70 @@ $('restore-best-btn').addEventListener('click', async () => {
   console.info('[scriptonait] restored the best model');
 });
 
+// --- The training plan -------------------------------------------------
+//
+// Loss and step count say what is happening; the plan says what it means
+// and what to do. It is computed in the worker from the schedule's own
+// numbers and the corpus's own numbers — see `buildPlan` there — and this
+// only draws it.
+
+/// The phase last drawn, so a change of phase can be announced once
+/// rather than every time the plan is recomputed.
+let lastPhaseKey = null;
+
+function renderPlan(plan) {
+  if (!plan || !plan.phase) return;
+  const box = $('train-plan');
+  $('plan-phase-title').textContent = plan.phase.title;
+  $('plan-phase-detail').textContent = plan.phase.detail;
+
+  const n = plan.numbers;
+  const parts = [];
+  parts.push(`step ${n.step.toLocaleString()}`);
+  if (n.plannedSteps > n.step) parts.push(`of ${n.plannedSteps.toLocaleString()} planned`);
+  parts.push(`${formatCount(n.tokensSeen)} tokens seen`);
+  if (n.epochs >= 0.05) parts.push(`${n.epochs.toFixed(1)}x over your text`);
+  parts.push(`${n.tokensPerParam.toFixed(1)} tokens per parameter`);
+  if (n.etaSeconds !== null && n.etaSeconds > 0) {
+    parts.push(`about ${formatDuration(n.etaSeconds)} left`);
+  }
+  $('plan-numbers').textContent = parts.join(' · ');
+
+  const list = $('plan-actions');
+  list.replaceChildren();
+  for (const action of plan.actions || []) {
+    const li = document.createElement('li');
+    li.textContent = action.text;
+    if (action.urgency === 'high') li.className = 'high';
+    list.append(li);
+  }
+  box.hidden = false;
+
+  // A change of phase is worth a notification: the whole point of naming
+  // the phases is that "the loss is barely moving" means opposite things
+  // in two of them, and nobody watches a tab for twenty minutes to find
+  // out which.
+  if (plan.phase.key !== lastPhaseKey) {
+    if (lastPhaseKey !== null) notify(`Training: ${plan.phase.title}`, plan.phase.detail);
+    console.info(`[scriptonait] phase: ${plan.phase.title} — ${plan.phase.detail}`, n);
+    lastPhaseKey = plan.phase.key;
+  }
+}
+
+onStream('train-plan', (plan) => renderPlan(plan));
+
+/// Ask for the plan outside a training run — after a model loads, or the
+/// corpus changes. The answer is what to do next, and it should not take
+/// a training run to see it.
+async function refreshPlan() {
+  if (!model || training) return;
+  try {
+    renderPlan(await call('training-plan', { batchSize: chosenBatchSize() }));
+  } catch (error) {
+    console.warn('[scriptonait] could not build the training plan', error);
+  }
+}
+
 onStream('train-advice', ({ advice, step }) => {
   const box = $('train-advice');
   box.textContent = `At step ${step.toLocaleString()}: ${advice}`;
@@ -1184,6 +1256,7 @@ $('train-btn').addEventListener('click', async () => {
   if (training) return;
   clearError();
   training = true;
+  lastPhaseKey = null;
   lossHistory.length = 0;
   validationHistory.length = 0;
   $('train-btn').disabled = true;
@@ -1273,6 +1346,8 @@ $('train-btn').addEventListener('click', async () => {
     }
     if (result.model) renderModel(result.model);
     await saveModel();
+    training = false;
+    await refreshPlan();
   } catch (error) {
     showError(error);
   } finally {
@@ -1496,4 +1571,8 @@ async function restoreModel() {
     console.warn('[scriptonait] could not read the best model:', error);
   }
   updateGuidance();
+  // What to do next, before anything has been trained: with a model and
+  // a corpus already restored from the last visit, the plan is readable
+  // immediately and is the most useful thing on the page.
+  await refreshPlan();
 })();

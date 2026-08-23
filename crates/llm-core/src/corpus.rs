@@ -295,6 +295,42 @@ impl Corpus {
         self.dirty = false;
     }
 
+    /// How many tokens of each kind of writing the corpus holds.
+    ///
+    /// Counted in tokens rather than in sources, because one novel and
+    /// twenty scenes are not a balanced corpus however the file count
+    /// reads. Kinds with no text at all are left out.
+    pub fn mix(&self) -> Vec<(crate::mix::SourceKind, usize)> {
+        let mut totals: Vec<(crate::mix::SourceKind, usize)> = Vec::new();
+        for id in &self.order {
+            let (Some(text), Some(tokens)) = (self.cleaned_text.get(id), self.sources.get(id))
+            else {
+                continue;
+            };
+            let kind = crate::mix::classify(text);
+            match totals.iter_mut().find(|(k, _)| *k == kind) {
+                Some((_, count)) => *count += tokens.len(),
+                None => totals.push((kind, tokens.len())),
+            }
+        }
+        totals.sort_by(|a, b| b.1.cmp(&a.1));
+        totals
+    }
+
+    /// Tokens the training stream actually draws from, and the tokens
+    /// held out of it. `total_tokens` counts both; a training plan has to
+    /// separate them, because it is the first of the two that decides how
+    /// long an epoch is.
+    pub fn training_tokens(&mut self) -> usize {
+        self.rebuild_flat_if_needed();
+        self.flat_cache.len()
+    }
+
+    pub fn validation_tokens(&mut self) -> usize {
+        self.rebuild_flat_if_needed();
+        self.val_cache.len()
+    }
+
     /// Whether there's enough data to sample at least one training window.
     pub fn can_sample(&mut self, context_len: usize) -> bool {
         self.rebuild_flat_if_needed();

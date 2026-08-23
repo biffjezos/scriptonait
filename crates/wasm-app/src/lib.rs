@@ -447,6 +447,59 @@ impl WasmLLM {
         }
     }
 
+    /// Everything a training plan is computed from, as JSON.
+    ///
+    /// The schedule's own numbers (peak rate, warmup length, planned
+    /// length) and the corpus's own numbers (how many tokens train, how
+    /// many are held out) live on this side, so the page asks rather than
+    /// keeping a second copy that drifts. What the numbers *mean* — which
+    /// phase the run is in, what to do about it — is worked out where it
+    /// can be changed quickly, in the worker.
+    pub fn training_plan(&self) -> String {
+        let inner = &mut *self.0.borrow_mut();
+        let config = inner.config;
+        let train = inner.train;
+        let step = inner.step;
+        let context_len = config.context_len;
+        let training_tokens = inner.corpus.training_tokens();
+        let validation_tokens = inner.corpus.validation_tokens();
+        let mix = inner
+            .corpus
+            .mix()
+            .iter()
+            .map(|(kind, tokens)| {
+                format!("{{\"kind\":{:?},\"label\":{:?},\"tokens\":{}}}", kind.key(), kind.label(), tokens)
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        format!(
+            "{{\"step\":{},\"plannedSteps\":{},\"warmupSteps\":{},\"peakLr\":{},\
+             \"minLrRatio\":{},\"lrNow\":{},\"weightDecay\":{},\"gradClip\":{},\
+             \"params\":{},\"layers\":{},\"hidden\":{},\"vocabSize\":{},\
+             \"contextLen\":{},\"sources\":{},\"corpusTokens\":{},\
+             \"trainingTokens\":{},\"validationTokens\":{},\"pretrained\":{},\"mix\":[{}]}}",
+            step,
+            train.total_steps,
+            train.warmup_steps,
+            train.lr,
+            train.min_lr_ratio,
+            train.lr_at(step),
+            train.weight_decay,
+            train.grad_clip,
+            config.param_count(),
+            config.num_layers,
+            config.hidden_dim,
+            config.vocab_size,
+            context_len,
+            inner.corpus.num_sources(),
+            inner.corpus.total_tokens(),
+            training_tokens,
+            validation_tokens,
+            inner.pretrained,
+            mix,
+        )
+    }
+
     /// Rough memory estimate in bytes; see `ModelConfig::memory_bytes`.
     pub fn memory_bytes(&self, training: bool) -> f64 {
         self.0.borrow().config.memory_bytes(training) as f64

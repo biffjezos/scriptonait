@@ -79,6 +79,15 @@
         <input type="text" id="sample-prompt" value="Write a 40 word scene." />
       </div>
 
+      <!-- The plan: which phase the run is in, the numbers behind that,
+           and what a person could actually do about it. Shown before the
+           first step, not only after the first validation. -->
+      <div id="train-plan" class="plan" hidden>
+        <p class="plan-phase"><span id="plan-phase-title"></span><span id="plan-phase-detail"></span></p>
+        <p id="plan-numbers" class="stats"></p>
+        <ul id="plan-actions" class="plan-actions"></ul>
+      </div>
+
       <div id="train-status" class="job-status" hidden>
         <div class="progress"><div class="bar" id="train-progress-bar"></div></div>
         <p id="train-stats" class="stats"></p>

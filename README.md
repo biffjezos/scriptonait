@@ -47,6 +47,13 @@ device the page says so and does not train.
   on the next visit, so it is measured once, not guessed and not
   hard-coded for anybody's hardware.
 - Stop any time; progress is kept.
+- A training plan, recomputed as the run goes: which phase it is in
+  (warm-up, learning, plateau, overfitting, cooling down), what that
+  phase means for the numbers you are looking at, tokens seen, how many
+  times it has been over your text, an estimate of what is left — and
+  what would actually help, named with the number behind it. Sources are
+  classified by line shape (film scripts, novels, essays, verse), so a
+  corpus that is all one thing is told so.
 - Live loss chart with two curves — training loss and held-out loss, on
   one axis, because the gap between them is what says whether the model
   is learning the language or memorizing your text.
