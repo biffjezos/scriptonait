@@ -348,6 +348,41 @@ function renderModelShape(info) {
   $('shape-hint').textContent = info
     ? "This model's shape. Fixed — training continues the model you have."
     : 'New model shape:';
+  $('tile-hint').textContent = info ? '' : tileAdvice();
+}
+
+/// Whether a proposed width divides evenly into the matmul kernels'
+/// tiles, and what it costs when it does not.
+///
+/// The kernels compute a 64x64 block of output per workgroup. A width
+/// that is not a multiple of 64 still dispatches whole workgroups for
+/// the remainder, so a 516-wide model runs nine tile-columns to do
+/// eight tiles' worth of arithmetic — paid on every matmul in every
+/// layer, for four extra columns of model. Head size has the same
+/// property: 512 with 8 heads gives the 64-wide heads the attention
+/// kernels are shaped around, where 516 with 6 gives 86.
+///
+/// This is not a correctness rule and nothing rejects an odd width. It
+/// is a few percent of every step, forever, for nothing — worth one
+/// line under the fields rather than a discovery six hours in.
+function tileAdvice() {
+  const hidden = Number($('cfg-hidden').value) || 0;
+  const heads = Number($('cfg-heads').value) || 1;
+  if (hidden <= 0) return '';
+  const wasted = Math.ceil(hidden / 64) * 64 - hidden;
+  if (wasted === 0) return '';
+  const nearest = Math.round(hidden / 64) * 64;
+  const headDim = hidden % heads === 0 ? hidden / heads : null;
+  return (
+    `${hidden} is not a multiple of 64. The matmul kernels compute a 64x64 block per ` +
+    `workgroup, so this width dispatches ${Math.ceil(hidden / 64)} tiles to do ` +
+    `${(hidden / 64).toFixed(2)} tiles of work — a few percent of every step, on every layer. ` +
+    `${nearest} costs the same to train and does not` +
+    (headDim && headDim % 64 !== 0
+      ? `. Heads of ${headDim} are off the same grid; ${nearest} with ${nearest / 64} heads ` +
+        'gives 64-wide heads.'
+      : '.')
+  );
 }
 
 function renderModel(info) {
@@ -1489,6 +1524,11 @@ $('train-btn').addEventListener('click', async () => {
 });
 
 $('train-batch').addEventListener('input', updateGuidance);
+for (const id of ['cfg-hidden', 'cfg-heads']) {
+  $(id).addEventListener('input', () => {
+    if (!model) $('tile-hint').textContent = tileAdvice();
+  });
+}
 
 $('train-stop-btn').addEventListener('click', () => {
   $('train-stop-btn').disabled = true;
