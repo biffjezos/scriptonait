@@ -273,6 +273,9 @@ async function trainingSample(prompt, words) {
 async function train({ batchSize, learningRate, maxSteps, effort, sampleEvery, samplePrompt, sampleWords }) {
   stopRequested = false;
   if (learningRate > 0) llm.set_learning_rate(learningRate);
+  // The schedule has to know how long the run is, or its warmup and its
+  // cosine decay are shaped for a run nobody asked for.
+  llm.set_planned_steps(maxSteps > 0 ? maxSteps : 2000);
 
   const info = llm.info();
   log('training run starting', {

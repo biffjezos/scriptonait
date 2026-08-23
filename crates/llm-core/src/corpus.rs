@@ -133,6 +133,23 @@ impl Corpus {
         Some(size)
     }
 
+    /// One flag per token id: does this corpus contain it?
+    ///
+    /// Generation uses this to stay inside the vocabulary the text
+    /// actually used — see `SamplingConfig::allowed` for why an untrained
+    /// token is worse than a merely unlikely one.
+    pub fn seen_tokens(&self) -> std::rc::Rc<[bool]> {
+        let mut seen = vec![false; self.tokenizer.vocab_size()];
+        for tokens in self.sources.values() {
+            for &id in tokens {
+                if let Some(flag) = seen.get_mut(id as usize) {
+                    *flag = true;
+                }
+            }
+        }
+        seen.into()
+    }
+
     /// Clean, tokenize, and store (or replace) one source's text.
     pub fn upsert(&mut self, id: &str, raw_text: &str, is_html: bool) -> PreparedStats {
         let (cleaned, tokens, stats) = prep::prepare(&self.tokenizer, raw_text, is_html);
@@ -366,6 +383,16 @@ mod tests {
         assert_eq!(suggested_vocab_size(2_000), 512);
         assert!(suggested_vocab_size(200_000) > 1_000);
         assert!(suggested_vocab_size(5_000_000) > 4_096);
+    }
+
+    #[test]
+    fn seen_tokens_marks_only_what_the_corpus_contains() {
+        let mut c = Corpus::new();
+        c.upsert("a", "abc abc abc", false);
+        let seen = c.seen_tokens();
+        assert!(seen[b'a' as usize], "'a' is in the text");
+        assert!(!seen[b'Z' as usize], "'Z' is not");
+        assert!(!seen[200], "no high byte is");
     }
 
     #[test]

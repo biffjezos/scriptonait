@@ -424,6 +424,12 @@ impl WasmLLM {
             top_p,
             repetition_penalty,
             seed: seed as u64,
+            // Never emit a token the training text does not contain. A
+            // vocabulary holds every byte value so any input can be
+            // encoded, but a model early in training has had no reason to
+            // push the unused ones down, and they are what fills an early
+            // sample with replacement characters.
+            allowed: Some(self.0.borrow().corpus.seen_tokens()),
             ..SamplingConfig::default()
         };
 
@@ -926,6 +932,24 @@ impl WasmLLM {
             gpu.trainer = Some(trainer);
         }
         result.map_err(js_err)
+    }
+
+    /// Tell the schedule how long this run is planned to be.
+    ///
+    /// The warmup and the cosine decay are both shaped by it. Without
+    /// this the defaults assume a 10,000-step run with a 200-step
+    /// warmup, so a 231-step look at whether the thing learns at all
+    /// spends 200 of those steps at a fraction of the learning rate and
+    /// looks like it is doing nothing. Warmup is 2% of the run here,
+    /// between 10 and 200 steps.
+    pub fn set_planned_steps(&self, steps: u32) {
+        let inner = &mut *self.0.borrow_mut();
+        if steps == 0 {
+            return;
+        }
+        let steps = steps as u64;
+        inner.train.total_steps = steps;
+        inner.train.warmup_steps = (steps / 50).clamp(10, 200).min(steps.max(1) / 2);
     }
 
     /// Override the fine-tuning learning rate.
