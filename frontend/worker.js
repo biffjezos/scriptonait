@@ -385,6 +385,8 @@ function trainingPhase(plan, { heldOut, trainingLoss, stepsDone }) {
 /// is not advice; "this corpus is 6.5M tokens for a model that wants
 /// 283M — roughly 40 more scripts" is.
 function planActions(plan, phase, { heldOut, trainingLoss, tokensPerStep, tokensSeen }) {
+  // Measurements taken from generated text, folded onto the plan object
+  // by buildPlan so this reads them from one place.
   const actions = [];
   const { params, trainingTokens, validationTokens, contextLen, mix } = plan;
   const wanted = Math.round(params * TOKENS_PER_PARAM);
@@ -466,6 +468,41 @@ function planActions(plan, phase, { heldOut, trainingLoss, tokensPerStep, tokens
     });
   }
 
+  // What the samples themselves say. Loss can fall for a long time
+  // while the output is still not words, and that is exactly the
+  // situation where somebody stares at a falling curve and wonders why
+  // nothing reads like English.
+  const q = plan.quality;
+  if (q && q.words >= 20) {
+    if (q.knownWordRate < 0.75) {
+      actions.push({
+        key: 'not-words-yet',
+        urgency: 'normal',
+        text:
+          `Only ${Math.round(q.knownWordRate * 100)}% of the words in the last sample appear ` +
+          'anywhere in your corpus — the model is still assembling letters rather than ' +
+          'recalling words' +
+          (q.unknownExamples && q.unknownExamples.length
+            ? ` (${q.unknownExamples.slice(0, 4).join(', ')})`
+            : '') +
+          '. That is normal early and it is the first thing that should improve; if the loss ' +
+          'is falling and this is not, the tokenizer or the corpus is the problem, not the ' +
+          'number of steps.',
+      });
+    }
+    if (q.repeated4gramRate > 0.25) {
+      actions.push({
+        key: 'repeating',
+        urgency: 'normal',
+        text:
+          `${Math.round(q.repeated4gramRate * 100)}% of the four-word runs in the last sample ` +
+          'had already appeared in it. The model is cycling rather than continuing. Raise the ' +
+          'repetition penalty or min-p in the sampling settings before concluding anything ' +
+          'about the training.',
+      });
+    }
+  }
+
   // How many times the run has been over the same text. Past a few
   // passes a small corpus is being memorized whatever the loss says.
   if (trainingTokens > 0 && tokensSeen > 0) {
@@ -487,6 +524,8 @@ function planActions(plan, phase, { heldOut, trainingLoss, tokensPerStep, tokens
 /// The whole plan: the phase, the numbers behind it, and what to do.
 function buildPlan(state) {
   const plan = JSON.parse(llm.training_plan());
+  plan.quality = state.quality || null;
+  plan.bitsPerByte = state.bitsPerByte || 0;
   const phase = trainingPhase(plan, state);
   const tokensPerStep = state.tokensPerStep || plan.contextLen;
   // Tokens this model has seen over its whole life, not just this run.
@@ -514,6 +553,8 @@ function buildPlan(state) {
       etaSeconds: state.msPerStep > 0 ? (remaining * state.msPerStep) / 1000 : null,
       mix: plan.mix,
       sources: plan.sources,
+      bitsPerByte: plan.bitsPerByte,
+      quality: plan.quality,
     },
   };
 }
@@ -750,6 +791,11 @@ async function train({ batchSize, learningRate, maxSteps, effort, sampleEvery, s
   // The phase the run was last seen in, so a change of phase is
   // announced once instead of on every recomputation.
   let lastPhase = null;
+  /// The last quality measurement taken from a generated sample, so the
+  /// plan can carry it between samples instead of only at the moment one
+  /// is produced.
+  let lastQuality = null;
+  let lastBitsPerByte = 0;
   // Median-ish step cost, for the estimate of how long the rest takes.
   let recentStepMs = null;
 
@@ -825,10 +871,16 @@ async function train({ batchSize, learningRate, maxSteps, effort, sampleEvery, s
           validationLoss = measured;
           heldOut.push(measured);
           const gap = smoothedLoss === null ? null : measured - smoothedLoss;
+          // Bits per byte rather than nats per token: comparable
+          // between two vocabularies, and against a reference anybody
+          // can check — gzip lands around 2.5 on English prose.
+          const bpb = JSON.parse(llm.evaluate('', measured)).bitsPerByte;
           log(
             `step ${llm.step().toLocaleString()}: held-out loss ${measured.toFixed(4)}` +
-              (gap === null ? '' : ` (training ${smoothedLoss.toFixed(4)}, gap ${gap.toFixed(4)})`),
+              (gap === null ? '' : ` (training ${smoothedLoss.toFixed(4)}, gap ${gap.toFixed(4)})`) +
+              (bpb > 0 ? `, ${bpb.toFixed(3)} bits per byte` : ''),
           );
+          lastBitsPerByte = bpb;
           // A run's best model is rarely its last, and training past the
           // best is exactly what a small corpus makes it do. Tell the
           // page whenever this is the best held-out loss so far so it can
@@ -844,6 +896,8 @@ async function train({ batchSize, learningRate, maxSteps, effort, sampleEvery, s
             tokensPerStep,
             msPerStep: recentStepMs,
             lastPhase,
+            quality: lastQuality,
+            bitsPerByte: lastBitsPerByte,
           });
           const advice = corpusAdvice(heldOut, smoothedLoss);
           if (advice && advice !== lastAdvice) {
@@ -865,11 +919,23 @@ async function train({ batchSize, learningRate, maxSteps, effort, sampleEvery, s
       nextSampleAt = llm.step() + sampleEvery;
       const sampleStart = performance.now();
       try {
-        post('train-sample', {
-          step: llm.step(),
-          loss: smoothedLoss,
-          text: await trainingSample(samplePrompt, sampleWords || 40),
-        });
+        const text = await trainingSample(samplePrompt, sampleWords || 40);
+        // What the loss curve cannot say: is this English, and is it
+        // still saying anything new. Measured against the user's own
+        // corpus, so no word list has to ship with the page.
+        const quality = JSON.parse(llm.evaluate(text, validationLoss === null ? -1 : validationLoss));
+        lastQuality = quality;
+        post('train-sample', { step: llm.step(), loss: smoothedLoss, text, quality });
+        log(
+          `sample at step ${llm.step().toLocaleString()}: ` +
+            `${(quality.knownWordRate * 100).toFixed(0)}% of its words are in your corpus, ` +
+            `${(quality.repeated4gramRate * 100).toFixed(0)}% of its four-word runs are repeats, ` +
+            `${(quality.distinctWordRate * 100).toFixed(0)}% of its words are distinct` +
+            (quality.unknownExamples.length > 0
+              ? ` — words it invented: ${quality.unknownExamples.slice(0, 5).join(', ')}`
+              : ''),
+          quality,
+        );
         log(`sample generated in ${(performance.now() - sampleStart).toFixed(0)} ms`);
       } catch (error) {
         log(`sample failed: ${(error && error.message) || error}`);
@@ -1122,6 +1188,13 @@ const handlers = {
       );
     }
     return { rows };
+  },
+
+  /// Measure a piece of text against the corpus: how much of it is
+  /// words this corpus uses, how much of it repeats itself, and — given
+  /// a loss — how many bits per byte that is.
+  async evaluate({ text = '', loss = -1 }) {
+    return JSON.parse(llm.evaluate(text, loss));
   },
 
   /// The plan as it stands right now, without training anything: which

@@ -87,6 +87,12 @@ device the page says so and does not train.
 
 - Per-step console logging: loss, held-out loss, gradient norm, learning
   rate, tokens/second, dispatch and submission counts.
+- Measurements loss cannot make: **bits per byte** (the held-out loss in
+  a form comparable between two vocabularies, and against gzip's ~2.5 on
+  English prose), the fraction of a sample's words that appear anywhere
+  in your own sources, how many of its four-word runs it had already
+  written, and how many of its words are distinct. Shown on the sample
+  card and in the plan; `scriptonait.evaluate(text)` measures any text.
 - `scriptonait.profile()` in the console times one step per phase — zero,
   forward, loss, backward, reduce, readback, AdamW — at four
   command-buffer sizes, so "it is slow" becomes a measurement.

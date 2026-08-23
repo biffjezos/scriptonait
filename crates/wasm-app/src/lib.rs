@@ -447,6 +447,48 @@ impl WasmLLM {
         }
     }
 
+    /// Measure a piece of generated text against the corpus it was
+    /// trained on, and convert a loss into bits per byte. JSON.
+    ///
+    /// Loss alone cannot say whether the output is English. These can:
+    /// what fraction of the words appear anywhere in the user's own
+    /// sources, how much of it is a four-word run it already wrote, and
+    /// how many bits it takes this model to encode a byte of their text
+    /// — which, unlike loss, is comparable between two vocabularies and
+    /// against gzip.
+    ///
+    /// `loss` is a per-token cross-entropy in nats; pass a negative
+    /// number when there isn't one to convert.
+    pub fn evaluate(&self, text: String, loss: f32) -> String {
+        let inner = &mut *self.0.borrow_mut();
+        let bytes_per_token = inner.corpus.bytes_per_token();
+        let known = inner.corpus.word_vocabulary();
+        let stats = llm_core::eval::text_stats(&text, &known);
+        let bits = if loss >= 0.0 {
+            llm_core::eval::bits_per_byte_from_ratio(loss, bytes_per_token)
+        } else {
+            0.0
+        };
+        let unknown = stats
+            .unknown_examples
+            .iter()
+            .map(|w| format!("{w:?}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        format!(
+            "{{\"words\":{},\"knownWordRate\":{:.4},\"repeated4gramRate\":{:.4},\
+             \"distinctWordRate\":{:.4},\"bitsPerByte\":{:.4},\"bytesPerToken\":{:.3},\
+             \"unknownExamples\":[{}]}}",
+            stats.words,
+            stats.known_word_rate,
+            stats.repeated_4gram_rate,
+            stats.distinct_word_rate,
+            bits,
+            bytes_per_token,
+            unknown,
+        )
+    }
+
     /// Everything a training plan is computed from, as JSON.
     ///
     /// The schedule's own numbers (peak rate, warmup length, planned

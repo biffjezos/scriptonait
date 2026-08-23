@@ -54,6 +54,11 @@ pub struct Corpus {
     /// question it is supposed to: how does this model do on writing like
     /// the writing it was trained on.
     val_cache: Vec<u32>,
+    /// Every distinct word the sources use, built once and thrown away
+    /// whenever a source changes. Generated text is measured against it
+    /// (see `eval::text_stats`), and rebuilding it per measurement would
+    /// walk the whole corpus every twenty-five steps.
+    word_vocab: Option<std::rc::Rc<std::collections::HashSet<String>>>,
     dirty: bool,
     /// The tokenizer every source is encoded with. Swapping it
     /// re-encodes everything (see `set_tokenizer`), because token ids
@@ -92,6 +97,7 @@ impl Corpus {
             boundaries: Vec::new(),
             spans: Vec::new(),
             val_cache: Vec::new(),
+            word_vocab: None,
             dirty: true,
             tokenizer: Tokenizer::byte_level(),
         }
@@ -122,6 +128,7 @@ impl Corpus {
             }
         }
         self.dirty = true;
+        self.word_vocab = None;
     }
 
     /// Learn a BPE vocabulary from the sources already loaded, and
@@ -184,6 +191,7 @@ impl Corpus {
         self.cleaned_text.insert(id.to_string(), cleaned);
         self.sources.insert(id.to_string(), wrapped);
         self.dirty = true;
+        self.word_vocab = None;
         stats
     }
 
@@ -206,6 +214,7 @@ impl Corpus {
         }
         self.sources.insert(id.to_string(), tokens);
         self.dirty = true;
+        self.word_vocab = None;
     }
 
     pub fn remove(&mut self, id: &str) -> bool {
@@ -216,6 +225,7 @@ impl Corpus {
             self.cleaned_text.remove(id);
             self.per_source_state.remove(id);
             self.dirty = true;
+            self.word_vocab = None;
         }
         removed
     }
@@ -293,6 +303,33 @@ impl Corpus {
             self.val_cache.extend_from_slice(&tokens[split..]);
         }
         self.dirty = false;
+    }
+
+    /// Every distinct word the sources use, for measuring whether
+    /// generated text is made of words this corpus contains.
+    ///
+    /// The user's own text is the right reference here, not a
+    /// dictionary: a model trained on screenplays should be judged on
+    /// whether it writes the words those screenplays use, and no word
+    /// list has to ship with the page for that.
+    pub fn word_vocabulary(&mut self) -> std::rc::Rc<std::collections::HashSet<String>> {
+        if let Some(cached) = &self.word_vocab {
+            return std::rc::Rc::clone(cached);
+        }
+        let built = std::rc::Rc::new(crate::eval::vocabulary(self.cleaned_text.values()));
+        self.word_vocab = Some(std::rc::Rc::clone(&built));
+        built
+    }
+
+    /// Bytes of cleaned text per token, over the whole corpus.
+    ///
+    /// This is what turns a loss per token into bits per byte, which is
+    /// the only form of the number that can be compared between two
+    /// vocabularies — or against gzip.
+    pub fn bytes_per_token(&self) -> f32 {
+        let bytes: usize = self.cleaned_text.values().map(|t| t.len()).sum();
+        let tokens = self.total_tokens();
+        if tokens == 0 { 0.0 } else { bytes as f32 / tokens as f32 }
     }
 
     /// How many tokens of each kind of writing the corpus holds.
