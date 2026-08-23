@@ -1390,7 +1390,16 @@ $('train-btn').addEventListener('click', async () => {
       // 0 means "pick one": a new model needs a rate large enough to
       // learn a language from nothing; a working one needs a small
       // enough rate not to forget it.
-      learningRate: chosenRate > 0 ? chosenRate : (fromScratch ? 3e-4 : 5e-5),
+      //
+      // 6e-4 is what nanoGPT uses for a 768-wide GPT-2, and a narrower
+      // model tolerates more rather than less, so it is a conservative
+      // choice at the widths this page builds — and twice the 3e-4 that
+      // was here, which was simply timid. With warm-up, gradient-norm
+      // clipping at 1.0 and the plateau cut watching held-out loss,
+      // there are three separate things that catch a rate that turns
+      // out to be too high; there is nothing that catches one that is
+      // too low except hours of your time.
+      learningRate: chosenRate > 0 ? chosenRate : (fromScratch ? 6e-4 : 5e-5),
       maxSteps: Number($('train-steps').value),
       effort: chosenEffort(),
       // 0 turns sampling off; anything else is a step interval.
