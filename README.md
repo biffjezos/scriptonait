@@ -25,8 +25,11 @@ device the page says so and does not train.
   IndexedDB and reloaded on the next visit.
 - A BPE vocabulary is learned from your own corpus, sized to it, so the
   tokens are the phrases your text actually uses.
-- The last 5% of the corpus is held out of training, to measure the model
-  against text it has never seen.
+- Five percent of every source is held out of training, to measure the
+  model against text it has never seen. The measurement uses a fixed set
+  of windows, evenly spaced across that held-out text and identical on
+  every measurement, so two numbers differ because the weights differ
+  and not because two random draws landed on different text.
 
 **Training**
 

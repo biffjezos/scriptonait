@@ -325,9 +325,13 @@ impl WasmLLM {
         result
     }
 
-    /// Loss on held-out text — the number that separates learning from
-    /// memorizing. Returns -1 when there is not enough text to hold any
-    /// out, or no training state on the GPU yet.
+    /// Loss on a fixed set of held-out windows — the number that
+    /// separates learning from memorizing. Returns -1 when there is not
+    /// enough text to hold any out, or no training state on the GPU yet.
+    ///
+    /// `batch_size` is how many windows the set holds, not a sample
+    /// size: the same windows come back every call, so two measurements
+    /// differ only because the weights differ.
     pub async fn validation_loss(&self, batch_size: u32) -> Result<f32, JsValue> {
         self.acquire()?;
         let result = self.validation_loss_inner(batch_size).await;
@@ -1213,7 +1217,11 @@ impl WasmLLM {
                 return Ok(-1.0);
             }
             let context_len = inner.config.context_len;
-            match inner.corpus.sample_validation_batch(batch_size as usize, context_len, &mut inner.rng) {
+            // The same windows every time. A fresh random draw each
+            // measurement makes consecutive numbers differ by which text
+            // they happened to pick, and at a few thousand tokens a
+            // measurement that term is larger than the learning.
+            match inner.corpus.validation_batch(batch_size as usize, context_len) {
                 Some(batch) => batch,
                 None => return Ok(-1.0),
             }

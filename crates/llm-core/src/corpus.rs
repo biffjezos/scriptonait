@@ -392,6 +392,48 @@ impl Corpus {
 
     /// A batch drawn from the held-out stream — a slice of every source,
     /// never anything a training window can reach.
+    /// A *fixed* set of held-out windows, evenly spaced across the
+    /// held-out stream. The same windows every time it is called.
+    ///
+    /// This matters more than it looks. Held-out loss measured on a
+    /// fresh random batch each time is measuring two things at once —
+    /// how the model changed, and which text it happened to draw — and
+    /// at a few thousand tokens a measurement the second one dominates.
+    /// Consecutive measurements then differ by sampling noise, a run
+    /// looks like it is getting worse whenever two draws happen to land
+    /// on harder text, and every rule built on the difference between
+    /// them fires on nothing.
+    ///
+    /// A fixed set removes that term entirely: two measurements differ
+    /// only because the weights differ. It is not a sample of the
+    /// held-out text any more, it is *the* held-out text, and that is
+    /// what a validation set is supposed to be.
+    ///
+    /// Evenly spaced rather than the first N windows, because the
+    /// held-out stream is every source's tail concatenated, and the
+    /// first N windows would be one source's ending measured over and
+    /// over.
+    pub fn validation_batch(&mut self, batch_size: usize, context_len: usize) -> Option<Batch> {
+        self.rebuild_flat_if_needed();
+        if self.val_cache.len() <= context_len + 1 || batch_size == 0 {
+            return None;
+        }
+        let max_start = self.val_cache.len() - context_len - 1;
+        // One window per slot, spread across the whole stream. With more
+        // slots than the stream can hold apart, windows overlap rather
+        // than the set shrinking — an overlapping fixed set is still a
+        // fixed set.
+        let stride = (max_start / batch_size.max(1)).max(1);
+        let mut inputs = Vec::with_capacity(batch_size * context_len);
+        let mut targets = Vec::with_capacity(batch_size * context_len);
+        for i in 0..batch_size {
+            let start = (i * stride).min(max_start);
+            inputs.extend_from_slice(&self.val_cache[start..start + context_len]);
+            targets.extend_from_slice(&self.val_cache[start + 1..start + 1 + context_len]);
+        }
+        Some(Batch { inputs, targets, batch_size, context_len })
+    }
+
     pub fn sample_validation_batch(
         &mut self,
         batch_size: usize,
@@ -615,6 +657,42 @@ mod tests {
             assert!(c.sample_batch(2, 32, &mut rng).is_some());
             assert!(c.sample_validation_batch(2, 32, &mut rng).is_some());
         }
+    }
+
+    #[test]
+    fn the_validation_set_is_the_same_every_time() {
+        let mut c = Corpus::new();
+        c.upsert("a", &"the cave and the fire and the shadows on the wall. ".repeat(400), false);
+        let first = c.validation_batch(4, 32).expect("enough held-out text");
+        for _ in 0..5 {
+            let again = c.validation_batch(4, 32).expect("enough held-out text");
+            assert_eq!(again.inputs, first.inputs, "the validation set must not move");
+            assert_eq!(again.targets, first.targets);
+        }
+    }
+
+    #[test]
+    fn the_validation_set_spreads_across_the_held_out_stream() {
+        let mut c = Corpus::new();
+        for i in 0..6 {
+            c.upsert(&format!("s{i}"), &format!("source {i} text. ").repeat(500), false);
+        }
+        let batch = c.validation_batch(4, 32).expect("enough held-out text");
+        // Four windows drawn from four different places: if they were
+        // the first four in a row they would share most of their tokens.
+        let windows: Vec<&[u32]> = batch.inputs.chunks(32).collect();
+        assert_eq!(windows.len(), 4);
+        assert!(
+            windows[0] != windows[3],
+            "windows from opposite ends of the stream should differ"
+        );
+    }
+
+    #[test]
+    fn no_validation_set_without_enough_held_out_text() {
+        let mut c = Corpus::new();
+        c.upsert("a", "too short", false);
+        assert!(c.validation_batch(4, 32).is_none());
     }
 
     #[test]

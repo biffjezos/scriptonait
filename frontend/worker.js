@@ -62,6 +62,31 @@ const PLATEAU_FLOOR = 0.05;
 /// noise and the rate is never cut.
 const PLATEAU_MIN_DELTA = 0.005;
 
+/// How many held-out windows the validation set holds, and how often it
+/// is measured.
+///
+/// These trade against each other at fixed cost. Sixteen windows every
+/// fifty steps is the same GPU time as six every twenty-five, and it is
+/// a far better measurement: nearly three times the text, and — because
+/// the set is fixed rather than resampled — no sampling term at all.
+/// Two consecutive numbers now differ only because the weights differ,
+/// which is the property every rule built on their difference assumed
+/// and did not have.
+const VALIDATION_WINDOWS = 16;
+const VALIDATE_EVERY = 50;
+
+/// Tokens that must have gone through the model before anything is said
+/// about the corpus or about overfitting.
+///
+/// Held-out loss measured at step 250 of a run says nothing: the model
+/// has seen a fraction of a percent of its text, both curves are falling
+/// off a cliff together, and the differences the rules look at are
+/// dominated by how fast that fall happens to be at two nearby moments.
+/// A warning that fires there is a warning about nothing, and a page
+/// that cries wolf at step 250 has taught the user to ignore it by the
+/// time it is right.
+const TOKENS_BEFORE_JUDGING_HELD_OUT = 2e6;
+
 function post(type, payload = {}) {
   self.postMessage({ type, ...payload });
 }
@@ -373,19 +398,33 @@ function trainingPhase(plan, { heldOut, trainingLoss }) {
     };
   }
 
-  // Trend over the held-out curve, on the same window the corpus advice
-  // uses, so the two never disagree about which way the line is going.
+  // Trend over the held-out curve, on the same window and against the
+  // same noise floor the corpus advice uses, so the two never disagree
+  // about which way the line is going.
+  //
+  // Both are gated on the model having actually been trained. A curve
+  // 250 steps into a run is falling off a cliff; the difference between
+  // two adjacent windows of it is about how steep the cliff is at two
+  // nearby moments, and calling that "overfitting" is how a page ends up
+  // warning about memorization before the model can spell.
   const WINDOW = 5;
   let trend = null;
-  if (heldOut.length >= WINDOW * 2) {
+  let noise = 0;
+  if (heldOut.length >= WINDOW * 2 && plan.tokensSeen >= TOKENS_BEFORE_JUDGING_HELD_OUT) {
     const mean = (xs) => xs.reduce((a, b) => a + b, 0) / xs.length;
-    trend = mean(heldOut.slice(-WINDOW * 2, -WINDOW)) - mean(heldOut.slice(-WINDOW));
+    const recent = heldOut.slice(-WINDOW * 2);
+    const m = mean(recent);
+    noise = Math.max(
+      Math.sqrt(recent.reduce((a, b) => a + (b - m) ** 2, 0) / (recent.length - 1)),
+      0.002,
+    );
+    trend = mean(recent.slice(0, WINDOW)) - mean(recent.slice(WINDOW));
   }
   const gap = trainingLoss === null || heldOut.length === 0
     ? null
     : heldOut[heldOut.length - 1] - trainingLoss;
 
-  if (trend !== null && trend < -0.01) {
+  if (trend !== null && trend < -noise) {
     return {
       key: 'overfitting',
       title: 'Overfitting',
@@ -395,7 +434,7 @@ function trainingPhase(plan, { heldOut, trainingLoss }) {
         'writing anything new. The best model of this run is already saved.',
     };
   }
-  if (trend !== null && trend < 0.01) {
+  if (trend !== null && trend < noise) {
     return {
       key: 'plateau',
       title: 'Plateau',
@@ -937,7 +976,12 @@ async function train({ batchSize, learningRate, maxSteps, effort, sampleEvery, s
   // Held-out loss on the same cadence as the loss chart's own reporting:
   // often enough to see the two curves separate, rare enough that its
   // forward passes are a rounding error against training.
-  const validateEvery = 25;
+  const validateEvery = VALIDATE_EVERY;
+  log(
+    `held-out loss will be measured every ${VALIDATE_EVERY} steps on a fixed set of ` +
+      `${VALIDATION_WINDOWS} windows (${VALIDATION_WINDOWS * info.context_len} tokens), the ` +
+      'same windows each time — so two measurements differ only because the weights differ',
+  );
   let nextValidateAt = llm.step() + validateEvery;
   let validationLoss = null;
   // Held-out losses in order, so the run can say when more text would
@@ -1026,7 +1070,7 @@ async function train({ batchSize, learningRate, maxSteps, effort, sampleEvery, s
     if (llm.step() >= nextValidateAt) {
       nextValidateAt = llm.step() + validateEvery;
       try {
-        const measured = await llm.validation_loss(batchSize);
+        const measured = await llm.validation_loss(VALIDATION_WINDOWS);
         if (measured >= 0) {
           validationLoss = measured;
           heldOut.push(measured);
@@ -1096,7 +1140,7 @@ async function train({ batchSize, learningRate, maxSteps, effort, sampleEvery, s
             quality: lastQuality,
             bitsPerByte: lastBitsPerByte,
           });
-          const advice = corpusAdvice(heldOut, smoothedLoss);
+          const advice = corpusAdvice(heldOut, smoothedLoss, JSON.parse(llm.training_plan()).tokensSeen);
           if (advice && advice !== lastAdvice) {
             lastAdvice = advice;
             log(`advice: ${advice}`);
@@ -1178,8 +1222,13 @@ async function train({ batchSize, learningRate, maxSteps, effort, sampleEvery, s
 /// falls (the model is memorizing). Both have the same answer - more
 /// text - and both are invisible unless somebody watches the numbers,
 /// so the run watches them.
-function corpusAdvice(heldOut, trainingLoss) {
-  const WINDOW = 5; // about 125 steps at the validation cadence
+function corpusAdvice(heldOut, trainingLoss, tokensSeen) {
+  // Nothing can be concluded from a held-out curve before the model has
+  // actually been trained. At step 250 both curves are falling steeply
+  // together and the difference between two nearby windows of them is
+  // about how fast the fall is, not about overfitting.
+  if (tokensSeen < TOKENS_BEFORE_JUDGING_HELD_OUT) return null;
+  const WINDOW = 5; // 250 steps at the validation cadence
   if (heldOut.length < WINDOW * 2) return null;
   const mean = (xs) => xs.reduce((a, b) => a + b, 0) / xs.length;
   const now = mean(heldOut.slice(-WINDOW));
@@ -1187,14 +1236,24 @@ function corpusAdvice(heldOut, trainingLoss) {
   const improvement = before - now;
   const gap = trainingLoss === null ? 0 : now - trainingLoss;
 
-  if (improvement < -0.01) {
+  // How much the curve wobbles inside each window, so "it went up" is
+  // judged against how much it moves anyway rather than against a
+  // constant somebody picked. With a fixed validation set this is
+  // small, and a rise past it is a real rise.
+  const spread = (xs) => {
+    const m = mean(xs);
+    return Math.sqrt(xs.reduce((a, b) => a + (b - m) ** 2, 0) / Math.max(1, xs.length - 1));
+  };
+  const noise = Math.max(spread(heldOut.slice(-WINDOW * 2)), 0.002);
+
+  if (improvement < -noise) {
     return (
       'held-out loss is rising while training loss falls - the model has started memorizing your ' +
       'text rather than learning from it. Add more source material, or stop here and keep the ' +
       'model as it is.'
     );
   }
-  if (improvement < 0.01) {
+  if (improvement < noise) {
     return gap > 0.3
       ? 'held-out loss has flattened and sits well above training loss - this corpus has taught ' +
         'what it can. More text will help more than more steps.'
