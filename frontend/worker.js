@@ -1380,6 +1380,16 @@ const handlers = {
     return describePrompt(text(prompt, 'the prompt'));
   },
 
+  /// What a shape would cost, before anything is built from it. Needs no
+  /// model — that is the point, since this is what somebody is looking
+  /// at while they choose the numbers.
+  async 'describe-shape'({ layers, hidden, heads, kvHeads, contextLen, window: win, corpusChars }) {
+    await ensureWasm();
+    return JSON.parse(
+      wasm.describe_shape(layers, hidden, heads, kvHeads, contextLen, win, corpusChars || 0),
+    );
+  },
+
   /// Which loaded sources are copies of another. Reported, never
   /// removed: which copy to keep is the user's call.
   async 'duplicate-sources'() {
@@ -1587,7 +1597,7 @@ self.onmessage = async (event) => {
     return;
   }
   // Everything except `stop` needs a model; saying so beats a wasm panic.
-  if (!llm && !['load-model', 'create-model', 'import-checkpoint', 'parse-prompt', 'stop'].includes(type)) {
+  if (!llm && !['load-model', 'create-model', 'import-checkpoint', 'parse-prompt', 'describe-shape', 'stop'].includes(type)) {
     fail(
       rid,
       new Error(

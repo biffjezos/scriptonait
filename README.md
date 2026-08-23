@@ -47,7 +47,12 @@ device the page says so and does not train.
   readable. At the floor the page says so rather than cutting again —
   by then the limit is the corpus, not the rate.
 - Model shape is yours to set: layers, hidden size, heads, KV heads,
-  context length, attention window. So are steps, batch size, learning
+  context length, attention window — priced as you type, before anything
+  is built. Parameters, GPU memory to train against the ceiling that
+  rejects a shape, head and MLP widths, the vocabulary your text
+  supports, and what the shape wastes if it is off the kernels' 64-wide
+  tile grid. The arithmetic is the same `ModelConfig` the model is built
+  from, so the estimate cannot drift from what it estimates. So are steps, batch size, learning
   rate, and an effort setting that decides how much of the machine the
   run may take.
 - Every training setting is optional. The first run benchmarks the

@@ -1496,6 +1496,90 @@ impl WasmLLM {
     }
 }
 
+/// Price a model shape before anything is built from it.
+///
+/// Deliberately a free function rather than a method: the whole point is
+/// to answer "what would this cost" while no model exists, which is
+/// exactly when somebody is choosing the numbers. Returns JSON.
+///
+/// `corpus_chars` is how much text is loaded, which decides the
+/// vocabulary the model would be built with — and the vocabulary sets
+/// the embedding table, which at these sizes is a quarter of the
+/// parameters. Passing 0 falls back to the ceiling the page uses.
+#[wasm_bindgen]
+#[allow(clippy::too_many_arguments)]
+pub fn describe_shape(
+    layers: u32,
+    hidden: u32,
+    heads: u32,
+    kv_heads: u32,
+    context_len: u32,
+    window: u32,
+    corpus_chars: f64,
+) -> String {
+    const MAX_VOCAB: usize = 8192;
+    let vocab = if corpus_chars > 0.0 {
+        llm_core::corpus::suggested_vocab_size(corpus_chars as usize).min(MAX_VOCAB)
+    } else {
+        MAX_VOCAB
+    };
+    let config = ModelConfig {
+        num_layers: layers as usize,
+        hidden_dim: hidden as usize,
+        num_heads: heads.max(1) as usize,
+        num_kv_heads: kv_heads.max(1) as usize,
+        context_len: context_len as usize,
+        local_window: window as usize,
+        vocab_size: vocab,
+        ..ModelConfig::default()
+    };
+    // Everything below has to survive an invalid shape: the fields are
+    // being typed into, so most keystrokes produce one, and an estimator
+    // that throws on the way to a valid number is an estimator nobody
+    // can watch while they type.
+    let problem = match config.validate() {
+        Ok(()) => String::new(),
+        Err(err) => err.to_string(),
+    };
+    let divides = config.num_heads > 0
+        && config.hidden_dim % config.num_heads == 0
+        && config.num_kv_heads > 0
+        && config.num_heads % config.num_kv_heads == 0;
+    let (params, training_bytes, inference_bytes, efficiency, head_dim, kv_dim, ffn_dim) =
+        if divides && config.hidden_dim > 0 && config.context_len > 0 {
+            (
+                config.param_count(),
+                config.memory_bytes(true),
+                config.memory_bytes(false),
+                config.tile_efficiency(),
+                config.head_dim(),
+                config.kv_dim(),
+                config.ffn_dim(),
+            )
+        } else {
+            (0, 0, 0, 1.0, 0, 0, 0)
+        };
+    format!(
+        "{{"valid":{},"problem":{:?},"params":{},"vocabSize":{},"headDim":{},         "kvDim":{},"ffnDim":{},"trainingBytes":{},"inferenceBytes":{},         "memoryLimitBytes":{},"tileEfficiency":{:.4},"band":{}}}",
+        problem.is_empty(),
+        problem,
+        params,
+        vocab,
+        head_dim,
+        kv_dim,
+        ffn_dim,
+        training_bytes,
+        inference_bytes,
+        llm_core::config::MAX_TRAINING_BYTES,
+        efficiency,
+        if config.context_len > 0 {
+            llm_core::ops::band_width(config.context_len, config.effective_window())
+        } else {
+            0
+        },
+    )
+}
+
 /// Parse a prompt without a model, so the UI can echo back what it
 /// understood while the checkpoint is still downloading.
 #[wasm_bindgen]

@@ -348,59 +348,88 @@ function renderModelShape(info) {
   $('shape-hint').textContent = info
     ? "This model's shape. Fixed — training continues the model you have."
     : 'New model shape:';
-  $('tile-hint').textContent = info ? '' : tileAdvice();
+  refreshShapeEstimate();
 }
 
-/// Whether a proposed width divides evenly into the matmul kernels'
-/// tiles, and what it costs when it does not.
+/// What the shape in the fields would cost, priced before anything is
+/// built from it.
 ///
-/// The kernels compute a 64x64 block of output per workgroup. A width
-/// that is not a multiple of 64 still dispatches whole workgroups for
-/// the remainder, so a 516-wide model runs nine tile-columns to do
-/// eight tiles' worth of arithmetic — paid on every matmul in every
-/// layer, for four extra columns of model. Head size has the same
-/// property: 512 with 8 heads gives the 64-wide heads the attention
-/// kernels are shaped around, where 516 with 6 gives 86.
+/// This exists because choosing a model shape is choosing a number of
+/// hours and a quantity of GPU memory, and neither is guessable from
+/// "12 layers, 516 hidden". The arithmetic is in `describe_shape` on the
+/// wasm side — the same `ModelConfig` the model is actually built from,
+/// so the estimate cannot drift from the thing it estimates.
 ///
-/// This is not a correctness rule and nothing rejects an odd width. It
-/// is a few percent of every step, forever, for nothing — worth one
-/// line under the fields rather than a discovery six hours in.
-function tileAdvice() {
-  const hidden = Number($('cfg-hidden').value) || 0;
-  const heads = Number($('cfg-heads').value) || 1;
-  const context = Number($('cfg-context').value) || 0;
-  if (hidden <= 0 || context <= 0) return '';
+/// Recomputed on every keystroke and needs no model, which is the whole
+/// point: the moment somebody wants this answer is the moment before
+/// there is a model to ask.
+let shapeEstimateToken = 0;
 
-  // Both dimensions matter, and they multiply. Context is the row count
-  // of every matmul in a step and hidden is the column count, so a model
-  // that is off the grid on both pays the waste twice over: 516 x 516
-  // dispatches 9 x 9 tiles where 8.06 x 8.06 of work exists, which is
-  // 19% of every step rather than the 6% either one costs alone.
-  const off = [];
-  if (hidden % 64 !== 0) off.push(['hidden size', hidden]);
-  if (context % 64 !== 0) off.push(['context', context]);
-  if (off.length === 0) return '';
+function formatBytes(bytes) {
+  if (!bytes) return '—';
+  if (bytes >= 1e9) return `${(bytes / 1e9).toFixed(2)} GB`;
+  return `${Math.round(bytes / 1e6)} MB`;
+}
 
-  const waste = off.reduce((f, [, n]) => f * ((Math.ceil(n / 64) * 64) / n), 1);
-  const fix = off
-    .map(([what, n]) => `${what} ${Math.round(n / 64) * 64}`)
-    .join(', ');
-  const headDim = hidden % heads === 0 ? hidden / heads : null;
-  return (
-    `The matmul kernels compute a 64x64 block of output per workgroup, and ` +
-    `${off.map(([what, n]) => `${what} ${n}`).join(' and ')} ` +
-    `${off.length > 1 ? 'are' : 'is'} not a multiple of 64 — so this shape dispatches about ` +
-    `${((waste - 1) * 100).toFixed(0)}% more work than the arithmetic it needs, on every step ` +
-    `of every layer. ${fix} costs the same to train and does not` +
-    (headDim && headDim % 64 !== 0
-      ? `. Heads of ${headDim} are off the same grid too; ${Math.round(hidden / 64) * 64} with ` +
-        `${Math.round(hidden / 64)} heads gives the 64-wide heads the attention kernels are ` +
-        'shaped around.'
-      : '.')
-  );
+async function refreshShapeEstimate() {
+  const box = $('shape-estimate');
+  if (!box) return;
+  // With a model loaded the fields state its shape and cannot be
+  // changed, so there is nothing to price.
+  if (model) {
+    box.textContent = '';
+    return;
+  }
+  const token = ++shapeEstimateToken;
+  let estimate;
+  try {
+    estimate = await call('describe-shape', {
+      layers: Number($('cfg-layers').value) || 0,
+      hidden: Number($('cfg-hidden').value) || 0,
+      heads: Number($('cfg-heads').value) || 0,
+      kvHeads: Number($('cfg-kv-heads').value) || 0,
+      contextLen: Number($('cfg-context').value) || 0,
+      window: Number($('cfg-window').value) || 0,
+      corpusChars: sources.reduce((sum, s) => sum + (s.rawText || '').length, 0),
+    });
+  } catch (error) {
+    box.textContent = '';
+    return;
+  }
+  // Keystrokes race: only the newest answer may write.
+  if (token !== shapeEstimateToken) return;
+
+  if (!estimate.valid) {
+    box.textContent = `This shape will not build: ${estimate.problem}`;
+    box.className = 'hint shape-estimate invalid';
+    return;
+  }
+
+  const parts = [
+    `${formatCount(estimate.params)} parameters`,
+    `${formatBytes(estimate.trainingBytes)} of GPU memory to train ` +
+      `(limit ${formatBytes(estimate.memoryLimitBytes)})`,
+    `${formatBytes(estimate.inferenceBytes)} to generate`,
+    `${estimate.headDim}-wide heads`,
+    `${formatCount(estimate.ffnDim)} MLP width`,
+    `${formatCount(estimate.vocabSize)}-token vocabulary from the text you have`,
+  ];
+  // Only worth saying when it is true, and worth saying plainly when it
+  // is: a shape off the 64-grid pays this on every step, forever.
+  if (estimate.tileEfficiency > 1.02) {
+    parts.push(
+      `about ${Math.round((estimate.tileEfficiency - 1) * 100)}% of every step wasted — the ` +
+        'matmul kernels work in 64x64 blocks, and hidden size and context are the two ' +
+        'dimensions that have to be multiples of 64 (they multiply, so being off on both ' +
+        'costs both)',
+    );
+  }
+  box.textContent = parts.join(' · ');
+  box.className = 'hint shape-estimate';
 }
 
 function renderModel(info) {
+
   model = info;
   $('generate-btn').disabled = !info;
   $('train-btn').disabled = !info;
@@ -924,6 +953,9 @@ async function addSources(entries) {
   // did too. Without this the plan keeps reporting the corpus it was
   // last computed against.
   await refreshPlan();
+  // And the vocabulary a new model would be built with scales with how
+  // much text there is, so the shape estimate moved too.
+  refreshShapeEstimate();
   if (failures.length) {
     showError(
       `${failures.length} of ${entries.length} couldn't be added: ${failures.slice(0, 3).join(', ')}` +
@@ -1539,10 +1571,10 @@ $('train-btn').addEventListener('click', async () => {
 });
 
 $('train-batch').addEventListener('input', updateGuidance);
-for (const id of ['cfg-hidden', 'cfg-heads', 'cfg-context']) {
-  $(id).addEventListener('input', () => {
-    if (!model) $('tile-hint').textContent = tileAdvice();
-  });
+// Every field that changes the price, priced as it is typed.
+for (const id of ['cfg-layers', 'cfg-hidden', 'cfg-heads', 'cfg-kv-heads', 'cfg-context',
+  'cfg-window']) {
+  $(id).addEventListener('input', () => refreshShapeEstimate());
 }
 
 $('train-stop-btn').addEventListener('click', () => {
@@ -1779,4 +1811,6 @@ async function restoreModel() {
   // a corpus already restored from the last visit, the plan is readable
   // immediately and is the most useful thing on the page.
   await refreshPlan();
+  // And with no model, what the default shape in the fields would cost.
+  refreshShapeEstimate();
 })();

@@ -294,6 +294,47 @@ impl ModelConfig {
     /// numeric type). `training` accounts for gradients plus Adam's two
     /// moment buffers (~4x the raw weight bytes) *and* the per-step
     /// activation memory from `activation_bytes`.
+    /// How much work the tiled matmul kernels dispatch for this shape,
+    /// as a multiple of the arithmetic the shape actually needs.
+    ///
+    /// The kernels compute a 64x64 block of output per workgroup (see
+    /// `shaders/linear.wgsl`), so a dimension that is not a multiple of
+    /// 64 still costs a whole extra tile of mostly-idle threads. Both
+    /// dimensions count and they multiply: the token count is the row
+    /// dimension of every matmul in a step and the hidden size is the
+    /// column dimension, so a shape off the grid on both pays the waste
+    /// twice. 516 x 516 dispatches 9 x 9 tiles where 8.06 x 8.06 of work
+    /// exists — 1.19, against 1.01 for 512 x 512.
+    ///
+    /// Returns 1.0 for a shape that fits the grid exactly. Nothing
+    /// rejects a shape that does not; this is a few percent of every
+    /// step forever, and worth being able to see before committing a
+    /// run to it.
+    pub fn tile_efficiency(&self) -> f64 {
+        const TILE: usize = 64;
+        let tiles = |n: usize| n.div_ceil(TILE) * TILE;
+        let (h, kv, ffn, t) = (self.hidden_dim, self.kv_dim(), self.ffn_dim(), self.context_len);
+        let v = self.vocab_size();
+        let layers = self.num_layers;
+        // (contraction, output width, how many a step runs). The
+        // contraction dimension is walked in slabs and does not pay tile
+        // padding, so only rows and columns count here.
+        let shapes = [
+            (h, h, 2 * layers),     // Wq, Wo
+            (h, kv, 2 * layers),    // Wk, Wv
+            (h, ffn, 2 * layers),   // Wgate, Wup
+            (ffn, h, layers),       // Wdown
+            (h, v, 1),              // the tied output head
+        ];
+        let mut needed = 0.0f64;
+        let mut dispatched = 0.0f64;
+        for (k, n, times) in shapes {
+            needed += (t * k * n * times) as f64;
+            dispatched += (tiles(t) * k * tiles(n) * times) as f64;
+        }
+        if needed == 0.0 { 1.0 } else { dispatched / needed }
+    }
+
     pub fn memory_bytes(&self, training: bool) -> usize {
         let bytes_per_param = 4;
         let weight_bytes = self.param_count() * bytes_per_param;
@@ -309,6 +350,32 @@ impl ModelConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_shape_on_the_tile_grid_wastes_nothing_on_its_own_dimensions() {
+        let c = ModelConfig {
+            num_layers: 8, hidden_dim: 384, num_heads: 6, num_kv_heads: 2,
+            context_len: 256, local_window: 256, vocab_size: 8192, ..Default::default()
+        };
+        // 384, 256, 128 and 8192 are all multiples of 64; only the ffn
+        // dimension (1024) has to be checked, and it is one too.
+        assert!((c.tile_efficiency() - 1.0).abs() < 1e-9, "{}", c.tile_efficiency());
+    }
+
+    #[test]
+    fn being_off_the_grid_on_both_dimensions_multiplies() {
+        let both = ModelConfig {
+            num_layers: 12, hidden_dim: 516, num_heads: 6, num_kv_heads: 2,
+            context_len: 516, local_window: 256, vocab_size: 8192, ..Default::default()
+        };
+        let one = ModelConfig { context_len: 512, ..both };
+        let neither = ModelConfig {
+            hidden_dim: 512, num_heads: 8, context_len: 512, ..both
+        };
+        assert!(both.tile_efficiency() > 1.15, "{}", both.tile_efficiency());
+        assert!(one.tile_efficiency() < both.tile_efficiency());
+        assert!(neither.tile_efficiency() < 1.02, "{}", neither.tile_efficiency());
+    }
 
     #[test]
     fn default_config_is_valid() {

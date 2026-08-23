@@ -575,6 +575,18 @@ select {
   line-height: 1.4;
 }
 
+/* What the shape in the fields would cost, before it is built. Choosing
+   a model shape is choosing hours and gigabytes, and neither is
+   guessable from "12 layers, 516 hidden". */
+.shape-estimate {
+  margin-top: 0.4rem;
+  line-height: 1.5;
+}
+
+.shape-estimate.invalid {
+  color: var(--accent, #e0af68);
+}
+
 /* The training plan: phase, numbers, and what to do about them. It sits
    above the progress bar because it is the part worth reading. */
 .plan {
