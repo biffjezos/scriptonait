@@ -536,6 +536,24 @@ $('generate-btn').addEventListener('click', async () => {
       `${result.tokensPerSecond.toFixed(0)} tokens/s · ${why}`;
     renderNotes(result.notes);
     notify('Your piece is ready', `${result.wordCount} words — ${why}.`);
+    // Measure what came out, to the console. Not on the page: the piece
+    // is the point, and a person reading it does not need a score
+    // stapled to it — but "37% of those words are not in your corpus"
+    // is the answer to "why does this read like that".
+    try {
+      const quality = await call('evaluate', { text: result.text || '', loss: -1 });
+      if (quality && quality.words > 0) {
+        console.info(
+          `[scriptonait] this piece: ${Math.round(quality.knownWordRate * 100)}% of its words ` +
+            `are in your corpus, ${Math.round(quality.repeated4gramRate * 100)}% of its ` +
+            `four-word runs are repeats, ${Math.round(quality.distinctWordRate * 100)}% ` +
+            'of its words are distinct',
+          quality,
+        );
+      }
+    } catch (error) {
+      console.warn('[scriptonait] could not measure the generated text', error);
+    }
   } catch (error) {
     showError(error.message);
   } finally {
@@ -1023,6 +1041,12 @@ function renderPlan(plan) {
   parts.push(`${formatCount(n.tokensSeen)} tokens seen`);
   if (n.epochs >= 0.05) parts.push(`${n.epochs.toFixed(1)}x over your text`);
   parts.push(`${n.tokensPerParam.toFixed(1)} tokens per parameter`);
+  // Bits per byte is the loss in a form that can be compared with
+  // something: gzip is about 2.5 on English prose.
+  if (n.bitsPerByte > 0) parts.push(`${n.bitsPerByte.toFixed(2)} bits/byte`);
+  if (n.quality && n.quality.words > 0) {
+    parts.push(`${Math.round(n.quality.knownWordRate * 100)}% real words`);
+  }
   if (n.etaSeconds !== null && n.etaSeconds > 0) {
     parts.push(`about ${formatDuration(n.etaSeconds)} left`);
   }
@@ -1071,7 +1095,7 @@ onStream('train-advice', ({ advice, step }) => {
   notify('Your model has stopped improving', advice);
 });
 
-onStream('train-sample', ({ step, loss, text }) => {
+onStream('train-sample', ({ step, loss, text, quality }) => {
   const box = $('train-samples');
   let block = box.firstElementChild;
   if (!block || box.children.length !== 1) {
@@ -1081,8 +1105,18 @@ onStream('train-sample', ({ step, loss, text }) => {
     head.className = 'train-sample-head';
     block.append(head, document.createElement('pre'));
   }
-  block.firstElementChild.textContent = `step ${step.toLocaleString()}` +
-    (typeof loss === 'number' ? ` \u00b7 loss ${loss.toFixed(3)}` : '');
+  // The header carries the measurement, because the sample is where a
+  // person decides whether this is working, and "is it words" is not
+  // something you can eyeball reliably at 40 words a time.
+  const head = [`step ${step.toLocaleString()}`];
+  if (typeof loss === 'number') head.push(`loss ${loss.toFixed(3)}`);
+  if (quality && quality.words > 0) {
+    head.push(`${Math.round(quality.knownWordRate * 100)}% real words`);
+    if (quality.repeated4gramRate > 0.05) {
+      head.push(`${Math.round(quality.repeated4gramRate * 100)}% repeated runs`);
+    }
+  }
+  block.firstElementChild.textContent = head.join(' \u00b7 ');
   block.lastElementChild.textContent = text;
   box.replaceChildren(block);
 });
@@ -1487,6 +1521,15 @@ window.scriptonait = {
 
   /// What the machine measured, as stored.
   machine: () => machineProfile,
+
+  /// Measure any text against your corpus: what fraction of its words
+  /// your sources contain, how much of it repeats itself, and — with a
+  /// loss — how many bits per byte that is.
+  evaluate: (text, loss = -1) =>
+    call('evaluate', { text, loss }).catch((error) => {
+      console.error(`[scriptonait] evaluate: ${(error && error.message) || error}`);
+      return null;
+    }),
 };
 
 /// Write the trained model to IndexedDB.

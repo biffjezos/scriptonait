@@ -35,6 +35,12 @@ device the page says so and does not train.
   moment buffers stay in GPU memory between steps.
 - AdamW with decoupled weight decay, global gradient-norm clipping, and a
   cosine schedule with warmup shaped to the run length you asked for.
+- Plateau detection: when held-out loss goes four measurements without
+  improving, the learning rate is halved on top of the schedule, down to
+  a floor. The cosine says where the plan expected to be; this says what
+  the run actually needed, and the two are kept separate so both are
+  readable. At the floor the page says so rather than cutting again —
+  by then the limit is the corpus, not the rate.
 - Model shape is yours to set: layers, hidden size, heads, KV heads,
   context length, attention window. So are steps, batch size, learning
   rate, and an effort setting that decides how much of the machine the
@@ -87,6 +93,12 @@ device the page says so and does not train.
 
 - Per-step console logging: loss, held-out loss, gradient norm, learning
   rate, tokens/second, dispatch and submission counts.
+- Measurements loss cannot make: **bits per byte** (the held-out loss in
+  a form comparable between two vocabularies, and against gzip's ~2.5 on
+  English prose), the fraction of a sample's words that appear anywhere
+  in your own sources, how many of its four-word runs it had already
+  written, and how many of its words are distinct. Shown on the sample
+  card and in the plan; `scriptonait.evaluate(text)` measures any text.
 - `scriptonait.profile()` in the console times one step per phase — zero,
   forward, loss, backward, reduce, readback, AdamW — at four
   command-buffer sizes, so "it is slow" becomes a measurement.

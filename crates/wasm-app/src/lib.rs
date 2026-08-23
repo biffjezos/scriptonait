@@ -447,6 +447,48 @@ impl WasmLLM {
         }
     }
 
+    /// Measure a piece of generated text against the corpus it was
+    /// trained on, and convert a loss into bits per byte. JSON.
+    ///
+    /// Loss alone cannot say whether the output is English. These can:
+    /// what fraction of the words appear anywhere in the user's own
+    /// sources, how much of it is a four-word run it already wrote, and
+    /// how many bits it takes this model to encode a byte of their text
+    /// — which, unlike loss, is comparable between two vocabularies and
+    /// against gzip.
+    ///
+    /// `loss` is a per-token cross-entropy in nats; pass a negative
+    /// number when there isn't one to convert.
+    pub fn evaluate(&self, text: String, loss: f32) -> String {
+        let inner = &mut *self.0.borrow_mut();
+        let bytes_per_token = inner.corpus.bytes_per_token();
+        let known = inner.corpus.word_vocabulary();
+        let stats = llm_core::eval::text_stats(&text, &known);
+        let bits = if loss >= 0.0 {
+            llm_core::eval::bits_per_byte_from_ratio(loss, bytes_per_token)
+        } else {
+            0.0
+        };
+        let unknown = stats
+            .unknown_examples
+            .iter()
+            .map(|w| format!("{w:?}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        format!(
+            "{{\"words\":{},\"knownWordRate\":{:.4},\"repeated4gramRate\":{:.4},\
+             \"distinctWordRate\":{:.4},\"bitsPerByte\":{:.4},\"bytesPerToken\":{:.3},\
+             \"unknownExamples\":[{}]}}",
+            stats.words,
+            stats.known_word_rate,
+            stats.repeated_4gram_rate,
+            stats.distinct_word_rate,
+            bits,
+            bytes_per_token,
+            unknown,
+        )
+    }
+
     /// Everything a training plan is computed from, as JSON.
     ///
     /// The schedule's own numbers (peak rate, warmup length, planned
@@ -477,7 +519,8 @@ impl WasmLLM {
              \"minLrRatio\":{},\"lrNow\":{},\"weightDecay\":{},\"gradClip\":{},\
              \"params\":{},\"layers\":{},\"hidden\":{},\"vocabSize\":{},\
              \"contextLen\":{},\"sources\":{},\"corpusTokens\":{},\
-             \"trainingTokens\":{},\"validationTokens\":{},\"pretrained\":{},\"mix\":[{}]}}",
+             \"trainingTokens\":{},\"validationTokens\":{},\"pretrained\":{},\
+             \"plateauScale\":{},\"mix\":[{}]}}",
             step,
             train.total_steps,
             train.warmup_steps,
@@ -496,6 +539,7 @@ impl WasmLLM {
             training_tokens,
             validation_tokens,
             inner.pretrained,
+            train.plateau_scale,
             mix,
         )
     }
@@ -1300,6 +1344,32 @@ impl WasmLLM {
         let steps = steps as u64;
         inner.train.total_steps = steps;
         inner.train.warmup_steps = (steps / 50).clamp(10, 200).min(steps.max(1) / 2);
+    }
+
+    /// Cut the learning rate because held-out loss stopped improving,
+    /// and return the multiplier now in force.
+    ///
+    /// This multiplies whatever the cosine schedule asks for rather than
+    /// replacing it, so a run that plateaus early still finishes on the
+    /// schedule's shape — just lower. The floor exists because a rate
+    /// small enough stops being training at all, and a run that has cut
+    /// four times has a problem no fifth cut will fix.
+    pub fn decay_on_plateau(&self, factor: f32, floor: f32) -> f32 {
+        let inner = &mut *self.0.borrow_mut();
+        let scaled = inner.train.plateau_scale * factor.clamp(0.05, 1.0);
+        inner.train.plateau_scale = scaled.max(floor.clamp(0.001, 1.0));
+        inner.train.plateau_scale
+    }
+
+    /// The plateau multiplier currently in force.
+    pub fn plateau_scale(&self) -> f32 {
+        self.0.borrow().train.plateau_scale
+    }
+
+    /// Put it back to 1.0 — a new run, or a corpus that just grew, is
+    /// not on the plateau the last one found.
+    pub fn reset_plateau_scale(&self) {
+        self.0.borrow_mut().train.plateau_scale = 1.0;
     }
 
     /// Override the fine-tuning learning rate.

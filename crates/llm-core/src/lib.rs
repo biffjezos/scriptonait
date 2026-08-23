@@ -1,6 +1,7 @@
 pub mod checkpoint;
 pub mod config;
 pub mod corpus;
+pub mod eval;
 pub mod generate;
 pub mod instruct;
 pub mod mix;

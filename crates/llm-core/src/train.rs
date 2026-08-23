@@ -41,6 +41,17 @@ pub struct TrainConfig {
     pub weight_decay: f32,
     /// Global gradient-norm clip; see `model::clip_global_norm`.
     pub grad_clip: f32,
+    /// Multiplier applied on top of the schedule, cut when held-out loss
+    /// stops improving. 1.0 is untouched.
+    ///
+    /// The cosine schedule decays on a plan — it assumes the run is
+    /// making progress at the rate the plan expected. A model that has
+    /// stopped improving is often taking steps too large to settle into
+    /// the minimum it is circling, and the standard answer is to cut the
+    /// rate and let it. This is that cut, kept separate from the
+    /// schedule so both are legible: the cosine says where the plan
+    /// expected to be, this says what the run actually needed.
+    pub plateau_scale: f32,
 }
 
 impl Default for TrainConfig {
@@ -52,6 +63,7 @@ impl Default for TrainConfig {
             min_lr_ratio: 0.1,
             weight_decay: 0.1,
             grad_clip: 1.0,
+            plateau_scale: 1.0,
         }
     }
 }
@@ -60,6 +72,10 @@ impl TrainConfig {
     /// Learning rate for `step` (0-based): linear warmup, then cosine
     /// decay to `min_lr_ratio * lr`.
     pub fn lr_at(&self, step: u64) -> f32 {
+        // Warmup is deliberately not scaled: a plateau cut made
+        // mid-warmup would shrink the ramp the run has not finished
+        // climbing, and warmup exists precisely to get past the part of
+        // training where the rate cannot be judged yet.
         if self.warmup_steps > 0 && step < self.warmup_steps {
             // +1 so step 0 isn't a literal zero-size step.
             return self.lr * (step + 1) as f32 / self.warmup_steps as f32;
@@ -67,7 +83,7 @@ impl TrainConfig {
         let decay_steps = self.total_steps.saturating_sub(self.warmup_steps).max(1);
         let progress = ((step - self.warmup_steps) as f32 / decay_steps as f32).clamp(0.0, 1.0);
         let cosine = 0.5 * (1.0 + (std::f32::consts::PI * progress).cos());
-        self.lr * (self.min_lr_ratio + (1.0 - self.min_lr_ratio) * cosine)
+        self.lr * (self.min_lr_ratio + (1.0 - self.min_lr_ratio) * cosine) * self.plateau_scale
     }
 }
 
@@ -448,5 +464,37 @@ mod tests {
         trainer.train_step(&mut corpus, 2, 0.01);
         trainer.train_step(&mut corpus, 2, 0.01);
         assert_eq!(trainer.step, 2);
+    }
+
+    fn schedule() -> TrainConfig {
+        TrainConfig { lr: 1e-3, warmup_steps: 100, total_steps: 1000, ..Default::default() }
+    }
+
+    #[test]
+    fn a_plateau_cut_scales_the_schedule_after_warmup() {
+        let plain = schedule();
+        let cut = TrainConfig { plateau_scale: 0.5, ..schedule() };
+        for step in [100, 300, 700, 999, 5000] {
+            let expected = plain.lr_at(step) * 0.5;
+            assert!(
+                (cut.lr_at(step) - expected).abs() < 1e-9,
+                "step {step}: {} vs {expected}",
+                cut.lr_at(step)
+            );
+        }
+    }
+
+    #[test]
+    fn a_plateau_cut_leaves_warmup_alone() {
+        let plain = schedule();
+        let cut = TrainConfig { plateau_scale: 0.25, ..schedule() };
+        for step in [0, 1, 50, 99] {
+            assert_eq!(cut.lr_at(step), plain.lr_at(step), "step {step}");
+        }
+    }
+
+    #[test]
+    fn the_schedule_is_untouched_by_default() {
+        assert_eq!(TrainConfig::default().plateau_scale, 1.0);
     }
 }
