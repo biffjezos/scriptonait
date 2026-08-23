@@ -80,7 +80,13 @@ device the page says so and does not train.
   The gap worth reading is between the dashed curve and the held-out
   one.
 - Samples the model as it trains, into a single card that updates in
-  place.
+  place — and keeps every one, so they can be paged back through.
+- A run history: one row per measurement, with the settings that
+  produced it, kept in the browser across runs and reloads. Events sit
+  on the same timeline — a run starting, a rate being cut, a phase
+  changing — because a loss curve with an unexplained bend in it is
+  worse than no curve, and the bend is always an event. Copy it as
+  Markdown to paste into a conversation, or as JSON.
 - The trained model and its optimizer state are saved to the browser
   after every run and restored on the next visit, so a reload costs
   nothing and training resumes with its momentum intact.
@@ -182,8 +188,9 @@ crates/
 frontend/
   index.html, style.css, app.js   The page.
   worker.js                       Owns the wasm module, off the main thread.
-  db.js                           IndexedDB: your sources, your model, and
-                                  what this machine benchmarked.
+  db.js                           IndexedDB: your sources, your model,
+                                  what this machine benchmarked, and
+                                  every measurement your runs took.
 ```
 
 `llm-core` has 156 tests that run without network access, including

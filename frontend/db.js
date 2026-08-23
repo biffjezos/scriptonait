@@ -20,11 +20,14 @@
 // transaction completes.
 
 const DB_NAME = 'scriptonait-llm';
-// Version 2 added the settings store, which holds the machine profile.
-const DB_VERSION = 2;
+// Version 3 added the history store: one row per measurement, kept so a
+// run can be looked at after it happened rather than only while it is
+// scrolling past.
+const DB_VERSION = 3;
 const SOURCES_STORE = 'sources';
 const MODELS_STORE = 'models';
 const SETTINGS_STORE = 'settings';
+const HISTORY_STORE = 'history';
 
 let dbPromise = null;
 
@@ -47,6 +50,13 @@ function openDb() {
       // preference; it is all the result of a timed run on this GPU.
       if (!db.objectStoreNames.contains(SETTINGS_STORE)) {
         db.createObjectStore(SETTINGS_STORE, { keyPath: 'id' });
+      }
+      // Every measurement a run takes, kept. A training run is hours of
+      // numbers that scroll past once; without them the only record of
+      // what a setting did is somebody's memory of a console line.
+      if (!db.objectStoreNames.contains(HISTORY_STORE)) {
+        const store = db.createObjectStore(HISTORY_STORE, { keyPath: 'id' });
+        store.createIndex('runId', 'runId', { unique: false });
       }
     };
     req.onsuccess = () => resolve(req.result);
@@ -230,4 +240,47 @@ export async function getMachineProfile(device) {
 
 export async function deleteMachineProfile(device) {
   await withStore(SETTINGS_STORE, 'readwrite', (store) => store.delete(machineKey(device)));
+}
+
+// --- Run history -------------------------------------------------------
+//
+// One record per measurement, plus one per event worth remembering (a
+// run starting, a learning-rate cut, a corpus change). Rows are keyed
+// so that a plain `getAll` comes back in order: run id, then a
+// zero-padded step, then a counter for records that share a step.
+//
+// This is the thing that makes a training run reviewable. Everything
+// else on the page shows the present moment; a run is six hours long and
+// the question is almost always "what did it do between then and now".
+
+let historySequence = 0;
+
+function historyKey(runId, step) {
+  historySequence = (historySequence + 1) % 1000;
+  const paddedStep = String(Math.max(0, Math.round(step))).padStart(10, '0');
+  const paddedSeq = String(historySequence).padStart(3, '0');
+  return `${runId}:${paddedStep}:${paddedSeq}`;
+}
+
+export async function appendHistory(record) {
+  const stored = { ...record, id: historyKey(record.runId, record.step || 0) };
+  await withStore(HISTORY_STORE, 'readwrite', (store) => store.put(stored));
+  return stored;
+}
+
+/// Every record, oldest first. The store is keyed to sort this way, so
+/// no sort is needed and none is done — a run of 50,000 steps writes a
+/// few hundred rows, and reading them all is the point.
+export async function listHistory() {
+  return (await withStore(HISTORY_STORE, 'readonly', (store) => store.getAll())) || [];
+}
+
+/// Records for one run.
+export async function listRunHistory(runId) {
+  const all = await listHistory();
+  return all.filter((row) => row.runId === runId);
+}
+
+export async function clearHistory() {
+  await withStore(HISTORY_STORE, 'readwrite', (store) => store.clear());
 }

@@ -1274,6 +1274,276 @@ onStream('train-sample', ({ step, loss, text, quality }) => {
 });
 
 
+// --- Run history -------------------------------------------------------
+//
+// Everything else on this page shows the present moment. A training run
+// is six hours long, and the question worth asking is almost always
+// "what did it do between then and now" — which, until this existed, was
+// answerable only from whatever console lines had not scrolled away.
+//
+// Two kinds of record share one timeline: measurements (a row of numbers
+// every hundred steps) and events (a run starting, a rate being cut, a
+// sample being generated). They are kept together because a loss curve
+// with an unexplained bend in it is worse than no curve, and the bend is
+// always an event.
+//
+// It is all copyable, in Markdown for reading and JSON for machines. The
+// JSON is also the shape an MCP server would serve if the app is ever
+// wired up to one — the format is the interface, so building it now
+// costs nothing later.
+
+const history = [];
+
+/// Columns, in order. Each is a label, a reader, and how to render it —
+/// kept in one place so the table, the Markdown and the JSON cannot
+/// drift into disagreeing about what a run recorded.
+const HISTORY_COLUMNS = [
+  ['step', (r) => r.step, (v) => v.toLocaleString()],
+  ['tokens', (r) => r.tokensSeen, (v) => formatCount(v)],
+  ['passes', (r) => r.epochs, (v) => v.toFixed(2)],
+  ['loss', (r) => r.loss, (v) => v.toFixed(3)],
+  ['probe', (r) => r.probe, (v) => (v >= 0 ? v.toFixed(3) : '—')],
+  ['held-out', (r) => r.heldOut, (v) => v.toFixed(3)],
+  ['gap', (r) => r.gap, (v) => (v === null ? '—' : v.toFixed(3))],
+  ['bits/byte', (r) => r.bitsPerByte, (v) => (v > 0 ? v.toFixed(3) : '—')],
+  ['lr', (r) => r.lr, (v) => v.toExponential(2)],
+  ['x sched', (r) => r.plateauScale, (v) => v.toFixed(2)],
+  ['|grad|', (r) => r.gradNorm, (v) => v.toFixed(2)],
+  ['tok/s', (r) => r.tokensPerSecond, (v) => Math.round(v).toLocaleString()],
+  ['real words', (r) => (r.quality ? r.quality.knownWordRate : null),
+    (v) => (v === null ? '—' : `${Math.round(v * 100)}%`)],
+  ['repeats', (r) => (r.quality ? r.quality.repeated4gramRate : null),
+    (v) => (v === null ? '—' : `${Math.round(v * 100)}%`)],
+  ['phase', (r) => r.phase, (v) => v || '—'],
+];
+
+function historyCell(row, [, read, render]) {
+  const value = read(row);
+  if (value === undefined || value === null || Number.isNaN(value)) return '—';
+  return typeof value === 'number' || typeof value === 'string' ? render(value) : '—';
+}
+
+const measurements = () => history.filter((r) => r.kind === 'measurement');
+const samples = () => history.filter((r) => r.kind === 'sample');
+
+function renderHistory() {
+  const table = $('history-table');
+  if (!table) return;
+  const rows = measurements();
+  $('history-count').textContent = rows.length
+    ? `· ${rows.length} measurement${rows.length === 1 ? '' : 's'}, ` +
+      `${samples().length} sample${samples().length === 1 ? '' : 's'}`
+    : '· nothing recorded yet';
+
+  const head = `<thead><tr>${HISTORY_COLUMNS.map(([label]) => `<th>${label}</th>`).join('')}` +
+    '</tr></thead>';
+  // Newest last, so the table reads in the direction the run ran and the
+  // bottom row is the present.
+  const body = rows
+    .map((row) => `<tr>${HISTORY_COLUMNS.map((col) => `<td>${historyCell(row, col)}</td>`).join('')}</tr>`)
+    .join('');
+  table.innerHTML = `${head}<tbody>${body}</tbody>`;
+  // Keep the newest row in view, unless the user has scrolled up to look
+  // at something — in which case leave them where they are.
+  const wrap = table.parentElement;
+  if (wrap && wrap.scrollHeight - wrap.scrollTop - wrap.clientHeight < 60) {
+    wrap.scrollTop = wrap.scrollHeight;
+  }
+
+  const events = history.filter((r) => r.kind && r.kind !== 'measurement' && r.kind !== 'sample');
+  $('history-events').innerHTML = events
+    .slice(-40)
+    .map(
+      (e) =>
+        `<div><span class="step">step ${Number(e.step || 0).toLocaleString()}</span>${
+          escapeHtml(String(e.text || e.kind))
+        }</div>`,
+    )
+    .join('');
+
+  renderSampleHistory();
+}
+
+/// Which stored sample is on screen. -1 means "the newest", and it stays
+/// meaning that as new ones arrive, so a panel left alone keeps up while
+/// one somebody has paged back through does not jump.
+let sampleCursor = -1;
+
+function renderSampleHistory() {
+  const all = samples();
+  const box = $('sample-history');
+  if (all.length === 0) {
+    box.hidden = true;
+    return;
+  }
+  box.hidden = false;
+  const index = sampleCursor < 0 ? all.length - 1 : Math.min(sampleCursor, all.length - 1);
+  const sample = all[index];
+  const quality = sample.quality;
+  $('sample-position').textContent =
+    `${index + 1} of ${all.length} · step ${Number(sample.step).toLocaleString()}`;
+  $('sample-history-head').textContent = [
+    `step ${Number(sample.step).toLocaleString()}`,
+    typeof sample.loss === 'number' ? `loss ${sample.loss.toFixed(3)}` : null,
+    quality && quality.words ? `${Math.round(quality.knownWordRate * 100)}% real words` : null,
+    quality && quality.repeated4gramRate > 0.05
+      ? `${Math.round(quality.repeated4gramRate * 100)}% repeated runs`
+      : null,
+  ].filter(Boolean).join(' · ');
+  $('sample-history-text').textContent = sample.text || '';
+  $('sample-prev').disabled = index === 0;
+  $('sample-next').disabled = index === all.length - 1;
+}
+
+/// The whole history as Markdown: a header of what was being trained and
+/// on what, then the table, then the events, then the samples.
+///
+/// Written to be pasted into a conversation. That is a real use — the
+/// person running this cannot read a loss curve as fast as they can ask
+/// somebody about it, and a screenshot of one line is not enough to
+/// answer with.
+function historyAsMarkdown() {
+  const rows = measurements();
+  const start = history.find((r) => r.kind === 'run-started');
+  const out = ['# scriptonait run history', ''];
+
+  if (start && start.model) {
+    const m = start.model;
+    const c = start.corpus || {};
+    const s = start.settings || {};
+    out.push('## Model', '');
+    out.push(`- ${formatCount(m.params)} parameters — ${m.layers} layers, ${m.hidden} hidden, ` +
+      `${m.heads} heads (${m.kvHeads} key/value), context ${m.contextLen}, window ${m.window}, ` +
+      `vocabulary ${m.vocabSize}`);
+    out.push(`- Corpus: ${c.sources} sources, ${formatCount(c.chars)} characters, ` +
+      `${formatCount(c.trainingTokens)} training tokens, ` +
+      `${formatCount(c.validationTokens)} held out`);
+    out.push(`- Run: ${s.plannedSteps} planned steps, batch ${s.batchSize}, ` +
+      `${s.tokensPerStep} tokens/step, peak rate ${s.peakLr}, warm-up ${s.warmupSteps}, ` +
+      `weight decay ${s.weightDecay}, grad clip ${s.gradClip}`);
+    out.push(`- Device: ${start.device}`);
+    out.push('');
+  }
+
+  if (rows.length) {
+    out.push('## Measurements', '');
+    out.push(`| ${HISTORY_COLUMNS.map(([label]) => label).join(' | ')} |`);
+    out.push(`|${HISTORY_COLUMNS.map(() => '---').join('|')}|`);
+    for (const row of rows) {
+      out.push(`| ${HISTORY_COLUMNS.map((col) => historyCell(row, col)).join(' | ')} |`);
+    }
+    out.push('');
+  }
+
+  const events = history.filter((r) => r.kind && r.kind !== 'measurement' && r.kind !== 'sample');
+  if (events.length) {
+    out.push('## Events', '');
+    for (const e of events) {
+      out.push(`- **step ${Number(e.step || 0).toLocaleString()}** — ${e.text || e.kind}`);
+    }
+    out.push('');
+  }
+
+  const all = samples();
+  if (all.length) {
+    out.push('## Samples', '');
+    // The first, a few through the middle, and the last: enough to see
+    // the trajectory without pasting fifty of them.
+    const wanted = all.length <= 6
+      ? all
+      : [0, 1, Math.floor(all.length / 3), Math.floor((2 * all.length) / 3),
+        all.length - 2, all.length - 1].map((i) => all[i]);
+    for (const sample of wanted) {
+      const q = sample.quality;
+      out.push(`### step ${Number(sample.step).toLocaleString()}` +
+        (typeof sample.loss === 'number' ? ` — loss ${sample.loss.toFixed(3)}` : '') +
+        (q && q.words ? `, ${Math.round(q.knownWordRate * 100)}% real words` : ''));
+      out.push('');
+      out.push('```');
+      out.push((sample.text || '').trim());
+      out.push('```');
+      out.push('');
+    }
+  }
+  return out.join('\n');
+}
+
+async function copyToClipboard(text, label) {
+  try {
+    await navigator.clipboard.writeText(text);
+    const note = $('history-copied');
+    note.textContent = `Copied ${label}.`;
+    note.hidden = false;
+    setTimeout(() => { note.hidden = true; }, 2500);
+  } catch (error) {
+    // Clipboard access can be refused; the console is always there.
+    console.info('[scriptonait] clipboard refused, here it is instead:\n', text);
+    showError('The browser would not give the page the clipboard — it is in the console instead.');
+  }
+}
+
+onStream('train-record', async (record) => {
+  // Seed the live control from what the run actually started with, so
+  // pressing Apply without editing it is a no-op rather than a surprise.
+  if (record.kind === 'run-started' && record.settings && record.settings.peakLr) {
+    $('live-lr').value = record.settings.peakLr;
+  }
+  // The message carries `type` as well, from `post`; drop it so a stored
+  // record is exactly what it claims to be.
+  const { type, ...row } = record;
+  history.push(row);
+  renderHistory();
+  try {
+    await db.appendHistory(row);
+  } catch (error) {
+    console.warn('[scriptonait] could not store a history record', error);
+  }
+});
+
+$('history-copy-btn').addEventListener('click', () =>
+  copyToClipboard(historyAsMarkdown(), 'as Markdown'));
+
+$('history-json-btn').addEventListener('click', () =>
+  copyToClipboard(JSON.stringify(history, null, 2), 'as JSON'));
+
+$('history-clear-btn').addEventListener('click', async () => {
+  history.length = 0;
+  sampleCursor = -1;
+  renderHistory();
+  try {
+    await db.clearHistory();
+  } catch (error) {
+    console.warn('[scriptonait] could not clear the history', error);
+  }
+});
+
+$('sample-prev').addEventListener('click', () => {
+  const all = samples();
+  const index = sampleCursor < 0 ? all.length - 1 : sampleCursor;
+  sampleCursor = Math.max(0, index - 1);
+  renderSampleHistory();
+});
+
+$('sample-next').addEventListener('click', () => {
+  const all = samples();
+  const index = sampleCursor < 0 ? all.length - 1 : sampleCursor;
+  // Stepping onto the newest goes back to following it, rather than
+  // pinning to whatever index the newest happens to be right now.
+  sampleCursor = index + 1 >= all.length - 1 ? -1 : index + 1;
+  renderSampleHistory();
+});
+
+$('live-lr-btn').addEventListener('click', async () => {
+  const rate = Number($('live-lr').value);
+  if (!(rate > 0)) return;
+  try {
+    const result = await call('set-learning-rate', { learningRate: rate });
+    console.info(`[scriptonait] peak learning rate is now ${result.peakLr}`);
+  } catch (error) {
+    showError(error);
+  }
+});
+
 // --- The machine profile -----------------------------------------------
 //
 // Nothing about how fast a step runs can be worked out from here. How
@@ -1458,6 +1728,7 @@ $('train-btn').addEventListener('click', async () => {
   clearError();
   training = true;
   lastPhaseKey = null;
+  $('live-controls').hidden = false;
   lossHistory.length = 0;
   validationHistory.length = 0;
   probeHistory.length = 0;
@@ -1565,6 +1836,7 @@ $('train-btn').addEventListener('click', async () => {
     training = false;
     $('train-btn').disabled = false;
     $('train-stop-btn').hidden = true;
+    $('live-controls').hidden = true;
     setTitleProgress(null);
     updateGuidance();
   }
@@ -1813,4 +2085,14 @@ async function restoreModel() {
   await refreshPlan();
   // And with no model, what the default shape in the fields would cost.
   refreshShapeEstimate();
+
+  // What every previous run measured. This is why the history is in
+  // IndexedDB and not in a variable: the run worth understanding is
+  // usually the one from yesterday.
+  try {
+    history.push(...(await db.listHistory()));
+    renderHistory();
+  } catch (error) {
+    console.warn('[scriptonait] could not read the run history', error);
+  }
 })();
