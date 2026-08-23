@@ -61,6 +61,15 @@ fn js_err(msg: impl std::fmt::Display) -> JsValue {
 }
 
 struct Inner {
+    /// True while an async GPU operation owns the training state.
+    ///
+    /// Every one of them takes the resident `GpuTrainer` out of `gpu`,
+    /// awaits, and puts it back. Two at once - a training run and a
+    /// profile, say - would each find it missing, build a second one
+    /// (four copies of every parameter, again), and race on this
+    /// `RefCell` until one of them panicked the whole wasm instance.
+    /// Whoever asks second is told no.
+    busy: std::cell::Cell<bool>,
     config: ModelConfig,
     /// The host-side copy. Authoritative until the first training step;
     /// after that the GPU's copy is, and this one is refreshed by
@@ -218,6 +227,63 @@ impl GenerationResult {
 #[wasm_bindgen]
 pub struct WasmLLM(Rc<RefCell<Inner>>);
 
+/// The guarded entry points.
+///
+/// Each of these takes the resident GPU training state out, awaits, and
+/// puts it back, so exactly one may be in flight at a time. Anything else
+/// asking meanwhile is told no, rather than building a second copy of the
+/// training state and racing on the `RefCell` until the wasm instance
+/// panics - which is what "RefCell already borrowed" was.
+impl WasmLLM {
+    fn acquire(&self) -> Result<(), JsValue> {
+        let inner = self.0.borrow();
+        if inner.busy.get() {
+            return Err(js_err(
+                "the GPU is already busy with another operation — wait for it to finish, or \
+                 press Stop",
+            ));
+        }
+        inner.busy.set(true);
+        Ok(())
+    }
+
+    fn release(&self) {
+        self.0.borrow().busy.set(false);
+    }
+}
+
+#[wasm_bindgen]
+impl WasmLLM {
+    /// One training step over the current sources, on the GPU.
+    pub async fn train_step(&self, batch_size: u32) -> Result<Option<StepReport>, JsValue> {
+        self.acquire()?;
+        let result = self.train_step_inner(batch_size).await;
+        self.release();
+        result
+    }
+
+    /// One step, timed per phase; see `profile_step_inner`.
+    pub async fn profile_step(
+        &self,
+        batch_size: u32,
+        dispatches_per_submit: u32,
+    ) -> Result<String, JsValue> {
+        self.acquire()?;
+        let result = self.profile_step_inner(batch_size, dispatches_per_submit).await;
+        self.release();
+        result
+    }
+
+    /// Bring the trained weights back from the GPU; see
+    /// `sync_from_gpu_inner`.
+    pub async fn sync_from_gpu(&self) -> Result<(), JsValue> {
+        self.acquire()?;
+        let result = self.sync_from_gpu_inner().await;
+        self.release();
+        result
+    }
+}
+
 #[wasm_bindgen]
 impl WasmLLM {
     /// Load the model the site ships with.
@@ -228,6 +294,7 @@ impl WasmLLM {
     pub fn from_checkpoint(bytes: &[u8]) -> Result<WasmLLM, JsValue> {
         let checkpoint = Checkpoint::from_bytes(bytes).map_err(js_err)?;
         Ok(WasmLLM(Rc::new(RefCell::new(Inner {
+            busy: std::cell::Cell::new(false),
             config: checkpoint.config,
             weights: checkpoint.weights,
             step: checkpoint.step,
@@ -274,6 +341,7 @@ impl WasmLLM {
         };
         config.validate().map_err(js_err)?;
         Ok(WasmLLM(Rc::new(RefCell::new(Inner {
+            busy: std::cell::Cell::new(false),
             config,
             weights: ModelWeights::init(&config, seed as u64),
             step: 0,
@@ -438,7 +506,7 @@ impl WasmLLM {
         // them for decoding. Doing it here, once, is why a training step
         // itself never pays for a weight transfer. A failure is not
         // fatal: generation falls back to the CPU below.
-        let _ = self.sync_from_gpu().await;
+        let _ = self.sync_from_gpu_inner().await;
 
         let gpu_is_current = {
             let inner = self.0.borrow();
@@ -735,7 +803,7 @@ impl WasmLLM {
     /// train on — and handed over as token ids. Everything after that
     /// (forward, loss, backward, AdamW) happens in WGSL, and the weights
     /// stay in GPU memory between steps.
-    pub async fn train_step(&self, batch_size: u32) -> Result<Option<StepReport>, JsValue> {
+    async fn train_step_inner(&self, batch_size: u32) -> Result<Option<StepReport>, JsValue> {
         let (config, train, step, batch) = {
             let inner = &mut *self.0.borrow_mut();
             if inner.gpu.is_none() {
@@ -802,7 +870,7 @@ impl WasmLLM {
     /// command buffer for this step, which is the direct test of whether
     /// a step is bound by per-submission cost or by arithmetic: if the
     /// total falls as this rises, it was the submissions.
-    pub async fn profile_step(&self, batch_size: u32, dispatches_per_submit: u32) -> Result<String, JsValue> {
+    async fn profile_step_inner(&self, batch_size: u32, dispatches_per_submit: u32) -> Result<String, JsValue> {
         let (config, train, step, batch) = {
             let inner = &mut *self.0.borrow_mut();
             if inner.gpu.is_none() {
@@ -877,7 +945,7 @@ impl WasmLLM {
     /// generating, exporting a checkpoint — rather than after every
     /// step: the weights are megabytes, a step is milliseconds, and
     /// between steps nothing here needs to see them.
-    pub async fn sync_from_gpu(&self) -> Result<(), JsValue> {
+    async fn sync_from_gpu_inner(&self) -> Result<(), JsValue> {
         let (ctx, trainer) = {
             let inner = &mut *self.0.borrow_mut();
             let step = inner.step;
@@ -971,7 +1039,7 @@ impl WasmLLM {
     /// Async because the trained weights live on the GPU: this is one of
     /// the two places that pulls them back across the bus.
     pub async fn export_checkpoint(&self) -> Result<Vec<u8>, JsValue> {
-        self.sync_from_gpu().await?;
+        self.sync_from_gpu_inner().await?;
         let inner = self.0.borrow();
         let checkpoint = Checkpoint {
             config: inner.config,
