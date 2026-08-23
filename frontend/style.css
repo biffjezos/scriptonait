@@ -562,3 +562,15 @@ select {
 #sample-every {
   width: 6rem;
 }
+
+/* What the two loss curves are telling you to do next. Loud enough to
+   read at a glance, quiet enough not to look like an error. */
+.advice {
+  margin: 0.5rem 0 0;
+  padding: 0.5rem 0.75rem;
+  border-left: 3px solid var(--accent, #e0af68);
+  background: rgba(224, 175, 104, 0.08);
+  color: var(--text, inherit);
+  font-size: 0.9rem;
+  line-height: 1.4;
+}
