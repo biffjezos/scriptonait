@@ -227,6 +227,14 @@ function updateGuidance() {
   $('train-btn').disabled = training || sources.length === 0 || (model && !model.usingGpu);
   $('generate-btn').disabled = generating || !model;
 
+  // Say what a step will actually cover, since batch size and context
+  // multiply and neither number means much alone.
+  const batch = Number($('train-batch').value) || 1;
+  const context = model ? model.contextLen : Number($('cfg-context').value) || 0;
+  $('batch-hint').textContent =
+    `Batch size costs time, not memory: the sequences of a batch run one at a time and their ` +
+    `gradients add up. ${batch} x ${context} = ${(batch * context).toLocaleString()} tokens per step.`;
+
   $('train-btn').textContent = model
     ? (model.pretrained ? 'Keep training on my writing' : 'Keep training this model')
     : 'Train a model on my writing';
@@ -266,6 +274,30 @@ function updateGuidance() {
 async function syncAllSources() {
   for (const source of sources) {
     await syncSource(source);
+  }
+  await reportDuplicates();
+}
+
+/// Say when the same text is loaded twice.
+///
+/// A duplicate is trained on twice, which weights that script double and
+/// flatters the held-out number for it. The page names them; removing
+/// one is the user's decision, not the page's.
+async function reportDuplicates() {
+  if (!model) return;
+  try {
+    const { ids } = await call('duplicate-sources');
+    if (!ids || ids.length === 0) return;
+    const titles = ids
+      .map((id) => (sources.find((s) => s.id === id) || {}).title || id)
+      .slice(0, 3);
+    showError(
+      `${ids.length} source${ids.length === 1 ? ' is a copy' : 's are copies'} of another ` +
+        `(${titles.join(', ')}${ids.length > 3 ? ', …' : ''}). Training on a script twice ` +
+        'weights it double — remove the copies in step 1.',
+    );
+  } catch (error) {
+    console.warn('[scriptonait] duplicate check failed:', error);
   }
 }
 
@@ -1053,6 +1085,8 @@ $('train-btn').addEventListener('click', async () => {
     updateGuidance();
   }
 });
+
+$('train-batch').addEventListener('input', updateGuidance);
 
 $('train-stop-btn').addEventListener('click', () => {
   $('train-stop-btn').disabled = true;

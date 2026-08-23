@@ -743,6 +743,12 @@ impl WasmLLM {
         size as u32
     }
 
+    /// Titles of sources whose text duplicates an earlier one. Training
+    /// on the same script twice weights it double.
+    pub fn duplicate_sources(&self) -> Vec<String> {
+        self.0.borrow().corpus.duplicate_sources()
+    }
+
     pub fn vocab_size(&self) -> u32 {
         self.0.borrow().corpus.tokenizer().vocab_size() as u32
     }

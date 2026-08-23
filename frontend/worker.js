@@ -557,6 +557,12 @@ const handlers = {
     return describePrompt(text(prompt, 'the prompt'));
   },
 
+  /// Which loaded sources are copies of another. Reported, never
+  /// removed: which copy to keep is the user's call.
+  async 'duplicate-sources'() {
+    return { ids: llm.duplicate_sources() };
+  },
+
   async 'upsert-source'(payload) {
     const stats = llm.upsert_source(
       text(payload.id, 'the source id'),
