@@ -368,19 +368,34 @@ function renderModelShape(info) {
 function tileAdvice() {
   const hidden = Number($('cfg-hidden').value) || 0;
   const heads = Number($('cfg-heads').value) || 1;
-  if (hidden <= 0) return '';
-  const wasted = Math.ceil(hidden / 64) * 64 - hidden;
-  if (wasted === 0) return '';
-  const nearest = Math.round(hidden / 64) * 64;
+  const context = Number($('cfg-context').value) || 0;
+  if (hidden <= 0 || context <= 0) return '';
+
+  // Both dimensions matter, and they multiply. Context is the row count
+  // of every matmul in a step and hidden is the column count, so a model
+  // that is off the grid on both pays the waste twice over: 516 x 516
+  // dispatches 9 x 9 tiles where 8.06 x 8.06 of work exists, which is
+  // 19% of every step rather than the 6% either one costs alone.
+  const off = [];
+  if (hidden % 64 !== 0) off.push(['hidden size', hidden]);
+  if (context % 64 !== 0) off.push(['context', context]);
+  if (off.length === 0) return '';
+
+  const waste = off.reduce((f, [, n]) => f * ((Math.ceil(n / 64) * 64) / n), 1);
+  const fix = off
+    .map(([what, n]) => `${what} ${Math.round(n / 64) * 64}`)
+    .join(', ');
   const headDim = hidden % heads === 0 ? hidden / heads : null;
   return (
-    `${hidden} is not a multiple of 64. The matmul kernels compute a 64x64 block per ` +
-    `workgroup, so this width dispatches ${Math.ceil(hidden / 64)} tiles to do ` +
-    `${(hidden / 64).toFixed(2)} tiles of work — a few percent of every step, on every layer. ` +
-    `${nearest} costs the same to train and does not` +
+    `The matmul kernels compute a 64x64 block of output per workgroup, and ` +
+    `${off.map(([what, n]) => `${what} ${n}`).join(' and ')} ` +
+    `${off.length > 1 ? 'are' : 'is'} not a multiple of 64 — so this shape dispatches about ` +
+    `${((waste - 1) * 100).toFixed(0)}% more work than the arithmetic it needs, on every step ` +
+    `of every layer. ${fix} costs the same to train and does not` +
     (headDim && headDim % 64 !== 0
-      ? `. Heads of ${headDim} are off the same grid; ${nearest} with ${nearest / 64} heads ` +
-        'gives 64-wide heads.'
+      ? `. Heads of ${headDim} are off the same grid too; ${Math.round(hidden / 64) * 64} with ` +
+        `${Math.round(hidden / 64)} heads gives the 64-wide heads the attention kernels are ` +
+        'shaped around.'
       : '.')
   );
 }
@@ -1524,7 +1539,7 @@ $('train-btn').addEventListener('click', async () => {
 });
 
 $('train-batch').addEventListener('input', updateGuidance);
-for (const id of ['cfg-hidden', 'cfg-heads']) {
+for (const id of ['cfg-hidden', 'cfg-heads', 'cfg-context']) {
   $(id).addEventListener('input', () => {
     if (!model) $('tile-hint').textContent = tileAdvice();
   });

@@ -540,6 +540,34 @@ function planActions(plan, phase, { heldOut, trainingLoss, tokensSeen, tokensPer
     });
   }
 
+  // 1b. Is the run about to ask for more passes than repeated text is
+  //     worth? This has to be said before the run, not forty hours into
+  //     it: the existing epoch warning only fires once the passes have
+  //     actually been made, which is too late to be advice.
+  if (plan.plannedSteps > 0 && trainingTokens > 0 && tokensPerStep > 0) {
+    const planned = plan.plannedSteps * tokensPerStep;
+    const plannedEpochs = planned / trainingTokens;
+    if (plannedEpochs > USEFUL_EPOCHS * 1.2) {
+      const enough = Math.round((budget / tokensPerStep) / 100) * 100;
+      const hours = tokensPerSecond > 0 ? planned / tokensPerSecond / 3600 : null;
+      const enoughHours = tokensPerSecond > 0 ? budget / tokensPerSecond / 3600 : null;
+      actions.push({
+        key: 'run-too-long',
+        urgency: 'normal',
+        text:
+          `${plan.plannedSteps.toLocaleString()} steps at ${round(tokensPerStep)} tokens each is ` +
+          `${round(planned)} tokens — ${plannedEpochs.toFixed(1)} passes over your text` +
+          (hours ? `, about ${hours.toFixed(0)} hours at this speed` : '') +
+          `. Repeated text holds up to about ${USEFUL_EPOCHS} passes and gives back little ` +
+          `after, so roughly ${round(enough)} steps` +
+          (enoughHours ? ` (${enoughHours.toFixed(0)} hours)` : '') +
+          ' spends what this corpus is worth. The rest is time, not learning — and the ' +
+          'schedule decays over the length you set, so a shorter plan also means the rate ' +
+          'is actually falling while it matters.',
+      });
+    }
+  }
+
   // 2. Only now: is there enough text for a model this size? Judged
   //    against what repeated passes are worth, not against a single
   //    pass, because this run makes several.
