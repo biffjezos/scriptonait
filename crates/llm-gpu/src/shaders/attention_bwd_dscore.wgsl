@@ -27,6 +27,9 @@ struct Params {
 const THREADS: u32 = 64u;
 
 var<workgroup> partial: array<f32, 64>;
+/// This row's incoming gradient, read once rather than once per key by
+/// every thread - see attention_fwd.wgsl's q_row for the same fix.
+var<workgroup> d_out_row: array<f32, 256>;
 
 @compute @workgroup_size(64)
 fn main(
@@ -50,12 +53,17 @@ fn main(
     }
     let n = select(0u, t - lo + 1u, live);
 
+    for (var d: u32 = lane; d < p.head_dim; d = d + THREADS) {
+        d_out_row[d] = select(0.0, d_out[base_t + d], live);
+    }
+    workgroupBarrier();
+
     var lane_sum: f32 = 0.0;
     for (var j: u32 = lane; j < n; j = j + THREADS) {
         let base_v = (lo + j) * kvd + kvh * p.head_dim;
         var acc: f32 = 0.0;
         for (var d: u32 = 0u; d < p.head_dim; d = d + 1u) {
-            acc = acc + d_out[base_t + d] * v[base_v + d];
+            acc = acc + d_out_row[d] * v[base_v + d];
         }
         d_score[row + j] = acc;
         lane_sum = lane_sum + probs[row + j] * acc;
