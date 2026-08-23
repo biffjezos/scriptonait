@@ -20,9 +20,11 @@
 // transaction completes.
 
 const DB_NAME = 'scriptonait-llm';
-const DB_VERSION = 1;
+// Version 2 added the settings store, which holds the machine profile.
+const DB_VERSION = 2;
 const SOURCES_STORE = 'sources';
 const MODELS_STORE = 'models';
+const SETTINGS_STORE = 'settings';
 
 let dbPromise = null;
 
@@ -40,6 +42,11 @@ function openDb() {
       // threw all of it away, silently.
       if (!db.objectStoreNames.contains(MODELS_STORE)) {
         db.createObjectStore(MODELS_STORE, { keyPath: 'id' });
+      }
+      // What this machine measured about itself. Nothing here is a
+      // preference; it is all the result of a timed run on this GPU.
+      if (!db.objectStoreNames.contains(SETTINGS_STORE)) {
+        db.createObjectStore(SETTINGS_STORE, { keyPath: 'id' });
       }
     };
     req.onsuccess = () => resolve(req.result);
@@ -197,4 +204,30 @@ export async function putBestModel({ bytes, step, params, validationLoss }) {
 
 export async function getBestModel() {
   return withStore(MODELS_STORE, 'readonly', (store) => store.get(BEST_MODEL));
+}
+
+// --- The machine profile -----------------------------------------------
+//
+// One record per adapter the browser has handed this page. Keyed by the
+// adapter's own name and backend rather than by a single 'machine' key,
+// because the same profile is meaningless on a laptop that has both an
+// integrated and a discrete GPU and gives the page whichever one it
+// feels like.
+
+export function machineKey({ adapter, backend }) {
+  return `machine:${backend || '?'}:${adapter || 'unknown'}`;
+}
+
+export async function putMachineProfile(profile) {
+  const record = { ...profile, id: machineKey(profile), savedAt: Date.now() };
+  await withStore(SETTINGS_STORE, 'readwrite', (store) => store.put(record));
+  return record;
+}
+
+export async function getMachineProfile(device) {
+  return withStore(SETTINGS_STORE, 'readonly', (store) => store.get(machineKey(device)));
+}
+
+export async function deleteMachineProfile(device) {
+  await withStore(SETTINGS_STORE, 'readwrite', (store) => store.delete(machineKey(device)));
 }

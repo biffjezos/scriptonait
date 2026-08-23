@@ -575,6 +575,57 @@ select {
   line-height: 1.4;
 }
 
+/* The training plan: phase, numbers, and what to do about them. It sits
+   above the progress bar because it is the part worth reading. */
+.plan {
+  margin: 0.75rem 0;
+  padding: 0.75rem 0.9rem;
+  border: 1px solid var(--line, rgba(128, 128, 128, 0.3));
+  border-radius: 6px;
+  background: rgba(128, 128, 128, 0.05);
+}
+
+.plan-phase {
+  margin: 0 0 0.35rem;
+  line-height: 1.45;
+}
+
+#plan-phase-title {
+  font-weight: 600;
+  margin-right: 0.5ch;
+}
+
+#plan-phase-title::after {
+  content: ' —';
+  font-weight: 400;
+  opacity: 0.6;
+}
+
+#plan-phase-detail {
+  font-size: 0.92rem;
+}
+
+#plan-numbers {
+  margin: 0;
+  opacity: 0.85;
+}
+
+.plan-actions {
+  margin: 0.5rem 0 0;
+  padding-left: 1.1rem;
+  font-size: 0.9rem;
+  line-height: 1.45;
+}
+
+.plan-actions li {
+  margin-top: 0.35rem;
+}
+
+/* An action that will not fix itself by waiting. */
+.plan-actions li.high {
+  color: var(--accent, #e0af68);
+}
+
 /* The best model a run has produced, and the way back to it. */
 .best-model {
   display: flex;

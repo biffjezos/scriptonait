@@ -3,6 +3,7 @@ pub mod config;
 pub mod corpus;
 pub mod generate;
 pub mod instruct;
+pub mod mix;
 pub mod model;
 pub mod ops;
 pub mod prep;

@@ -39,7 +39,21 @@ device the page says so and does not train.
   context length, attention window. So are steps, batch size, learning
   rate, and an effort setting that decides how much of the machine the
   run may take.
+- Every training setting is optional. The first run benchmarks the
+  machine it is on — how much work fits in one command buffer before the
+  driver's watchdog takes the device away, how many sequences a batch can
+  hold before a step stops being interruptible — and the settings are
+  read off that measurement. The result is stored per adapter and loaded
+  on the next visit, so it is measured once, not guessed and not
+  hard-coded for anybody's hardware.
 - Stop any time; progress is kept.
+- A training plan, recomputed as the run goes: which phase it is in
+  (warm-up, learning, plateau, overfitting, cooling down), what that
+  phase means for the numbers you are looking at, tokens seen, how many
+  times it has been over your text, an estimate of what is left — and
+  what would actually help, named with the number behind it. Sources are
+  classified by line shape (film scripts, novels, essays, verse), so a
+  corpus that is all one thing is told so.
 - Live loss chart with two curves — training loss and held-out loss, on
   one axis, because the gap between them is what says whether the model
   is learning the language or memorizing your text.
@@ -51,8 +65,12 @@ device the page says so and does not train.
 
 **Writing**
 
-- Generate from a prompt, with temperature, top-k, top-p, repetition
-  penalty and seed. Text streams in and can be stopped.
+- Generate from a prompt, with temperature, top-k, top-p, min-p,
+  repetition penalty and seed. Text streams in and can be stopped.
+- Min-p truncates relative to the best token rather than to a fixed
+  share of the mass, so a confident step stays sharp and an uncertain
+  one stays open. At this model size the distribution is often barely
+  peaked, and that is exactly where top-p behaves worst.
 - The prompt is read as an instruction — form (screenplay, novel,
   allegory, …), length, subject, a work to echo — and shown back as chips
   before generating, so a misread prompt is visibly misread.
@@ -72,6 +90,8 @@ device the page says so and does not train.
 - `scriptonait.profile()` in the console times one step per phase — zero,
   forward, loss, backward, reduce, readback, AdamW — at four
   command-buffer sizes, so "it is slow" becomes a measurement.
+- `scriptonait.benchmark()` re-runs the machine sweep and logs every
+  candidate it timed; `scriptonait.machine()` shows what is stored.
 - The device the browser handed over is named, and a software renderer
   is called out as one.
 - Export the model to a `.ckpt` file, and load one back.
@@ -134,7 +154,8 @@ crates/
 frontend/
   index.html, style.css, app.js   The page.
   worker.js                       Owns the wasm module, off the main thread.
-  db.js                           IndexedDB: your sources and your model.
+  db.js                           IndexedDB: your sources, your model, and
+                                  what this machine benchmarked.
 ```
 
 `llm-core` has 156 tests that run without network access, including

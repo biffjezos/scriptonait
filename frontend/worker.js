@@ -41,6 +41,10 @@ let stopRequested = false;
 
 const PROGRESS_INTERVAL_MS = 250;
 
+/// Bumped whenever the benchmark measures something different, so a
+/// stored profile from an older build is re-measured instead of trusted.
+const BENCH_VERSION = 1;
+
 function post(type, payload = {}) {
   self.postMessage({ type, ...payload });
 }
@@ -154,7 +158,7 @@ async function initGpu() {
     const report = JSON.parse(llm.gpu_report());
     log(
       `WebGPU device acquired in ${(performance.now() - startedAt).toFixed(0)} ms` +
-        ` (matmuls in ${report.f16 ? 'f16' : 'f32'})`,
+        ` (f16 available: ${report.f16 ? 'yes' : 'no'}; matmuls run in f32)`,
       report,
     );
     if (report.isSoftware) {
@@ -203,7 +207,7 @@ function describePrompt(prompt) {
   };
 }
 
-async function generate({ prompt, extraContext, temperature, topK, topP, repetitionPenalty, seed }) {
+async function generate({ prompt, extraContext, temperature, topK, topP, minP, repetitionPenalty, seed }) {
   stopRequested = false;
   const startedAt = performance.now();
   let lastPost = 0;
@@ -215,6 +219,7 @@ async function generate({ prompt, extraContext, temperature, topK, topP, repetit
     temperature,
     topK,
     topP,
+    minP || 0,
     repetitionPenalty,
     seed,
     (piece, words) => {
@@ -271,11 +276,431 @@ async function trainingSample(prompt, words) {
     0.9,
     40,
     0.95,
+    // A training sample is the one place min-p earns its keep without
+    // being asked for: an early model's distribution is nearly flat, so
+    // this keeps the field wide, and a later one's is peaked, so it
+    // stops the sample wandering into the tail.
+    0.05,
     1.1,
     Math.floor(Math.random() * 1e9),
     (_piece, produced) => produced < words,
   );
   return result.text;
+}
+
+// --- The training plan -------------------------------------------------
+//
+// A loss number and a step count do not tell anybody what to do next.
+// The plan does: which phase the run is in, what that phase means, and
+// which of the things a person can actually change would help.
+//
+// Everything here is arithmetic over numbers the wasm side already
+// keeps. It is recomputed on the validation cadence rather than every
+// step, because none of it moves faster than that.
+
+/// Roughly how many tokens a model of this size wants to see. The
+/// Chinchilla result is ~20 tokens per parameter for a compute-optimal
+/// run; it is a rule of thumb rather than a law, and it is the only
+/// honest yardstick for "is this corpus big enough for this model".
+const TOKENS_PER_PARAM = 20;
+
+/// Which phase of a run this is, and what that means for what you are
+/// looking at.
+///
+/// The phases are not decoration. "Loss is barely moving" means one
+/// thing in the first fifty steps, when the learning rate is still a
+/// fraction of its peak, and the opposite thing two thousand steps
+/// later. Saying which is which is the difference between waiting and
+/// wasting an afternoon.
+function trainingPhase(plan, { heldOut, trainingLoss, stepsDone }) {
+  const { step, plannedSteps, warmupSteps, peakLr, lrNow, minLrRatio } = plan;
+  if (step < warmupSteps) {
+    return {
+      key: 'warm-up',
+      title: 'Warm-up',
+      detail:
+        `the learning rate is ramping from nearly zero to ${peakLr.toExponential(1)} over the ` +
+        `first ${warmupSteps.toLocaleString()} steps — it is at ${lrNow.toExponential(1)} now. ` +
+        'Loss moves slowly here on purpose: a full-size step this early puts the model ' +
+        'somewhere it spends thousands of steps climbing out of.',
+    };
+  }
+
+  // Trend over the held-out curve, on the same window the corpus advice
+  // uses, so the two never disagree about which way the line is going.
+  const WINDOW = 5;
+  let trend = null;
+  if (heldOut.length >= WINDOW * 2) {
+    const mean = (xs) => xs.reduce((a, b) => a + b, 0) / xs.length;
+    trend = mean(heldOut.slice(-WINDOW * 2, -WINDOW)) - mean(heldOut.slice(-WINDOW));
+  }
+  const gap = trainingLoss === null || heldOut.length === 0
+    ? null
+    : heldOut[heldOut.length - 1] - trainingLoss;
+
+  if (trend !== null && trend < -0.01) {
+    return {
+      key: 'overfitting',
+      title: 'Overfitting',
+      detail:
+        'held-out loss is rising while training loss falls. From here the model is learning ' +
+        'your text rather than learning from it, and every further step makes it worse at ' +
+        'writing anything new. The best model of this run is already saved.',
+    };
+  }
+  if (trend !== null && trend < 0.01) {
+    return {
+      key: 'plateau',
+      title: 'Plateau',
+      detail:
+        'held-out loss has stopped improving' +
+        (gap === null ? '' : `, and sits ${gap.toFixed(2)} above training loss`) +
+        '. More steps at this setting will not move it; something has to change.',
+    };
+  }
+  // The cosine tail: the last stretch of a planned run, where the rate
+  // is close to its floor and the model is settling rather than moving.
+  if (plannedSteps > 0 && lrNow <= peakLr * (minLrRatio + 0.05)) {
+    return {
+      key: 'cooling',
+      title: 'Cooling down',
+      detail:
+        `the cosine schedule has taken the rate down to ${lrNow.toExponential(1)}, near its ` +
+        `floor of ${(peakLr * minLrRatio).toExponential(1)}. This is where a run consolidates: ` +
+        'small improvements, and the least noisy weights it will have.',
+    };
+  }
+  return {
+    key: 'learning',
+    title: 'Learning',
+    detail:
+      `past warm-up, rate ${lrNow.toExponential(1)}, held-out loss still improving` +
+      (stepsDone > 0 ? ` — ${stepsDone.toLocaleString()} steps into this run.` : '.'),
+  };
+}
+
+/// What a person could actually do about it, most useful first.
+///
+/// Every entry names a number and an action. "Add more text" on its own
+/// is not advice; "this corpus is 6.5M tokens for a model that wants
+/// 283M — roughly 40 more scripts" is.
+function planActions(plan, phase, { heldOut, trainingLoss, tokensPerStep, tokensSeen }) {
+  const actions = [];
+  const { params, trainingTokens, validationTokens, contextLen, mix } = plan;
+  const wanted = Math.round(params * TOKENS_PER_PARAM);
+  const round = (n) => Math.round(n).toLocaleString();
+
+  if (validationTokens < contextLen + 1) {
+    actions.push({
+      key: 'no-validation',
+      urgency: 'high',
+      text:
+        'There is not enough text to hold any of it out, so nothing here can tell learning ' +
+        'from memorizing. Add sources until the corpus is comfortably past ' +
+        `${round((contextLen * 20) / 0.05)} tokens.`,
+    });
+  }
+
+  if (trainingTokens > 0 && trainingTokens < wanted) {
+    const ratio = trainingTokens / params;
+    // Sized from what is already loaded rather than from an assumed
+    // script length: their scripts are the right unit of "more".
+    const perSource = plan.sources > 0 ? plan.corpusTokens / plan.sources : 0;
+    const moreSources = perSource > 0 ? Math.ceil((wanted - trainingTokens) / perSource) : 0;
+    actions.push({
+      key: 'corpus-size',
+      urgency: phase.key === 'overfitting' || phase.key === 'plateau' ? 'high' : 'normal',
+      text:
+        `${round(trainingTokens)} training tokens for ${round(params)} parameters is ` +
+        `${ratio.toFixed(1)} tokens per parameter; the rule of thumb is ${TOKENS_PER_PARAM}, so ` +
+        `this model wants about ${round(wanted)}. Either add roughly ${round(moreSources)} more ` +
+        `sources the size of the ones already loaded, or build a smaller model — ` +
+        `${round(trainingTokens / TOKENS_PER_PARAM)} parameters is what this corpus supports.`,
+    });
+  }
+
+  // What kind of text is missing. A corpus that is all one thing teaches
+  // the shape of that thing: thirty scripts teach a model that every
+  // paragraph is one line of dialogue long.
+  if (Array.isArray(mix) && mix.length > 0 && plan.corpusTokens > 0) {
+    const largest = mix[0];
+    const share = largest.tokens / plan.corpusTokens;
+    if (share > 0.8) {
+      const missing = ['film scripts', 'novels and prose fiction', 'essays and philosophy',
+        'verse and lyrics']
+        .filter((label) => !mix.some((m) => m.label === label && m.tokens / plan.corpusTokens > 0.05));
+      if (missing.length > 0) {
+        actions.push({
+          key: 'corpus-mix',
+          urgency: 'normal',
+          text:
+            `${Math.round(share * 100)}% of your corpus is ${largest.label}. A model trained on ` +
+            'one shape of writing learns that shape and not the language underneath it. ' +
+            `Adding ${missing.slice(0, 2).join(' or ')} would widen what it can write.`,
+        });
+      }
+    }
+  }
+
+  if (phase.key === 'overfitting') {
+    actions.push({
+      key: 'stop-here',
+      urgency: 'high',
+      text:
+        'Stop this run and go back to the best model, or add text and keep training. ' +
+        'Continuing without either only makes it worse.',
+    });
+  }
+  if (phase.key === 'plateau') {
+    const gap = trainingLoss === null || heldOut.length === 0
+      ? 0
+      : heldOut[heldOut.length - 1] - trainingLoss;
+    actions.push({
+      key: 'plateau-what-next',
+      urgency: 'normal',
+      text: gap > 0.3
+        ? 'Held-out sits well above training loss, which is the signature of too little text ' +
+          'for this model, not of too few steps.'
+        : 'Both curves have flattened together, which is the signature of a model too small ' +
+          'for the text. A larger hidden size or another layer would do more than more steps.',
+    });
+  }
+
+  // How many times the run has been over the same text. Past a few
+  // passes a small corpus is being memorized whatever the loss says.
+  if (trainingTokens > 0 && tokensSeen > 0) {
+    const epochs = tokensSeen / trainingTokens;
+    if (epochs >= 2) {
+      actions.push({
+        key: 'epochs',
+        urgency: epochs >= 4 ? 'high' : 'normal',
+        text:
+          `This model has been over your text ${epochs.toFixed(1)} times. Repeated passes are ` +
+          'how a small corpus gets memorized; each further pass buys less than the last.',
+      });
+    }
+  }
+
+  return actions;
+}
+
+/// The whole plan: the phase, the numbers behind it, and what to do.
+function buildPlan(state) {
+  const plan = JSON.parse(llm.training_plan());
+  const phase = trainingPhase(plan, state);
+  const tokensPerStep = state.tokensPerStep || plan.contextLen;
+  // Tokens this model has seen over its whole life, not just this run.
+  // Approximate on purpose: earlier runs may have used a different batch
+  // size, and the step count is all that survives them.
+  const tokensSeen = plan.step * tokensPerStep;
+  const remaining = plan.plannedSteps > plan.step ? plan.plannedSteps - plan.step : 0;
+  return {
+    phase,
+    actions: planActions(plan, phase, { ...state, tokensPerStep, tokensSeen }),
+    numbers: {
+      step: plan.step,
+      plannedSteps: plan.plannedSteps,
+      warmupSteps: plan.warmupSteps,
+      lrNow: plan.lrNow,
+      peakLr: plan.peakLr,
+      params: plan.params,
+      tokensPerStep,
+      tokensSeen,
+      trainingTokens: plan.trainingTokens,
+      validationTokens: plan.validationTokens,
+      tokensPerParam: plan.params > 0 ? plan.trainingTokens / plan.params : 0,
+      wantedTokens: Math.round(plan.params * TOKENS_PER_PARAM),
+      epochs: plan.trainingTokens > 0 ? tokensSeen / plan.trainingTokens : 0,
+      etaSeconds: state.msPerStep > 0 ? (remaining * state.msPerStep) / 1000 : null,
+      mix: plan.mix,
+      sources: plan.sources,
+    },
+  };
+}
+
+/// Measure this machine, once, and let the measurement pick the
+/// settings.
+///
+/// Two things about a training step are properties of the GPU and its
+/// driver rather than of the model, and neither can be reasoned out from
+/// here:
+///
+///   * How much work belongs in one command buffer. Too little pays the
+///     submission cost on every dispatch; too much hands the driver a
+///     buffer long enough to trip its watchdog and lose the device. The
+///     best value differs by adapter, by backend and by driver version.
+///   * How many sequences a batch should hold. A larger batch is a
+///     steadier gradient and usually more tokens per second, up to the
+///     point where a single step takes long enough that stopping feels
+///     broken and the watchdog gets interested.
+///
+/// So both are timed here, on this machine, with the model that is
+/// actually loaded, and the winner is stored. `bench_step` runs at
+/// learning rate zero and restores the step counter, so this costs time
+/// and changes nothing else.
+async function benchmark({ ceilingMs = 1500, budgetMs = 60000, repeats = 3 } = {}) {
+  const device = JSON.parse(llm.gpu_report());
+  if (!device.available) throw new Error('benchmarking needs a GPU device');
+  const info = llm.info();
+  const contextLen = info.context_len;
+  const startedAt = performance.now();
+  const overBudget = () => performance.now() - startedAt > budgetMs;
+  const tokensPerSecond = (batch, ms) => (ms > 0 ? (batch * contextLen) / (ms / 1000) : 0);
+
+  log('benchmarking this machine — one timed sweep, nothing is learned from it', {
+    adapter: device.adapter,
+    backend: device.backend,
+    deviceType: device.deviceType,
+    contextLen,
+    params: info.params,
+  });
+
+  // The first step allocates every training buffer and compiles every
+  // pipeline. Timing that would measure the driver's lazy work, not the
+  // step.
+  const warmupStart = performance.now();
+  await llm.bench_step(1, 32);
+  log(`benchmark warmup ${(performance.now() - warmupStart).toFixed(0)} ms ` +
+      '(allocating training state and compiling pipelines)');
+
+  /// Fastest of `repeats` runs, not the mean: a slow run is another
+  /// process getting the GPU, and the fastest is the one this
+  /// configuration is capable of.
+  async function timeStep(batch, chunk, runs) {
+    let best = Infinity;
+    for (let i = 0; i < runs; i += 1) {
+      const started = performance.now();
+      await llm.bench_step(batch, chunk);
+      best = Math.min(best, performance.now() - started);
+    }
+    return best;
+  }
+
+  // --- How much work per command buffer, at one sequence -------------
+  const chunkSweep = [];
+  let chunk = 32;
+  let chunkMs = Infinity;
+  for (const candidate of [8, 16, 32, 64, 128, 256]) {
+    if (overBudget()) {
+      log(`benchmark: out of time budget, stopping the command-buffer sweep at ${candidate}`);
+      break;
+    }
+    let ms;
+    try {
+      ms = await timeStep(1, candidate, repeats);
+    } catch (error) {
+      // A device lost to the watchdog takes everything with it, so a
+      // failure here ends the sweep rather than continuing past it.
+      log(`benchmark: ${candidate} dispatches/submit failed (${error && error.message || error}) ` +
+          '— keeping the best value measured before it');
+      break;
+    }
+    chunkSweep.push({ dispatchesPerSubmit: candidate, msPerStep: ms });
+    log(`benchmark: ${candidate} dispatches/submit -> ${ms.toFixed(1)} ms/step ` +
+        `(${tokensPerSecond(1, ms).toFixed(0)} tok/s at batch 1)`);
+    if (ms < chunkMs) {
+      chunkMs = ms;
+      chunk = candidate;
+    }
+  }
+  if (chunkSweep.length === 0) {
+    throw new Error('the benchmark could not time a single step on this device');
+  }
+  post('bench-progress', { stage: 'chunk', dispatchesPerSubmit: chunk });
+
+  // --- How many sequences per batch ----------------------------------
+  //
+  // Ascending, and stopping at the first candidate that is slower per
+  // token or takes longer than the ceiling: past that point a batch buys
+  // a marginally steadier gradient with a step nobody can interrupt.
+  const batchSweep = [];
+  let batchSize = 1;
+  let bestRate = 0;
+  let bestMs = chunkMs;
+  for (const candidate of [1, 2, 4, 8, 16]) {
+    if (overBudget()) {
+      log(`benchmark: out of time budget, stopping the batch sweep at ${candidate}`);
+      break;
+    }
+    let ms;
+    try {
+      ms = await timeStep(candidate, chunk, candidate >= 8 ? 1 : 2);
+    } catch (error) {
+      log(`benchmark: batch ${candidate} failed (${error && error.message || error}) ` +
+          '— keeping the largest batch that worked');
+      break;
+    }
+    const rate = tokensPerSecond(candidate, ms);
+    batchSweep.push({ batchSize: candidate, msPerStep: ms, tokensPerSecond: rate });
+    log(`benchmark: batch ${candidate} -> ${ms.toFixed(0)} ms/step, ${rate.toFixed(0)} tok/s`);
+    // The smallest batch is taken whatever it costs — there is nothing
+    // below it — but a larger one has to earn its step time.
+    const first = bestRate === 0;
+    if (!first && ms > ceilingMs) {
+      log(`benchmark: batch ${candidate} takes ${ms.toFixed(0)} ms, past the ${ceilingMs} ms ` +
+          `ceiling that keeps a step interruptible — staying at ${batchSize}`);
+      break;
+    }
+    // Three percent, because anything smaller is inside the noise of two
+    // runs and not worth a step that takes twice as long to interrupt.
+    if (!first && rate <= bestRate * 1.03) {
+      log(`benchmark: batch ${candidate} is no faster per token than ${batchSize} — stopping here`);
+      break;
+    }
+    bestRate = rate;
+    bestMs = ms;
+    batchSize = candidate;
+  }
+
+  const profile = {
+    version: BENCH_VERSION,
+    adapter: device.adapter,
+    backend: device.backend,
+    deviceType: device.deviceType,
+    isSoftware: device.isSoftware,
+    dispatchesPerSubmit: chunk,
+    batchSize,
+    msPerStep: bestMs,
+    tokensPerSecond: bestRate,
+    // The batch ceiling depends on the model's shape, so a profile
+    // measured against a different model says nothing about this one.
+    shape: {
+      layers: info.layers,
+      hidden: info.hidden,
+      heads: info.heads,
+      kvHeads: info.kv_heads,
+      contextLen: info.context_len,
+      window: info.window,
+      vocabSize: info.vocab_size,
+    },
+    chunkSweep,
+    batchSweep,
+    elapsedSeconds: (performance.now() - startedAt) / 1000,
+  };
+  llm.set_dispatches_per_submit(chunk);
+  log('machine profile measured', profile);
+  return profile;
+}
+
+/// Recompute the plan, announce a change of phase, and hand it to the
+/// page. Called at the start of a run and on the validation cadence,
+/// never per step: nothing in it moves faster than that.
+function reportPlan(state) {
+  let plan;
+  try {
+    plan = buildPlan(state);
+  } catch (error) {
+    log(`could not build the training plan: ${(error && error.message) || error}`);
+    return state.lastPhase;
+  }
+  if (plan.phase.key !== state.lastPhase) {
+    log(`phase: ${plan.phase.title} — ${plan.phase.detail}`, plan.numbers);
+    for (const action of plan.actions) {
+      log(`plan (${action.urgency}): ${action.text}`);
+    }
+  }
+  post('train-plan', plan);
+  return plan.phase.key;
 }
 
 async function train({ batchSize, learningRate, maxSteps, effort, sampleEvery, samplePrompt, sampleWords }) {
@@ -293,6 +718,7 @@ async function train({ batchSize, learningRate, maxSteps, effort, sampleEvery, s
     batchSize,
     contextLen: info.context_len,
     tokensPerStep: batchSize * info.context_len,
+    dispatchesPerSubmit: llm.dispatches_per_submit(),
     maxSteps: maxSteps || 'until stopped',
     effort,
     learningRate: learningRate > 0 ? learningRate : 'automatic',
@@ -301,6 +727,7 @@ async function train({ batchSize, learningRate, maxSteps, effort, sampleEvery, s
 
   const sliceMs = 120;
   const pauseMs = Math.max(0, Math.round(sliceMs * (1 - effort) / Math.max(effort, 0.05)));
+  const tokensPerStep = batchSize * info.context_len;
   const startedAt = performance.now();
   let steps = 0;
   let tokens = 0;
@@ -320,6 +747,17 @@ async function train({ batchSize, learningRate, maxSteps, effort, sampleEvery, s
   const heldOut = [];
   let lastAdvice = null;
   let bestValidation = null;
+  // The phase the run was last seen in, so a change of phase is
+  // announced once instead of on every recomputation.
+  let lastPhase = null;
+  // Median-ish step cost, for the estimate of how long the rest takes.
+  let recentStepMs = null;
+
+  // Say where the run is starting from before it starts: which phase,
+  // how much text there is for a model this size, what would help.
+  lastPhase = reportPlan({
+    heldOut, trainingLoss: null, stepsDone: 0, tokensPerStep, msPerStep: null, lastPhase: null,
+  });
 
   while (!stopRequested && (maxSteps <= 0 || steps < maxSteps)) {
     const sliceStart = performance.now();
@@ -332,6 +770,11 @@ async function train({ batchSize, learningRate, maxSteps, effort, sampleEvery, s
         return { steps, stopReason: 'no-data', elapsedSeconds: (performance.now() - startedAt) / 1000 };
       }
       const stepMs = performance.now() - stepStart;
+      // Exponential average, and not from the first step: that one pays
+      // for allocating every training buffer on the device.
+      if (steps > 0) {
+        recentStepMs = recentStepMs === null ? stepMs : recentStepMs * 0.9 + stepMs * 0.1;
+      }
       steps += 1;
       tokens += report.tokens;
       smoothedLoss = smoothedLoss === null ? report.loss : smoothedLoss * 0.9 + report.loss * 0.1;
@@ -394,6 +837,14 @@ async function train({ batchSize, learningRate, maxSteps, effort, sampleEvery, s
             bestValidation = measured;
             post('train-best', { step: llm.step(), validationLoss: measured });
           }
+          lastPhase = reportPlan({
+            heldOut,
+            trainingLoss: smoothedLoss,
+            stepsDone: steps,
+            tokensPerStep,
+            msPerStep: recentStepMs,
+            lastPhase,
+          });
           const advice = corpusAdvice(heldOut, smoothedLoss);
           if (advice && advice !== lastAdvice) {
             lastAdvice = advice;
@@ -673,6 +1124,45 @@ const handlers = {
     return { rows };
   },
 
+  /// The plan as it stands right now, without training anything: which
+  /// phase the model is in, and what would help. The page asks for this
+  /// whenever the corpus or the model changes, so the advice is there
+  /// before the first step rather than after the first validation.
+  async 'training-plan'({ batchSize = 1 } = {}) {
+    const info = llm.info();
+    return buildPlan({
+      heldOut: [],
+      trainingLoss: null,
+      stepsDone: 0,
+      tokensPerStep: Math.max(1, batchSize) * info.context_len,
+      msPerStep: null,
+      lastPhase: null,
+    });
+  },
+
+  /// Time this machine and return the settings it wants. The page
+  /// stores the result and hands it back on the next visit.
+  async benchmark(payload = {}) {
+    if (!llm.has_gpu()) return { error: 'no GPU device' };
+    if (training) {
+      const message = 'a training run is in flight — press Stop, then benchmark';
+      log(`benchmark refused: ${message}`);
+      return { error: message };
+    }
+    if (!llm.can_train()) {
+      return { error: 'not enough source text to fill one context window' };
+    }
+    return { profile: await benchmark(payload) };
+  },
+
+  /// Apply a stored profile's command-buffer size without re-measuring.
+  async 'apply-machine-profile'({ dispatchesPerSubmit }) {
+    if (dispatchesPerSubmit > 0) llm.set_dispatches_per_submit(dispatchesPerSubmit);
+    const applied = llm.dispatches_per_submit();
+    log(`machine profile applied: ${applied} dispatches per command buffer`);
+    return { dispatchesPerSubmit: applied };
+  },
+
   async train(payload) {
     // Training is GPU work. Without a device there is nothing to fall
     // back to, so say which of the two reasons stopped it.
@@ -718,9 +1208,9 @@ self.onmessage = async (event) => {
     fail(
       rid,
       new Error(
-        type === 'profile'
-          ? 'profiling needs a model: press Train first (a model lives in this tab only, so ' +
-            'a reload leaves none), then run scriptonait.profile() again'
+        type === 'profile' || type === 'benchmark'
+          ? `${type === 'profile' ? 'profiling' : 'benchmarking'} needs a model: press Train ` +
+            'first (a model lives in this tab only, so a reload leaves none), then run it again'
           : 'no model loaded yet',
       ),
     );

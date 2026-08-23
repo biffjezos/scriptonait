@@ -79,6 +79,15 @@
         <input type="text" id="sample-prompt" value="Write a 40 word scene." />
       </div>
 
+      <!-- The plan: which phase the run is in, the numbers behind that,
+           and what a person could actually do about it. Shown before the
+           first step, not only after the first validation. -->
+      <div id="train-plan" class="plan" hidden>
+        <p class="plan-phase"><span id="plan-phase-title"></span><span id="plan-phase-detail"></span></p>
+        <p id="plan-numbers" class="stats"></p>
+        <ul id="plan-actions" class="plan-actions"></ul>
+      </div>
+
       <div id="train-status" class="job-status" hidden>
         <div class="progress"><div class="bar" id="train-progress-bar"></div></div>
         <p id="train-stats" class="stats"></p>
@@ -96,8 +105,9 @@
         <div class="settings-grid">
           <label>Effort
             <select id="train-effort">
+              <option value="auto" selected>Auto — full speed, steps kept interruptible</option>
               <option value="0.25">Gentle — leaves the machine usable</option>
-              <option value="0.5" selected>Balanced</option>
+              <option value="0.5">Balanced</option>
               <option value="1">Full speed — will make things sluggish</option>
             </select>
           </label>
@@ -105,13 +115,24 @@
             <input type="number" id="train-steps" value="500" min="0" max="1000000" />
           </label>
           <label>Batch size
-            <input type="number" id="train-batch" value="2" min="1" max="256" />
+            <input type="number" id="train-batch" value="0" min="0" max="256" />
           </label>
           <label>Learning rate
             <input type="number" id="train-lr" value="0" min="0" max="0.01" step="0.00001" />
           </label>
         </div>
-        <p class="hint">0 = pick automatically.</p>
+        <p class="hint">
+          Every setting here is optional. Effort on Auto runs flat out — the benchmark
+          below only accepts a batch whose step stays short enough to interrupt —
+          batch size 0 uses whatever that benchmark measured fastest on this machine,
+          learning rate 0 picks one from whether the model is new or already trained, and
+          steps 0 trains until you press Stop.
+        </p>
+        <div class="row">
+          <span class="hint" id="machine-profile-text">Machine profile: not measured yet.</span>
+          <button id="bench-btn" type="button" class="secondary">Measure this machine</button>
+          <button id="bench-forget-btn" type="button" class="secondary" hidden>Forget it</button>
+        </div>
         <p class="hint" id="batch-hint">
           Batch size costs time, not memory: the sequences of a batch run one at a time and
           their gradients add up, so a larger batch is a steadier gradient at the same
@@ -178,6 +199,9 @@
           <label>Top-p
             <input type="number" id="opt-top-p" value="0.95" min="0.05" max="1" step="0.01" />
           </label>
+          <label>Min-p
+            <input type="number" id="opt-min-p" value="0.05" min="0" max="1" step="0.01" />
+          </label>
           <label>Repetition penalty
             <input type="number" id="opt-repetition" value="1.1" min="1" max="2" step="0.05" />
           </label>
@@ -185,7 +209,12 @@
             <input type="number" id="opt-seed" value="0" min="0" />
           </label>
         </div>
-        <p class="hint">Temperature 0 = repeatable.</p>
+        <p class="hint">
+          Temperature 0 = repeatable. Min-p keeps only tokens at least that fraction as likely
+          as the best one, so a confident step stays sharp and an uncertain one stays open —
+          which is what top-p, at a fixed 95% of the mass, cannot do. It generally does the
+          truncating on its own; 0 turns it off.
+        </p>
       </details>
     </section>
 

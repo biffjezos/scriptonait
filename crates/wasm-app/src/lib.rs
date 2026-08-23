@@ -60,6 +60,11 @@ fn js_err(msg: impl std::fmt::Display) -> JsValue {
     JsValue::from_str(&msg.to_string())
 }
 
+/// Command-buffer size used until this machine has been measured. The
+/// benchmark replaces it with whatever this adapter is actually fastest
+/// at; it is a starting point, not a tuning.
+const DEFAULT_DISPATCHES_PER_SUBMIT: u32 = 32;
+
 struct Inner {
     /// True while an async GPU operation owns the training state.
     ///
@@ -85,6 +90,12 @@ struct Inner {
     corpus: Corpus,
     gpu: Option<GpuBackend>,
     train: TrainConfig,
+    /// How many GPU operations share one command buffer, measured on
+    /// this machine by `bench_step` rather than fixed here: too few
+    /// pays submission cost on every dispatch, too many hands the
+    /// driver a command buffer long enough to trip its watchdog, and
+    /// where the best sits is a property of the adapter.
+    dispatches_per_submit: u32,
     /// True when the weights came from a checkpoint rather than from
     /// random initialization — the difference between "this model can
     /// write" and "this model needs training first", which the UI has to
@@ -274,6 +285,30 @@ impl WasmLLM {
         result
     }
 
+    /// Time one step at a given batch size and command-buffer size,
+    /// changing nothing: no weight update, no step counter. This is the
+    /// measurement the machine profile is built from.
+    pub async fn bench_step(
+        &self,
+        batch_size: u32,
+        dispatches_per_submit: u32,
+    ) -> Result<f64, JsValue> {
+        self.acquire()?;
+        let result = self.bench_step_inner(batch_size, dispatches_per_submit).await;
+        self.release();
+        result
+    }
+
+    /// How many GPU operations currently share a command buffer.
+    pub fn dispatches_per_submit(&self) -> u32 {
+        self.0.borrow().dispatches_per_submit
+    }
+
+    /// Set it, from a stored machine profile or from a fresh benchmark.
+    pub fn set_dispatches_per_submit(&self, n: u32) {
+        self.0.borrow_mut().dispatches_per_submit = n.clamp(1, 1024);
+    }
+
     /// Bring the trained weights back from the GPU; see
     /// `sync_from_gpu_inner`.
     pub async fn sync_from_gpu(&self) -> Result<(), JsValue> {
@@ -332,6 +367,7 @@ impl WasmLLM {
         let checkpoint = Checkpoint::from_bytes(bytes).map_err(js_err)?;
         Ok(WasmLLM(Rc::new(RefCell::new(Inner {
             busy: std::cell::Cell::new(false),
+            dispatches_per_submit: DEFAULT_DISPATCHES_PER_SUBMIT,
             config: checkpoint.config,
             weights: checkpoint.weights,
             step: checkpoint.step,
@@ -379,6 +415,7 @@ impl WasmLLM {
         config.validate().map_err(js_err)?;
         Ok(WasmLLM(Rc::new(RefCell::new(Inner {
             busy: std::cell::Cell::new(false),
+            dispatches_per_submit: DEFAULT_DISPATCHES_PER_SUBMIT,
             config,
             weights: ModelWeights::init(&config, seed as u64),
             step: 0,
@@ -408,6 +445,59 @@ impl WasmLLM {
             step: inner.step as f64,
             pretrained: inner.pretrained,
         }
+    }
+
+    /// Everything a training plan is computed from, as JSON.
+    ///
+    /// The schedule's own numbers (peak rate, warmup length, planned
+    /// length) and the corpus's own numbers (how many tokens train, how
+    /// many are held out) live on this side, so the page asks rather than
+    /// keeping a second copy that drifts. What the numbers *mean* — which
+    /// phase the run is in, what to do about it — is worked out where it
+    /// can be changed quickly, in the worker.
+    pub fn training_plan(&self) -> String {
+        let inner = &mut *self.0.borrow_mut();
+        let config = inner.config;
+        let train = inner.train;
+        let step = inner.step;
+        let context_len = config.context_len;
+        let training_tokens = inner.corpus.training_tokens();
+        let validation_tokens = inner.corpus.validation_tokens();
+        let mix = inner
+            .corpus
+            .mix()
+            .iter()
+            .map(|(kind, tokens)| {
+                format!("{{\"kind\":{:?},\"label\":{:?},\"tokens\":{}}}", kind.key(), kind.label(), tokens)
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        format!(
+            "{{\"step\":{},\"plannedSteps\":{},\"warmupSteps\":{},\"peakLr\":{},\
+             \"minLrRatio\":{},\"lrNow\":{},\"weightDecay\":{},\"gradClip\":{},\
+             \"params\":{},\"layers\":{},\"hidden\":{},\"vocabSize\":{},\
+             \"contextLen\":{},\"sources\":{},\"corpusTokens\":{},\
+             \"trainingTokens\":{},\"validationTokens\":{},\"pretrained\":{},\"mix\":[{}]}}",
+            step,
+            train.total_steps,
+            train.warmup_steps,
+            train.lr,
+            train.min_lr_ratio,
+            train.lr_at(step),
+            train.weight_decay,
+            train.grad_clip,
+            config.param_count(),
+            config.num_layers,
+            config.hidden_dim,
+            config.vocab_size,
+            context_len,
+            inner.corpus.num_sources(),
+            inner.corpus.total_tokens(),
+            training_tokens,
+            validation_tokens,
+            inner.pretrained,
+            mix,
+        )
     }
 
     /// Rough memory estimate in bytes; see `ModelConfig::memory_bytes`.
@@ -519,6 +609,7 @@ impl WasmLLM {
         temperature: f32,
         top_k: u32,
         top_p: f32,
+        min_p: f32,
         repetition_penalty: f32,
         seed: f64,
         on_token: &js_sys::Function,
@@ -528,6 +619,7 @@ impl WasmLLM {
             temperature,
             top_k: top_k as usize,
             top_p,
+            min_p,
             repetition_penalty,
             seed: seed as u64,
             // Never emit a token the training text does not contain. A
@@ -883,6 +975,7 @@ impl WasmLLM {
             }
         }
         let mut trainer = trainer.expect("created above");
+        trainer.set_dispatches_per_submit(self.0.borrow().dispatches_per_submit);
         let result = trainer
             .train_step(&ctx, &batch.inputs, &batch.targets, lr, train.weight_decay, train.grad_clip)
             .await;
@@ -980,6 +1073,52 @@ impl WasmLLM {
             p.adam,
             report.tokens,
         ))
+    }
+
+    /// One timed step that leaves no trace: `GpuTrainer::bench_step`
+    /// runs at learning rate zero and restores the step counter, so a
+    /// benchmark sweep costs time and nothing else.
+    async fn bench_step_inner(
+        &self,
+        batch_size: u32,
+        dispatches_per_submit: u32,
+    ) -> Result<f64, JsValue> {
+        let (config, batch) = {
+            let inner = &mut *self.0.borrow_mut();
+            if inner.gpu.is_none() {
+                return Err(js_err("benchmarking needs a GPU device"));
+            }
+            let context_len = inner.config.context_len;
+            let Some(batch) =
+                inner.corpus.sample_batch(batch_size as usize, context_len, &mut inner.rng)
+            else {
+                return Err(js_err("not enough text to sample a batch"));
+            };
+            (inner.config, batch)
+        };
+
+        let (ctx, trainer) = {
+            let inner = &mut *self.0.borrow_mut();
+            let gpu = inner.gpu.as_mut().expect("checked above");
+            (Rc::clone(&gpu.ctx), gpu.trainer.take())
+        };
+        let mut trainer = match trainer {
+            Some(existing) => existing,
+            None => {
+                let weights = self.0.borrow().weights.clone();
+                llm_gpu::GpuTrainer::new(&ctx, &config, &weights, batch.context_len)
+                    .map_err(js_err)?
+            }
+        };
+        trainer.set_dispatches_per_submit(dispatches_per_submit.max(1));
+        let result = trainer.bench_step(&ctx, &batch.inputs, &batch.targets).await;
+        {
+            let inner = &mut *self.0.borrow_mut();
+            if let Some(gpu) = inner.gpu.as_mut() {
+                gpu.trainer = Some(trainer);
+            }
+        }
+        result.map_err(js_err)
     }
 
     async fn profile_kernels_inner(&self, reps: u32) -> Result<String, JsValue> {

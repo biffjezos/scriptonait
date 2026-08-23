@@ -38,6 +38,21 @@ pub struct SamplingConfig {
     /// Nucleus sampling: keep the most likely tokens whose probabilities
     /// sum to `top_p`. 1.0 disables it. Applied after `top_k`.
     pub top_p: f32,
+    /// Minimum-probability sampling: keep only tokens at least `min_p`
+    /// times as likely as the most likely one. 0.0 disables it. Applied
+    /// after `top_k` and before `top_p`.
+    ///
+    /// This is the truncation that adapts to how sure the model is,
+    /// which top-p does not. Top-p keeps a fixed 95% of the mass whether
+    /// the model has one obvious continuation or fifty plausible ones:
+    /// in the first case it drags in a tail of tokens hundreds of times
+    /// less likely than the leader, and in the second it cuts off
+    /// candidates that were nearly as good as the one it kept. A
+    /// threshold relative to the leader does the opposite of both — a
+    /// confident step stays sharp, an uncertain one stays broad — and at
+    /// this model size, where the distribution is often barely peaked at
+    /// all, that difference is visible in the output.
+    pub min_p: f32,
     /// Divides the logit of any token seen in the last
     /// `repetition_window` positions (multiplies it, if it's negative).
     /// 1.0 disables it.
@@ -70,6 +85,7 @@ impl Default for SamplingConfig {
             temperature: 0.9,
             top_k: 40,
             top_p: 0.95,
+            min_p: 0.0,
             repetition_penalty: 1.1,
             repetition_window: 128,
             seed: 0,
@@ -363,6 +379,21 @@ pub fn sample_with(
         *p /= sum;
     }
 
+    // Relative to the leader, so this has to come after normalization
+    // and before top-p narrows the field.
+    if sampling.min_p > 0.0 {
+        let threshold = sampling.min_p * probs.first().copied().unwrap_or(0.0);
+        // At least one candidate always survives: the leader is by
+        // definition `min_p` times itself or better only when `min_p <=
+        // 1`, and a caller who passes more than that still gets a token
+        // rather than a panic.
+        let keep = probs.iter().take_while(|&&p| p >= threshold).count().max(1);
+        probs.truncate(keep);
+        order.truncate(keep);
+        // Truncation changed the mass; the draw below divides by the
+        // total it actually has, so nothing else needs rescaling here.
+    }
+
     if sampling.top_p < 1.0 {
         let mut cumulative = 0.0f32;
         let mut keep = probs.len();
@@ -394,6 +425,7 @@ pub fn sample(logits: &[f32], temperature: f32, rng: &mut Rng) -> u32 {
         temperature,
         top_k: 0,
         top_p: 1.0,
+        min_p: 0.0,
         repetition_penalty: 1.0,
         ..SamplingConfig::default()
     };
@@ -592,5 +624,70 @@ mod tests {
         );
         assert_eq!(reason, StopReason::Caller);
         assert_eq!(count, 5);
+    }
+
+    /// A peaked distribution: min-p should cut everything that is not
+    /// close to the leader, whatever the tail's total mass is.
+    #[test]
+    fn min_p_cuts_the_tail_of_a_confident_step() {
+        // exp(6) is ~400x exp(0), so with min_p = 0.1 only the leader
+        // clears the bar.
+        let logits = vec![6.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+        let sampling = SamplingConfig {
+            temperature: 1.0,
+            top_k: 0,
+            top_p: 1.0,
+            min_p: 0.1,
+            repetition_penalty: 1.0,
+            ..SamplingConfig::default()
+        };
+        let mut rng = Rng::seed_from_u64(1);
+        for _ in 0..64 {
+            assert_eq!(sample_with(&logits, &sampling, &[], &mut rng), 0);
+        }
+    }
+
+    /// The same threshold on a flat distribution keeps everything —
+    /// which is the whole point of making it relative to the leader.
+    #[test]
+    fn min_p_keeps_the_field_when_the_model_is_unsure() {
+        let logits = vec![0.10, 0.05, 0.0, -0.05, -0.10];
+        let sampling = SamplingConfig {
+            temperature: 1.0,
+            top_k: 0,
+            top_p: 1.0,
+            min_p: 0.1,
+            repetition_penalty: 1.0,
+            ..SamplingConfig::default()
+        };
+        let mut rng = Rng::seed_from_u64(2);
+        let mut seen = [false; 5];
+        for _ in 0..500 {
+            seen[sample_with(&logits, &sampling, &[], &mut rng) as usize] = true;
+        }
+        assert!(seen.iter().all(|&s| s), "every token should still be reachable: {seen:?}");
+    }
+
+    /// Nothing is ever cut down to nothing, however the threshold is set.
+    #[test]
+    fn min_p_always_leaves_a_candidate() {
+        let logits = vec![1.0, 0.9, 0.8];
+        let sampling = SamplingConfig {
+            temperature: 1.0,
+            top_k: 0,
+            top_p: 1.0,
+            min_p: 5.0,
+            repetition_penalty: 1.0,
+            ..SamplingConfig::default()
+        };
+        let mut rng = Rng::seed_from_u64(3);
+        assert_eq!(sample_with(&logits, &sampling, &[], &mut rng), 0);
+    }
+
+    /// Off by default, so adding it changed nothing for anyone who does
+    /// not ask for it.
+    #[test]
+    fn min_p_is_off_unless_asked_for() {
+        assert_eq!(SamplingConfig::default().min_p, 0.0);
     }
 }
