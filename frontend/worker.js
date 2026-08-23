@@ -154,7 +154,7 @@ async function initGpu() {
     const report = JSON.parse(llm.gpu_report());
     log(
       `WebGPU device acquired in ${(performance.now() - startedAt).toFixed(0)} ms` +
-        ` (matmuls in ${report.f16 ? 'f16' : 'f32'})`,
+        ` (f16 available: ${report.f16 ? 'yes' : 'no'}; matmuls run in f32)`,
       report,
     );
     if (report.isSoftware) {
