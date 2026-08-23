@@ -85,6 +85,18 @@ async fn await_mapped(
     }
 }
 
+/// Blocks until everything submitted so far has finished on the device.
+///
+/// There is no direct "wait for the queue" on the web: `device.poll` is a
+/// no-op there, because the browser owns the event loop. Mapping a tiny
+/// buffer that was written by the last submission is the portable way to
+/// find out that the submission is done, which is what a per-phase
+/// profile needs - without it every phase's timing is just how long it
+/// took to *encode*, not to run.
+pub async fn sync(device: &wgpu::Device, queue: &wgpu::Queue, marker: &wgpu::Buffer) -> Result<(), String> {
+    read_f32(device, queue, marker, 1).await.map(|_| ())
+}
+
 /// Copies `buffer`'s first `len` f32s back to the host. Async because
 /// `wgpu`'s buffer mapping is inherently async (mandatory on the web,
 /// where the browser's WebGPU implementation is a JS Promise underneath);

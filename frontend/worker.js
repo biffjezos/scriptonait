@@ -519,6 +519,27 @@ const handlers = {
     return { vocabSize: size, changed: true, model: describeModel() };
   },
 
+  /// Time one step per phase, at a few command-buffer sizes. This is the
+  /// measurement that says whether a step is bound by arithmetic or by
+  /// per-submission cost, instead of anybody guessing.
+  async profile({ batchSize = 2 }) {
+    if (!llm.has_gpu()) return { error: 'no GPU device' };
+    const rows = [];
+    for (const perSubmit of [4, 16, 64, 256]) {
+      const report = JSON.parse(await llm.profile_step(batchSize, perSubmit));
+      rows.push(report);
+      log(
+        `profile: ${report.dispatchesPerSubmit} dispatches/submit -> ` +
+          `${report.totalMs.toFixed(0)} ms total ` +
+          `(${report.submits} submits) | zero ${report.zeroMs.toFixed(0)} ` +
+          `forward ${report.forwardMs.toFixed(0)} loss ${report.lossMs.toFixed(0)} ` +
+          `backward ${report.backwardMs.toFixed(0)} reduce ${report.reduceMs.toFixed(0)} ` +
+          `readback ${report.readbackMs.toFixed(0)} adam ${report.adamMs.toFixed(0)}`,
+      );
+    }
+    return { rows };
+  },
+
   async train(payload) {
     // Training is GPU work. Without a device there is nothing to fall
     // back to, so say which of the two reasons stopped it.

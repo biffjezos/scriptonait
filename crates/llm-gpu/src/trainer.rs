@@ -23,6 +23,8 @@ use llm_core::config::ModelConfig;
 use llm_core::model::ModelWeights;
 use llm_core::ops;
 
+use web_time::Instant;
+
 use crate::buffers;
 use crate::context::GpuContext;
 use crate::model::{ceil_div, dispatch, dispatch_add_inplace, dispatch_linear, dispatch_swiglu, P4, P8};
@@ -237,11 +239,29 @@ pub struct GpuStepReport {
     pub lr: f32,
     pub grad_norm: f32,
     pub tokens: usize,
+    /// Milliseconds per phase, filled in only by `profile_step`. A step
+    /// pipelines its phases, so these are meaningful only when the
+    /// profiler forces a device sync between them - which is why the
+    /// normal step does not measure them.
+    pub phase_ms: Option<PhaseTimings>,
     /// Compute dispatches issued for this step, and command buffers
     /// submitted. Both scale with the batch, and together they say
     /// whether a step is bound by arithmetic or by per-dispatch overhead.
     pub dispatches: u32,
     pub submits: u32,
+}
+
+/// Where a step's time goes, in milliseconds.
+#[derive(Clone, Copy, Default)]
+pub struct PhaseTimings {
+    pub zero: f64,
+    pub forward: f64,
+    pub loss: f64,
+    pub backward: f64,
+    pub reduce: f64,
+    pub readback: f64,
+    pub adam: f64,
+    pub total: f64,
 }
 
 impl GpuTrainer {
@@ -463,6 +483,131 @@ impl GpuTrainer {
         };
 
         self.step += 1;
+        self.encode_adam(&mut chunks, ctx, lr, weight_decay, inv_batch * clip);
+        chunks.flush();
+
+        Ok(GpuStepReport {
+            loss,
+            lr,
+            grad_norm,
+            phase_ms: None,
+            tokens: batch_size * t,
+            dispatches: ctx.dispatch_count.get(),
+            submits: chunks.submits,
+        })
+    }
+
+    /// One step, with a device sync after each phase and a stopwatch
+    /// around each: the answer to "which part of a step is slow".
+    ///
+    /// The syncs make the step slower than a real one — a normal step
+    /// lets the phases pipeline — so the total here is an upper bound.
+    /// What matters is the split between the phases, and how it changes
+    /// when `dispatches_per_submit` changes: a step dominated by
+    /// per-submit cost gets faster with bigger chunks and shows most of
+    /// its time in whichever phase issues the most submits, while a step
+    /// dominated by arithmetic barely moves.
+    pub async fn profile_step(
+        &mut self,
+        ctx: &GpuContext,
+        inputs: &[u32],
+        targets: &[u32],
+        lr: f32,
+        weight_decay: f32,
+        grad_clip: f32,
+    ) -> Result<GpuStepReport, String> {
+        let t = self.t_len;
+        if inputs.len() != targets.len() || inputs.is_empty() || inputs.len() % t != 0 {
+            return Err("batch shape does not match this trainer".to_string());
+        }
+        let batch_size = inputs.len() / t;
+        ctx.params.reset();
+        ctx.dispatch_count.set(0);
+        let mut timings = PhaseTimings::default();
+        let started = Instant::now();
+
+        let mut chunks = Chunks::new(ctx, self.dispatches_per_submit);
+        for slot in &self.grads.slots {
+            self.dispatch_zero(&mut chunks, ctx, &slot.buffer, slot.len);
+        }
+        let stats_len = 1 + self.grads.slots.len();
+        self.dispatch_zero(&mut chunks, ctx, &self.scratch.stats, stats_len);
+        chunks.flush();
+        self.sync(ctx).await?;
+        let mut mark = Instant::now();
+        timings.zero = started.elapsed().as_secs_f64() * 1000.0;
+        for b in 0..batch_size {
+            let seq = &inputs[b * t..(b + 1) * t];
+            let tgt = &targets[b * t..(b + 1) * t];
+            buffers::write_u32(&ctx.queue, &self.scratch.tokens, seq);
+            buffers::write_u32(&ctx.queue, &self.scratch.targets, tgt);
+            let groups = self.upload_scatter_index(ctx, seq);
+
+            self.encode_forward(&mut chunks, ctx);
+            chunks.flush();
+            self.sync(ctx).await?;
+            timings.forward += take(&mut mark);
+
+            self.encode_loss(&mut chunks, ctx);
+            chunks.flush();
+            self.sync(ctx).await?;
+            timings.loss += take(&mut mark);
+
+            self.encode_backward(&mut chunks, ctx, groups);
+            chunks.flush();
+            self.sync(ctx).await?;
+            timings.backward += take(&mut mark);
+        }
+
+        mark = Instant::now();
+        for (i, slot) in self.grads.slots.iter().enumerate() {
+            self.dispatch_reduce(&mut chunks, ctx, &slot.buffer, slot.len, 1 + i, true);
+        }
+        chunks.flush();
+        self.sync(ctx).await?;
+        timings.reduce = take(&mut mark);
+
+        let stats = buffers::read_f32(&ctx.device, &ctx.queue, &self.scratch.stats, stats_len).await?;
+        timings.readback = take(&mut mark);
+
+        let inv_batch = 1.0 / batch_size as f32;
+        let loss = stats[0] / (batch_size * t) as f32;
+        let sum_sq: f64 = stats[1..].iter().map(|&x| x as f64).sum();
+        let grad_norm = (sum_sq.sqrt() as f32) * inv_batch;
+        let clip = if grad_norm > grad_clip && grad_norm.is_finite() && grad_norm > 0.0 {
+            grad_clip / grad_norm
+        } else {
+            1.0
+        };
+        self.step += 1;
+        self.encode_adam(&mut chunks, ctx, lr, weight_decay, inv_batch * clip);
+        chunks.flush();
+        self.sync(ctx).await?;
+        timings.adam = take(&mut mark);
+        timings.total = started.elapsed().as_secs_f64() * 1000.0;
+
+        Ok(GpuStepReport {
+            loss,
+            lr,
+            grad_norm,
+            phase_ms: Some(timings),
+            tokens: batch_size * t,
+            dispatches: ctx.dispatch_count.get(),
+            submits: chunks.submits,
+        })
+    }
+
+    /// The AdamW pass: one dispatch per tensor, with the batch average
+    /// and the gradient-norm clip folded into `grad_scale` so neither
+    /// needs its own pass over every parameter.
+    fn encode_adam(
+        &self,
+        chunks: &mut Chunks,
+        ctx: &GpuContext,
+        lr: f32,
+        weight_decay: f32,
+        grad_scale: f32,
+    ) {
         let bias1 = 1.0 - 0.9f32.powi(self.step);
         let bias2 = 1.0 - 0.95f32.powi(self.step);
         for (i, slot) in self.grads.slots.iter().enumerate() {
@@ -477,7 +622,7 @@ impl GpuTrainer {
                     bias1,
                     bias2,
                     weight_decay: wd,
-                    grad_scale: inv_batch * clip,
+                    grad_scale,
                     stride,
                     _p0: 0,
                 },
@@ -491,16 +636,13 @@ impl GpuTrainer {
             ];
             dispatch(chunks.enc(), ctx, &ctx.pipelines.adam_update, &entries, (groups, 1, 1));
         }
-        chunks.flush();
+    }
 
-        Ok(GpuStepReport {
-            loss,
-            lr,
-            grad_norm,
-            tokens: batch_size * t,
-            dispatches: ctx.dispatch_count.get(),
-            submits: chunks.submits,
-        })
+    /// Wait for everything submitted so far to actually finish on the
+    /// device. Without this a "phase timing" is only how long encoding
+    /// took, which is not the question.
+    async fn sync(&self, ctx: &GpuContext) -> Result<(), String> {
+        buffers::sync(&ctx.device, &ctx.queue, &self.scratch.stats).await
     }
 
     /// Copy the trained weights back into a CPU-side `ModelWeights` —
@@ -1334,6 +1476,13 @@ impl GpuTrainer {
         ];
         dispatch(chunks.enc(), ctx, &ctx.pipelines.rmsnorm_bwd_dgain, &entries, (ceil_div(dim, 64), 1, 1));
     }
+}
+
+/// Milliseconds since `mark`, restarting it.
+fn take(mark: &mut Instant) -> f64 {
+    let ms = mark.elapsed().as_secs_f64() * 1000.0;
+    *mark = Instant::now();
+    ms
 }
 
 /// Encodes work in bounded chunks and submits each one.
