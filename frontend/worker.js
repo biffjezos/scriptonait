@@ -152,7 +152,11 @@ async function initGpu() {
   try {
     const summary = await llm.init_gpu();
     const report = JSON.parse(llm.gpu_report());
-    log(`WebGPU device acquired in ${(performance.now() - startedAt).toFixed(0)} ms`, report);
+    log(
+      `WebGPU device acquired in ${(performance.now() - startedAt).toFixed(0)} ms` +
+        ` (matmuls in ${report.f16 ? 'f16' : 'f32'})`,
+      report,
+    );
     if (report.isSoftware) {
       log(
         'WARNING: this is a SOFTWARE renderer, not your GPU. Training will run at ' +
@@ -315,6 +319,7 @@ async function train({ batchSize, learningRate, maxSteps, effort, sampleEvery, s
   // help more than more steps.
   const heldOut = [];
   let lastAdvice = null;
+  let bestValidation = null;
 
   while (!stopRequested && (maxSteps <= 0 || steps < maxSteps)) {
     const sliceStart = performance.now();
@@ -381,6 +386,14 @@ async function train({ batchSize, learningRate, maxSteps, effort, sampleEvery, s
             `step ${llm.step().toLocaleString()}: held-out loss ${measured.toFixed(4)}` +
               (gap === null ? '' : ` (training ${smoothedLoss.toFixed(4)}, gap ${gap.toFixed(4)})`),
           );
+          // A run's best model is rarely its last, and training past the
+          // best is exactly what a small corpus makes it do. Tell the
+          // page whenever this is the best held-out loss so far so it can
+          // keep a copy.
+          if (bestValidation === null || measured < bestValidation) {
+            bestValidation = measured;
+            post('train-best', { step: llm.step(), validationLoss: measured });
+          }
           const advice = corpusAdvice(heldOut, smoothedLoss);
           if (advice && advice !== lastAdvice) {
             lastAdvice = advice;
@@ -542,6 +555,12 @@ const handlers = {
   async 'parse-prompt'({ prompt }) {
     await ensureWasm();
     return describePrompt(text(prompt, 'the prompt'));
+  },
+
+  /// Which loaded sources are copies of another. Reported, never
+  /// removed: which copy to keep is the user's call.
+  async 'duplicate-sources'() {
+    return { ids: llm.duplicate_sources() };
   },
 
   async 'upsert-source'(payload) {

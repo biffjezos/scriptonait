@@ -574,3 +574,11 @@ select {
   font-size: 0.9rem;
   line-height: 1.4;
 }
+
+/* The best model a run has produced, and the way back to it. */
+.best-model {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  margin-top: 0.5rem;
+}

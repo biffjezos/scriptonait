@@ -49,9 +49,13 @@ fn every_shader_parses_and_validates() {
         // Default capabilities, not `all()`: these shaders run in a
         // browser against baseline WebGPU, so validating against a
         // superset of that would accept things Chrome would reject.
+        // SHADER_F16 so the f16 kernel variants validate here too: they
+        // are compiled at runtime only when the adapter reports the
+        // feature, but a syntax or type error in them must fail the build
+        // rather than wait for a machine that has it.
         let mut validator = naga::valid::Validator::new(
             naga::valid::ValidationFlags::all(),
-            naga::valid::Capabilities::default(),
+            naga::valid::Capabilities::default() | naga::valid::Capabilities::SHADER_FLOAT16,
         );
         if let Err(err) = validator.validate(&module) {
             failures.push(format!("{name}: validation error\n{}", err.emit_to_string(&source)));

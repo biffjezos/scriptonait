@@ -227,6 +227,14 @@ function updateGuidance() {
   $('train-btn').disabled = training || sources.length === 0 || (model && !model.usingGpu);
   $('generate-btn').disabled = generating || !model;
 
+  // Say what a step will actually cover, since batch size and context
+  // multiply and neither number means much alone.
+  const batch = Number($('train-batch').value) || 1;
+  const context = model ? model.contextLen : Number($('cfg-context').value) || 0;
+  $('batch-hint').textContent =
+    `Batch size costs time, not memory: the sequences of a batch run one at a time and their ` +
+    `gradients add up. ${batch} x ${context} = ${(batch * context).toLocaleString()} tokens per step.`;
+
   $('train-btn').textContent = model
     ? (model.pretrained ? 'Keep training on my writing' : 'Keep training this model')
     : 'Train a model on my writing';
@@ -266,6 +274,30 @@ function updateGuidance() {
 async function syncAllSources() {
   for (const source of sources) {
     await syncSource(source);
+  }
+  await reportDuplicates();
+}
+
+/// Say when the same text is loaded twice.
+///
+/// A duplicate is trained on twice, which weights that script double and
+/// flatters the held-out number for it. The page names them; removing
+/// one is the user's decision, not the page's.
+async function reportDuplicates() {
+  if (!model) return;
+  try {
+    const { ids } = await call('duplicate-sources');
+    if (!ids || ids.length === 0) return;
+    const titles = ids
+      .map((id) => (sources.find((s) => s.id === id) || {}).title || id)
+      .slice(0, 3);
+    showError(
+      `${ids.length} source${ids.length === 1 ? ' is a copy' : 's are copies'} of another ` +
+        `(${titles.join(', ')}${ids.length > 3 ? ', …' : ''}). Training on a script twice ` +
+        'weights it double — remove the copies in step 1.',
+    );
+  } catch (error) {
+    console.warn('[scriptonait] duplicate check failed:', error);
   }
 }
 
@@ -895,6 +927,53 @@ onStream('train-progress', (progress) => {
 // one worth reading, which is the current one.
 // What the held-out curve is saying to do about the corpus. It appears
 // when the numbers earn it and stays until the next run.
+// A new best held-out loss: keep a copy of this model, because training
+// continues past it and the last model of a run is usually not its best.
+let bestSaveInFlight = false;
+onStream('train-best', async ({ step, validationLoss }) => {
+  if (bestSaveInFlight || !model) return;
+  bestSaveInFlight = true;
+  try {
+    const { bytes } = await call('export-checkpoint');
+    await db.putBestModel({ bytes, step, params: model.params, validationLoss });
+    console.info(
+      `[scriptonait] kept the best model so far (held-out ${validationLoss.toFixed(3)} ` +
+        `at step ${step.toLocaleString()})`,
+    );
+    renderBestModel({ step, validationLoss });
+  } catch (error) {
+    console.warn('[scriptonait] could not keep the best model:', error);
+  } finally {
+    bestSaveInFlight = false;
+  }
+});
+
+/// Show what the best kept model is, and offer to go back to it.
+function renderBestModel(best) {
+  const row = $('best-model');
+  if (!best) {
+    row.hidden = true;
+    return;
+  }
+  $('best-model-text').textContent =
+    `Best so far: held-out ${best.validationLoss.toFixed(3)} at step ${best.step.toLocaleString()}.`;
+  row.hidden = false;
+}
+
+$('restore-best-btn').addEventListener('click', async () => {
+  const best = await db.getBestModel();
+  if (!best) return;
+  if (!confirm(`Go back to the model from step ${best.step.toLocaleString()}? The current one is replaced.`)) {
+    return;
+  }
+  setModelStatus('loading', 'Restoring the best model…');
+  renderModel(await call('load-model', { bytes: best.bytes }, [], 0));
+  await syncAllSources();
+  await refreshStoryState();
+  await saveModel();
+  console.info('[scriptonait] restored the best model');
+});
+
 onStream('train-advice', ({ advice, step }) => {
   const box = $('train-advice');
   box.textContent = `At step ${step.toLocaleString()}: ${advice}`;
@@ -1006,6 +1085,8 @@ $('train-btn').addEventListener('click', async () => {
     updateGuidance();
   }
 });
+
+$('train-batch').addEventListener('input', updateGuidance);
 
 $('train-stop-btn').addEventListener('click', () => {
   $('train-stop-btn').disabled = true;
@@ -1198,5 +1279,11 @@ async function restoreModel() {
   setModelStatus('absent', 'No model yet.');
   updateGuidance();
   await restoreModel();
+  try {
+    const best = await db.getBestModel();
+    if (best) renderBestModel(best);
+  } catch (error) {
+    console.warn('[scriptonait] could not read the best model:', error);
+  }
   updateGuidance();
 })();

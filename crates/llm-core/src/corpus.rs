@@ -40,6 +40,20 @@ pub struct Corpus {
     flat_cache: Vec<u32>,
     /// Index into `flat_cache` of each source's first token (its BOS).
     boundaries: Vec<usize>,
+    /// `(start, len)` of every source inside `flat_cache`, so a training
+    /// window can be drawn from within one source rather than across the
+    /// seam between two.
+    spans: Vec<(usize, usize)>,
+    /// The held-out stream: a slice taken from *every* source, not the
+    /// tail of the corpus.
+    ///
+    /// A tail split holds out whichever source happens to be last, so
+    /// its loss measures "text from a script we never saw" - a different
+    /// distribution, not unseen text from the same one. Taking a slice
+    /// out of each source instead means held-out loss answers the
+    /// question it is supposed to: how does this model do on writing like
+    /// the writing it was trained on.
+    val_cache: Vec<u32>,
     dirty: bool,
     /// The tokenizer every source is encoded with. Swapping it
     /// re-encodes everything (see `set_tokenizer`), because token ids
@@ -76,6 +90,8 @@ impl Corpus {
             order: Vec::new(),
             flat_cache: Vec::new(),
             boundaries: Vec::new(),
+            spans: Vec::new(),
+            val_cache: Vec::new(),
             dirty: true,
             tokenizer: Tokenizer::byte_level(),
         }
@@ -254,11 +270,27 @@ impl Corpus {
         }
         self.flat_cache.clear();
         self.boundaries.clear();
+        self.spans.clear();
+        self.val_cache.clear();
         for id in &self.order {
-            if let Some(tokens) = self.sources.get(id) {
+            let Some(tokens) = self.sources.get(id) else { continue };
+            // Each source contributes its own held-out slice, taken from
+            // the end of that source, so every source is represented in
+            // both streams and no training window can reach into one.
+            let held = (tokens.len() as f32 * VALIDATION_FRACTION) as usize;
+            let split = tokens.len().saturating_sub(held);
+            // A source too small to split at all stays entirely in
+            // training: half a scene is not a validation set.
+            if held < 32 || split < 32 {
                 self.boundaries.push(self.flat_cache.len());
+                self.spans.push((self.flat_cache.len(), tokens.len()));
                 self.flat_cache.extend_from_slice(tokens);
+                continue;
             }
+            self.boundaries.push(self.flat_cache.len());
+            self.spans.push((self.flat_cache.len(), split));
+            self.flat_cache.extend_from_slice(&tokens[..split]);
+            self.val_cache.extend_from_slice(&tokens[split..]);
         }
         self.dirty = false;
     }
@@ -269,35 +301,14 @@ impl Corpus {
         self.flat_cache.len() > context_len
     }
 
-    /// Where the training data ends and the held-out data begins.
-    ///
-    /// The last `VALIDATION_FRACTION` of the corpus is never trained on,
-    /// so the loss measured there says whether the model is learning the
-    /// language or memorizing the sample - which training loss alone
-    /// cannot tell you. It is the tail rather than a random selection of
-    /// windows because windows overlap: a randomly held-out window would
-    /// share most of its tokens with a trained one, and report as
-    /// "unseen" text the model has in fact seen.
-    fn split_point(&self, context_len: usize) -> usize {
-        let total = self.flat_cache.len();
-        let held_out = ((total as f32 * VALIDATION_FRACTION) as usize).max(context_len + 1);
-        // Never hold out so much that training has nothing left.
-        if total < (context_len + 1) * 4 {
-            return total;
-        }
-        total - held_out.min(total / 2)
-    }
-
-    /// Whether there is enough text for a held-out split at all.
+    /// Whether there is enough held-out text to measure anything.
     pub fn can_validate(&mut self, context_len: usize) -> bool {
         self.rebuild_flat_if_needed();
-        let split = self.split_point(context_len);
-        split < self.flat_cache.len() && self.flat_cache.len() - split > context_len
+        self.val_cache.len() > context_len + 1
     }
 
-    /// A batch drawn from the held-out tail, for measuring validation
-    /// loss. Deterministic given `rng`, and never overlapping the
-    /// windows `sample_batch` can return.
+    /// A batch drawn from the held-out stream — a slice of every source,
+    /// never anything a training window can reach.
     pub fn sample_validation_batch(
         &mut self,
         batch_size: usize,
@@ -305,18 +316,16 @@ impl Corpus {
         rng: &mut Rng,
     ) -> Option<Batch> {
         self.rebuild_flat_if_needed();
-        let split = self.split_point(context_len);
-        let available = self.flat_cache.len().checked_sub(split)?;
-        if available <= context_len + 1 {
+        if self.val_cache.len() <= context_len + 1 {
             return None;
         }
-        let max_start = available - context_len - 1;
+        let max_start = self.val_cache.len() - context_len - 1;
         let mut inputs = Vec::with_capacity(batch_size * context_len);
         let mut targets = Vec::with_capacity(batch_size * context_len);
         for _ in 0..batch_size {
-            let start = split + rng.gen_range(max_start + 1);
-            inputs.extend_from_slice(&self.flat_cache[start..start + context_len]);
-            targets.extend_from_slice(&self.flat_cache[start + 1..start + 1 + context_len]);
+            let start = rng.gen_range(max_start + 1);
+            inputs.extend_from_slice(&self.val_cache[start..start + context_len]);
+            targets.extend_from_slice(&self.val_cache[start + 1..start + 1 + context_len]);
         }
         Some(Batch { inputs, targets, batch_size, context_len })
     }
@@ -338,27 +347,76 @@ impl Corpus {
         if self.flat_cache.len() <= context_len {
             return None;
         }
-        // Training windows stop at the split: everything after it is the
-        // held-out tail.
-        let train_end = self.split_point(context_len);
-        if train_end <= context_len + 1 {
+        // Sources long enough to hold a window, and where each one starts
+        // in the flat stream. A window is drawn from inside one source:
+        // the flat stream is a concatenation, and a window spanning the
+        // seam teaches the model that one script's last line is followed
+        // by another script's title page.
+        let usable: Vec<(usize, usize)> = self
+            .spans
+            .iter()
+            .copied()
+            .filter(|&(_, len)| len > context_len + 1)
+            .collect();
+        if usable.is_empty() {
             return None;
         }
-        let max_start = train_end - context_len - 1;
-        let boundary_starts: Vec<usize> = self.boundaries.iter().copied().filter(|&b| b <= max_start).collect();
+        // Weighted by length, so a corpus of one long script and one
+        // short one samples in proportion to how much text each is.
+        let total: usize = usable.iter().map(|&(_, len)| len - context_len - 1).sum();
 
         let mut inputs = Vec::with_capacity(batch_size * context_len);
         let mut targets = Vec::with_capacity(batch_size * context_len);
         for _ in 0..batch_size {
-            let start = if !boundary_starts.is_empty() && rng.next_f32() < BOUNDARY_ALIGNED_SAMPLE_RATE {
-                boundary_starts[rng.gen_range(boundary_starts.len())]
+            let start = if rng.next_f32() < BOUNDARY_ALIGNED_SAMPLE_RATE {
+                // A window that starts where a source starts, so the model
+                // sees what an opening looks like - see the constant.
+                usable[rng.gen_range(usable.len())].0
             } else {
-                rng.gen_range(max_start + 1)
+                let mut pick = rng.gen_range(total.max(1));
+                let mut chosen = usable[0].0;
+                for &(base, len) in &usable {
+                    let room = len - context_len - 1;
+                    if pick < room {
+                        chosen = base + pick;
+                        break;
+                    }
+                    pick -= room;
+                }
+                chosen
             };
             inputs.extend_from_slice(&self.flat_cache[start..start + context_len]);
             targets.extend_from_slice(&self.flat_cache[start + 1..start + 1 + context_len]);
         }
         Some(Batch { inputs, targets, batch_size, context_len })
+    }
+
+    /// Source ids whose cleaned text is identical to an earlier source's.
+    ///
+    /// The same script added twice - a re-upload, the same file under two
+    /// names - is trained on twice, which weights it double and inflates
+    /// how well the model appears to do on it. Reported rather than
+    /// removed: which copy to keep is the user's call.
+    pub fn duplicate_sources(&self) -> Vec<String> {
+        let mut seen: HashMap<u64, &str> = HashMap::new();
+        let mut duplicates = Vec::new();
+        for id in &self.order {
+            let Some(text) = self.cleaned_text.get(id) else { continue };
+            // FNV-1a over the cleaned text: cheap, and a collision here
+            // would only mean one false report.
+            let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+            for byte in text.as_bytes() {
+                hash ^= *byte as u64;
+                hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+            }
+            match seen.get(&hash) {
+                Some(_) => duplicates.push(id.clone()),
+                None => {
+                    seen.insert(hash, id.as_str());
+                }
+            }
+        }
+        duplicates
     }
 }
 
@@ -450,26 +508,58 @@ mod tests {
     }
 
     #[test]
-    fn validation_windows_never_overlap_training_windows() {
+    fn every_source_contributes_to_the_held_out_stream() {
+        // Two sources with disjoint vocabularies: if the held-out stream
+        // came from the tail of the corpus it would contain only the
+        // second one's tokens, and validation loss would be measuring a
+        // different distribution rather than unseen text from the same
+        // one.
         let mut c = Corpus::new();
-        // Distinct text so an overlap would be visible, and long enough
-        // for a real split.
-        c.upsert("a", &"the quick brown fox jumps over the lazy dog ".repeat(200), false);
-        let context = 32;
-        assert!(c.can_validate(context));
-        let mut rng = Rng::seed_from_u64(4);
+        c.upsert("a", &"aaaa bbbb cccc dddd ".repeat(200), false);
+        c.upsert("b", &"wwww xxxx yyyy zzzz ".repeat(200), false);
+        assert!(c.can_validate(32));
 
-        let split = {
-            c.rebuild_flat_if_needed();
-            c.split_point(context)
-        };
+        c.rebuild_flat_if_needed();
+        let held: std::collections::HashSet<u32> = c.val_cache.iter().copied().collect();
+        let from_a = held.contains(&(b'a' as u32));
+        let from_b = held.contains(&(b'z' as u32));
+        assert!(from_a && from_b, "both sources must appear in the held-out stream");
+
+        // And no training window can reach the held-out tokens: the two
+        // streams are separate buffers.
+        let mut rng = Rng::seed_from_u64(4);
         for _ in 0..20 {
-            let train = c.sample_batch(2, context, &mut rng).expect("train batch");
-            assert_eq!(train.inputs.len(), 2 * context);
-            let val = c.sample_validation_batch(2, context, &mut rng).expect("val batch");
-            assert_eq!(val.inputs.len(), 2 * context);
+            assert!(c.sample_batch(2, 32, &mut rng).is_some());
+            assert!(c.sample_validation_batch(2, 32, &mut rng).is_some());
         }
-        assert!(split > 0 && split < c.total_tokens(), "split sits inside the corpus");
+    }
+
+    #[test]
+    fn a_training_window_never_spans_two_sources() {
+        // Two sources with disjoint alphabets: a window containing both
+        // would be a window that crossed the seam between scripts.
+        let mut c = Corpus::new();
+        c.upsert("a", &"aaaa ".repeat(500), false);
+        c.upsert("b", &"zzzz ".repeat(500), false);
+        let mut rng = Rng::seed_from_u64(9);
+        for _ in 0..100 {
+            let batch = c.sample_batch(4, 32, &mut rng).expect("batch");
+            for window in batch.inputs.chunks(32) {
+                let has_a = window.contains(&(b'a' as u32));
+                let has_z = window.contains(&(b'z' as u32));
+                assert!(!(has_a && has_z), "window spans two sources: {window:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn duplicate_sources_are_reported_not_removed() {
+        let mut c = Corpus::new();
+        c.upsert("a", "INT. KITCHEN - DAY\n\nJANE\nHi.", false);
+        c.upsert("copy", "INT. KITCHEN - DAY\n\nJANE\nHi.", false);
+        c.upsert("other", "EXT. GARDEN - NIGHT\n\nJOHN\nBye.", false);
+        assert_eq!(c.duplicate_sources(), vec!["copy".to_string()]);
+        assert_eq!(c.num_sources(), 3, "reporting a duplicate must not remove it");
     }
 
     #[test]

@@ -83,6 +83,10 @@
         <div class="progress"><div class="bar" id="train-progress-bar"></div></div>
         <p id="train-stats" class="stats"></p>
         <p id="train-advice" class="advice" hidden></p>
+        <div id="best-model" class="best-model row" hidden>
+          <span id="best-model-text" class="stats"></span>
+          <button id="restore-best-btn" type="button" class="secondary">Go back to it</button>
+        </div>
       </div>
       <canvas id="loss-chart" width="640" height="140" hidden></canvas>
       <div id="train-samples" class="train-samples"></div>
@@ -101,13 +105,18 @@
             <input type="number" id="train-steps" value="500" min="0" max="1000000" />
           </label>
           <label>Batch size
-            <input type="number" id="train-batch" value="2" min="1" max="32" />
+            <input type="number" id="train-batch" value="2" min="1" max="256" />
           </label>
           <label>Learning rate
             <input type="number" id="train-lr" value="0" min="0" max="0.01" step="0.00001" />
           </label>
         </div>
         <p class="hint">0 = pick automatically.</p>
+        <p class="hint" id="batch-hint">
+          Batch size costs time, not memory: the sequences of a batch run one at a time and
+          their gradients add up, so a larger batch is a steadier gradient at the same
+          memory.
+        </p>
         <p class="hint" id="shape-hint">New model shape:</p>
         <div class="settings-grid">
           <label>Layers <input type="number" id="cfg-layers" value="4" min="1" max="12" /></label>

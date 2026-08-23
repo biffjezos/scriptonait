@@ -116,6 +116,10 @@ pub struct GpuContext {
     /// True when the adapter is a CPU/software implementation (SwiftShader,
     /// WARP, lavapipe) rather than real hardware.
     pub is_software: bool,
+    /// Whether the f16 matmul kernels are the ones that got compiled.
+    /// Reported so a machine's speed can be read against what it is
+    /// actually running.
+    pub has_f16: bool,
     /// The adapter's own fields, kept separate from the summary string so
     /// the page can log them individually — "is this actually my GPU?"
     /// is the first question a slow training run raises.
@@ -186,10 +190,20 @@ impl GpuContext {
         // browser already understands (it's where they came from) and
         // guaranteed compute-shader-capable (real WebGPU adapters report
         // real compute limits, unlike the WebGL2 downlevel defaults).
+        // f16 where the adapter has it: the matmuls are most of a training
+        // step, and their inner loop is arithmetic-bound, so packed f16
+        // math and half the workgroup-memory traffic is the largest win
+        // available in a kernel. Requested only when reported - asking for
+        // a feature an adapter lacks fails the whole device request - and
+        // the f32 kernels stay the fallback.
+        let has_f16 = adapter.features().contains(wgpu::Features::SHADER_F16);
+        let required_features =
+            if has_f16 { wgpu::Features::SHADER_F16 } else { wgpu::Features::empty() };
+
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("scriptonait-llm-device"),
-                required_features: wgpu::Features::empty(),
+                required_features,
                 required_limits: adapter.limits(),
                 ..Default::default()
             })
@@ -197,7 +211,15 @@ impl GpuContext {
             .map_err(|e| format!("Failed to get WebGPU device: {e}"))?;
 
         let pipelines = Pipelines {
-            linear: make_pipeline(&device, "linear", include_str!("shaders/linear.wgsl")),
+            linear: make_pipeline(
+                &device,
+                "linear",
+                if has_f16 {
+                    include_str!("shaders/linear_f16.wgsl")
+                } else {
+                    include_str!("shaders/linear.wgsl")
+                },
+            ),
             add_inplace: make_pipeline(&device, "add_inplace", include_str!("shaders/add_inplace.wgsl")),
             embedding_gather: make_pipeline(
                 &device,
@@ -220,12 +242,20 @@ impl GpuContext {
             linear_bwd_dw: make_pipeline(
                 &device,
                 "linear_bwd_dw",
-                include_str!("shaders/linear_bwd_dw.wgsl"),
+                if has_f16 {
+                    include_str!("shaders/linear_bwd_dw_f16.wgsl")
+                } else {
+                    include_str!("shaders/linear_bwd_dw.wgsl")
+                },
             ),
             linear_bwd_dx: make_pipeline(
                 &device,
                 "linear_bwd_dx",
-                include_str!("shaders/linear_bwd_dx.wgsl"),
+                if has_f16 {
+                    include_str!("shaders/linear_bwd_dx_f16.wgsl")
+                } else {
+                    include_str!("shaders/linear_bwd_dx.wgsl")
+                },
             ),
             rmsnorm_bwd_dx: make_pipeline(
                 &device,
@@ -298,6 +328,7 @@ impl GpuContext {
             params: ParamsPool::new(),
             adapter_summary,
             is_software,
+            has_f16,
         })
     }
 }

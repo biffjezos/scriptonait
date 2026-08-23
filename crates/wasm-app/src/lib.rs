@@ -465,13 +465,14 @@ impl WasmLLM {
         let training_bytes = gpu.trainer.as_ref().map(|t| t.allocated_bytes()).unwrap_or(0);
         format!(
             "{{\"available\":true,\"adapter\":{:?},\"backend\":{:?},\"deviceType\":{:?},\
-             \"isSoftware\":{},\"maxWorkgroupsPerDimension\":{},\
+             \"isSoftware\":{},\"f16\":{},\"maxWorkgroupsPerDimension\":{},\
              \"maxStorageBufferBindingSize\":{},\"maxBufferSize\":{},\
              \"trainingStateBytes\":{},\"trainerReady\":{}}}",
             ctx.adapter_name,
             ctx.backend,
             ctx.device_type,
             ctx.is_software,
+            ctx.has_f16,
             ctx.max_workgroups_per_dimension,
             ctx.max_storage_buffer_binding_size,
             ctx.max_buffer_size,
@@ -740,6 +741,12 @@ impl WasmLLM {
         // state belong to the old shape.
         inner.gpu = None;
         size as u32
+    }
+
+    /// Titles of sources whose text duplicates an earlier one. Training
+    /// on the same script twice weights it double.
+    pub fn duplicate_sources(&self) -> Vec<String> {
+        self.0.borrow().corpus.duplicate_sources()
     }
 
     pub fn vocab_size(&self) -> u32 {

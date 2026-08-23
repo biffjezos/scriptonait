@@ -159,6 +159,11 @@ export async function getSource(id) {
 // own tokenizer and shape, so nothing else has to be stored beside it.
 
 const CURRENT_MODEL = 'current';
+/// The model with the lowest held-out loss the run has seen. Training
+/// past its own best is normal - the best model of a run is rarely its
+/// last - so the best one is kept separately and never overwritten by a
+/// later, worse one.
+const BEST_MODEL = 'best';
 
 export async function putModel({ bytes, step, params, optimizer = null }) {
   // The optimizer's moment buffers ride along with the weights: a model
@@ -175,4 +180,21 @@ export async function getModel() {
 
 export async function deleteModel() {
   await withStore(MODELS_STORE, 'readwrite', (store) => store.delete(CURRENT_MODEL));
+}
+
+export async function putBestModel({ bytes, step, params, validationLoss }) {
+  const record = {
+    id: BEST_MODEL,
+    bytes,
+    step,
+    params,
+    validationLoss,
+    savedAt: Date.now(),
+  };
+  await withStore(MODELS_STORE, 'readwrite', (store) => store.put(record));
+  return record;
+}
+
+export async function getBestModel() {
+  return withStore(MODELS_STORE, 'readonly', (store) => store.get(BEST_MODEL));
 }
