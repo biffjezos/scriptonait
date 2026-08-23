@@ -81,6 +81,13 @@ struct Inner {
     /// `sync_from_gpu` when something needs it here.
     weights: ModelWeights,
     step: u64,
+    /// Tokens this model has been trained on, cumulative over every run.
+    ///
+    /// Not derivable from `step`: a step is one batch, and the batch
+    /// size changes between runs and between machines. This is counted
+    /// as it happens and carried in the checkpoint, because it — not the
+    /// step count — is what says how trained a model is.
+    tokens_seen: u64,
     /// The seed the model was built from, so a rebuild at a new
     /// vocabulary size starts from the same place.
     seed: u64,
@@ -371,6 +378,7 @@ impl WasmLLM {
             config: checkpoint.config,
             weights: checkpoint.weights,
             step: checkpoint.step,
+            tokens_seen: checkpoint.tokens_seen,
             seed: 1,
             rng: Rng::seed_from_u64(1),
             corpus: Corpus::with_tokenizer(checkpoint.tokenizer),
@@ -419,6 +427,7 @@ impl WasmLLM {
             config,
             weights: ModelWeights::init(&config, seed as u64),
             step: 0,
+            tokens_seen: 0,
             seed: seed as u64,
             rng: Rng::seed_from_u64(seed as u64),
             corpus: Corpus::with_tokenizer(tokenizer),
@@ -503,6 +512,12 @@ impl WasmLLM {
         let train = inner.train;
         let step = inner.step;
         let context_len = config.context_len;
+        // Characters as well as tokens, because the token count moves
+        // when the vocabulary is relearned and the character count does
+        // not. The same corpus reads as 6.5M tokens at a 4k vocabulary
+        // and 4.5M at an 8k one, and somebody watching that number
+        // change with no explanation is right to distrust all of them.
+        let corpus_chars = inner.corpus.total_chars();
         let training_tokens = inner.corpus.training_tokens();
         let validation_tokens = inner.corpus.validation_tokens();
         let mix = inner
@@ -520,7 +535,7 @@ impl WasmLLM {
              \"params\":{},\"layers\":{},\"hidden\":{},\"vocabSize\":{},\
              \"contextLen\":{},\"sources\":{},\"corpusTokens\":{},\
              \"trainingTokens\":{},\"validationTokens\":{},\"pretrained\":{},\
-             \"plateauScale\":{},\"mix\":[{}]}}",
+             \"plateauScale\":{},\"tokensSeen\":{},\"corpusChars\":{},\"mix\":[{}]}}",
             step,
             train.total_steps,
             train.warmup_steps,
@@ -540,6 +555,8 @@ impl WasmLLM {
             validation_tokens,
             inner.pretrained,
             train.plateau_scale,
+            inner.tokens_seen,
+            corpus_chars,
             mix,
         )
     }
@@ -1033,6 +1050,9 @@ impl WasmLLM {
 
         let inner = &mut *self.0.borrow_mut();
         inner.step += 1;
+        // The tokens this step actually consumed, not an estimate from
+        // the batch size the page happens to be set to.
+        inner.tokens_seen += report.tokens as u64;
         Ok(Some(StepReport {
             loss: report.loss,
             lr: report.lr,
@@ -1398,6 +1418,7 @@ impl WasmLLM {
             weights: inner.weights.clone(),
             tokenizer: inner.corpus.tokenizer().clone(),
             step: inner.step,
+            tokens_seen: inner.tokens_seen,
         };
         Ok(checkpoint.to_bytes_with(WeightDtype::Bf16))
     }
@@ -1411,6 +1432,7 @@ impl WasmLLM {
         inner.config = checkpoint.config;
         inner.weights = checkpoint.weights;
         inner.step = checkpoint.step;
+        inner.tokens_seen = checkpoint.tokens_seen;
         inner.corpus.set_tokenizer(checkpoint.tokenizer);
         inner.pretrained = true;
         // Both the uploaded generation weights and any resident training

@@ -248,7 +248,8 @@ function updateGuidance() {
     ? ''
     : machineProfile && profileShapeMatches(machineProfile)
       ? ' (measured on this machine)'
-      : ' (until this machine is measured)';
+      : ' — a fallback, not a measurement: press Train and this machine gets benchmarked first, ' +
+        'or type a number here';
   $('batch-hint').textContent =
     `Batch size costs time, not memory: the sequences of a batch run one at a time and their ` +
     `gradients add up. ${batch}${where} x ${context} = ` +
@@ -1035,22 +1036,38 @@ function renderPlan(plan) {
   $('plan-phase-detail').textContent = plan.phase.detail;
 
   const n = plan.numbers;
-  const parts = [];
-  parts.push(`step ${n.step.toLocaleString()}`);
-  if (n.plannedSteps > n.step) parts.push(`of ${n.plannedSteps.toLocaleString()} planned`);
-  parts.push(`${formatCount(n.tokensSeen)} tokens seen`);
-  if (n.epochs >= 0.05) parts.push(`${n.epochs.toFixed(1)}x over your text`);
-  parts.push(`${n.tokensPerParam.toFixed(1)} tokens per parameter`);
-  // Bits per byte is the loss in a form that can be compared with
-  // something: gzip is about 2.5 on English prose.
-  if (n.bitsPerByte > 0) parts.push(`${n.bitsPerByte.toFixed(2)} bits/byte`);
+  // Two lines, because they answer two different questions and running
+  // them together is how "0.3 tokens per parameter" ended up beside
+  // "1.17M tokens seen" as though they were the same kind of fact.
+  //
+  // First line: how much training has happened. Second: what there is
+  // to train on. Corpus size is given in characters as well as tokens,
+  // because the token count changes when the vocabulary is relearned
+  // and the character count does not - and a number that moves for
+  // reasons the user did not cause is a number they stop believing.
+  const progress = [`step ${n.step.toLocaleString()}`];
+  if (n.plannedSteps > n.step) progress.push(`of ${n.plannedSteps.toLocaleString()} planned`);
+  progress.push(
+    n.tokensSeen > 0
+      ? `${formatCount(n.tokensSeen)} tokens trained on`
+      : 'tokens trained on: not recorded for this model',
+  );
+  if (n.epochs >= 0.01) progress.push(`${n.epochs.toFixed(2)} passes over your text`);
+  if (n.bitsPerByte > 0) progress.push(`${n.bitsPerByte.toFixed(2)} bits/byte`);
   if (n.quality && n.quality.words > 0) {
-    parts.push(`${Math.round(n.quality.knownWordRate * 100)}% real words`);
+    progress.push(`${Math.round(n.quality.knownWordRate * 100)}% real words`);
   }
   if (n.etaSeconds !== null && n.etaSeconds > 0) {
-    parts.push(`about ${formatDuration(n.etaSeconds)} left`);
+    progress.push(`${formatDuration(n.etaSeconds)} left in this run`);
   }
-  $('plan-numbers').textContent = parts.join(' · ');
+
+  const corpus = [];
+  if (n.corpusChars > 0) corpus.push(`${formatCount(n.corpusChars)} characters`);
+  corpus.push(`${formatCount(n.trainingTokens)} tokens at this vocabulary`);
+  corpus.push(`${formatCount(n.params)} parameters`);
+
+  $('plan-numbers').textContent = `Trained: ${progress.join(' · ')}`;
+  $('plan-corpus').textContent = `Corpus: ${corpus.join(' · ')}`;
 
   const list = $('plan-actions');
   list.replaceChildren();
@@ -1248,7 +1265,21 @@ function chosenBatchSize() {
   const typed = Number($('train-batch').value);
   if (typed > 0) return typed;
   if (machineProfile && profileShapeMatches(machineProfile)) return machineProfile.batchSize;
+  // The fallback, and it is a bad one to take silently: batch 1 is a
+  // quarter of the throughput this machine can do, and a run left on it
+  // for four thousand steps has done a quarter of the training its step
+  // count suggests. Relearning the vocabulary rebuilds the model, which
+  // makes the stored profile's shape stop matching and lands here, so
+  // this is a real path and not a theoretical one.
   return 1;
+}
+
+/// True when "auto" is about to fall back rather than use a measurement.
+function batchSizeIsGuessed() {
+  return (
+    Number($('train-batch').value) <= 0 &&
+    !(machineProfile && profileShapeMatches(machineProfile))
+  );
 }
 
 /// Effort, when it is left on Auto.

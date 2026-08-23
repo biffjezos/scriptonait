@@ -315,11 +315,41 @@ async function trainingSample(prompt, words) {
 // keeps. It is recomputed on the validation cadence rather than every
 // step, because none of it moves faster than that.
 
-/// Roughly how many tokens a model of this size wants to see. The
-/// Chinchilla result is ~20 tokens per parameter for a compute-optimal
-/// run; it is a rule of thumb rather than a law, and it is the only
-/// honest yardstick for "is this corpus big enough for this model".
+/// Two different questions get confused constantly, and confusing them
+/// is how a training page ends up giving advice that contradicts itself
+/// from one visit to the next. They are:
+///
+///   1. **Has this model been trained enough yet?** Answered by tokens
+///      *seen* — how many tokens have gone through it, counting repeats.
+///      This is the number that governs early on, and it is almost
+///      always the binding one, because a run has to process tens of
+///      millions of tokens before anything reads like language.
+///   2. **Is there enough text for a model this size?** Answered by
+///      tokens *available*. This only binds once the first question is
+///      answered — a corpus cannot be the limit on a model that has
+///      barely been trained on it.
+///
+/// The 20-tokens-per-parameter figure below is from Hoffmann et al.
+/// (2022), and it is *not* a threshold below which a model cannot learn
+/// English. It says how to split a fixed compute budget between model
+/// size and data for one pass over that data. Below it you are not
+/// compute-optimal — you will reach diminishing returns sooner and
+/// overfit earlier — which is a different statement from "this will not
+/// work".
 const TOKENS_PER_PARAM = 20;
+
+/// How many passes over the same text are worth making. Muennighoff et
+/// al. (2023) found repeated data holds up well to about four epochs and
+/// decays after; past roughly sixteen it adds nearly nothing. Four is
+/// the number to plan a run against: a corpus is worth about four times
+/// its token count in useful training.
+const USEFUL_EPOCHS = 4;
+
+/// Below this many tokens seen, nothing about the corpus can be
+/// concluded — the model has not been trained enough for the corpus to
+/// be what is limiting it. Ten million is where a model this size
+/// starts producing sentences rather than words.
+const TOKENS_BEFORE_JUDGING_THE_CORPUS = 10e6;
 
 /// Which phase of a run this is, and what that means for what you are
 /// looking at.
@@ -375,6 +405,23 @@ function trainingPhase(plan, { heldOut, trainingLoss, stepsDone }) {
         '. More steps at this setting will not move it; something has to change.',
     };
   }
+  // Past the end of the plan the cosine has nothing left to decay: the
+  // rate is parked on its floor and stays there however long training
+  // continues. That is a different situation from the tail of a run, and
+  // calling both "cooling down" produced the sentence "down to 5.0e-5,
+  // near its floor of 5.0e-5", which says nothing at all.
+  if (plannedSteps > 0 && step >= plannedSteps) {
+    return {
+      key: 'past-plan',
+      title: 'Past the planned run',
+      detail:
+        `this model has done ${step.toLocaleString()} steps against a plan of ` +
+        `${plannedSteps.toLocaleString()}, so the schedule has run out and the rate is parked ` +
+        `on its floor, ${lrNow.toExponential(1)}. Training continues at that constant rate. ` +
+        'Setting Steps to the length you actually intend gives the cosine a shape to follow ' +
+        'again, and a warm-up-then-decay run reaches a lower loss than a flat one.',
+    };
+  }
   // The cosine tail: the last stretch of a planned run, where the rate
   // is close to its floor and the model is settling rather than moving.
   if (plannedSteps > 0 && lrNow <= peakLr * (minLrRatio + 0.05)) {
@@ -382,9 +429,11 @@ function trainingPhase(plan, { heldOut, trainingLoss, stepsDone }) {
       key: 'cooling',
       title: 'Cooling down',
       detail:
-        `the cosine schedule has taken the rate down to ${lrNow.toExponential(1)}, near its ` +
-        `floor of ${(peakLr * minLrRatio).toExponential(1)}. This is where a run consolidates: ` +
-        'small improvements, and the least noisy weights it will have.',
+        `the cosine schedule has taken the rate from ${peakLr.toExponential(1)} down to ` +
+        `${lrNow.toExponential(1)}, approaching its floor of ` +
+        `${(peakLr * minLrRatio).toExponential(1)} at step ${plannedSteps.toLocaleString()}. ` +
+        'This is where a run consolidates: small improvements, and the least noisy weights ' +
+        'it will have.',
     };
   }
   return {
@@ -402,16 +451,81 @@ function trainingPhase(plan, { heldOut, trainingLoss, stepsDone }) {
 
 /// What a person could actually do about it, most useful first.
 ///
-/// Every entry names a number and an action. "Add more text" on its own
-/// is not advice; "this corpus is 6.5M tokens for a model that wants
-/// 283M — roughly 40 more scripts" is.
-function planActions(plan, phase, { heldOut, trainingLoss, tokensPerStep, tokensSeen }) {
-  // Measurements taken from generated text, folded onto the plan object
-  // by buildPlan so this reads them from one place.
+/// The order here is the whole point, and getting it wrong is worse than
+/// saying nothing. An earlier version led with "your corpus is 43x too
+/// small for this model" at step 4,573 — which is a statement about
+/// compute-optimal allocation, presented as though it were a verdict on
+/// whether the thing can work, to somebody whose model had processed
+/// 0.3 passes of its text and was already producing English words.
+///
+/// So: training progress first, because until a model has actually been
+/// trained the corpus cannot be what is limiting it. The corpus second,
+/// and only once there is enough training behind it for the claim to
+/// mean anything.
+function planActions(plan, phase, { heldOut, trainingLoss, tokensSeen, tokensPerSecond }) {
   const actions = [];
-  const { params, trainingTokens, validationTokens, contextLen, mix } = plan;
-  const wanted = Math.round(params * TOKENS_PER_PARAM);
+  const { params, trainingTokens, validationTokens, contextLen } = plan;
   const round = (n) => Math.round(n).toLocaleString();
+  const duration = (seconds) => {
+    if (!isFinite(seconds) || seconds <= 0) return null;
+    if (seconds < 3600) return `${Math.round(seconds / 60)} minutes`;
+    if (seconds < 86400) return `${(seconds / 3600).toFixed(1)} hours`;
+    return `${(seconds / 86400).toFixed(1)} days`;
+  };
+
+  // What this corpus is worth in total: its tokens, times the number of
+  // passes over the same text that still teach something.
+  const budget = trainingTokens * USEFUL_EPOCHS;
+  const epochs = trainingTokens > 0 ? tokensSeen / trainingTokens : 0;
+
+  // 1. Is it trained yet? Almost always the answer early on, and the
+  //    only one that can be acted on by waiting.
+  if (tokensSeen < TOKENS_BEFORE_JUDGING_THE_CORPUS && tokensSeen < budget) {
+    const target = Math.min(TOKENS_BEFORE_JUDGING_THE_CORPUS, budget);
+    const remaining = target - tokensSeen;
+    const eta = tokensPerSecond > 0 ? duration(remaining / tokensPerSecond) : null;
+    actions.push({
+      key: 'keep-training',
+      urgency: 'high',
+      text:
+        `This model has seen ${round(tokensSeen)} tokens — ${epochs.toFixed(2)} passes over ` +
+        'your text. That is early: a model this size needs tens of millions of tokens through ' +
+        `it before it writes sentences rather than words. Keep training to about ` +
+        `${round(target)} tokens seen` +
+        (eta ? ` — roughly ${eta} at the speed this machine is running` : '') +
+        '. Nothing about the corpus can be judged before then.',
+    });
+  }
+
+  // 2. Only now: is there enough text for a model this size? Judged
+  //    against what repeated passes are worth, not against a single
+  //    pass, because this run makes several.
+  const judged = tokensSeen >= TOKENS_BEFORE_JUDGING_THE_CORPUS ||
+    phase.key === 'overfitting' ||
+    phase.key === 'plateau';
+  const wanted = params * TOKENS_PER_PARAM;
+  if (judged && trainingTokens > 0 && budget < wanted) {
+    const perSource = plan.sources > 0 ? plan.corpusTokens / plan.sources : 0;
+    const moreSources = perSource > 0 ? Math.ceil((wanted - budget) / (perSource * USEFUL_EPOCHS)) : 0;
+    // The model size this corpus supports, at the same rule — stated as
+    // the trade it is, not as an instruction. A smaller model reaches
+    // its best sooner and that best is lower; which one is wanted is
+    // not something a page can decide.
+    const supported = budget / TOKENS_PER_PARAM;
+    actions.push({
+      key: 'corpus-size',
+      urgency: phase.key === 'overfitting' ? 'high' : 'normal',
+      text:
+        `${round(trainingTokens)} training tokens, worth about ${round(budget)} over the ` +
+        `${USEFUL_EPOCHS} passes that repeated text is still useful for. A ${round(params)}-` +
+        'parameter model is compute-optimally matched to about ' +
+        `${round(wanted)} (Hoffmann et al., 20 tokens per parameter) — a rule for splitting a ` +
+        'compute budget, not a threshold for whether it works. Below it the model reaches its ' +
+        'best sooner and overfits after. Either roughly ' +
+        `${round(moreSources)} more sources the size of yours, or a model nearer ` +
+        `${round(supported)} parameters, which would be worse at its best but would get there.`,
+    });
+  }
 
   if (validationTokens < contextLen + 1) {
     actions.push({
@@ -424,28 +538,11 @@ function planActions(plan, phase, { heldOut, trainingLoss, tokensPerStep, tokens
     });
   }
 
-  if (trainingTokens > 0 && trainingTokens < wanted) {
-    const ratio = trainingTokens / params;
-    // Sized from what is already loaded rather than from an assumed
-    // script length: their scripts are the right unit of "more".
-    const perSource = plan.sources > 0 ? plan.corpusTokens / plan.sources : 0;
-    const moreSources = perSource > 0 ? Math.ceil((wanted - trainingTokens) / perSource) : 0;
-    actions.push({
-      key: 'corpus-size',
-      urgency: phase.key === 'overfitting' || phase.key === 'plateau' ? 'high' : 'normal',
-      text:
-        `${round(trainingTokens)} training tokens for ${round(params)} parameters is ` +
-        `${ratio.toFixed(1)} tokens per parameter; the rule of thumb is ${TOKENS_PER_PARAM}, so ` +
-        `this model wants about ${round(wanted)}. Either add roughly ${round(moreSources)} more ` +
-        `sources the size of the ones already loaded, or build a smaller model — ` +
-        `${round(trainingTokens / TOKENS_PER_PARAM)} parameters is what this corpus supports.`,
-    });
-  }
-
   // What kind of text is missing. A corpus that is all one thing teaches
   // the shape of that thing: thirty scripts teach a model that every
   // paragraph is one line of dialogue long.
-  if (Array.isArray(mix) && mix.length > 0 && plan.corpusTokens > 0) {
+  const mix = plan.mix;
+  if (judged && Array.isArray(mix) && mix.length > 0 && plan.corpusTokens > 0) {
     const largest = mix[0];
     const share = largest.tokens / plan.corpusTokens;
     if (share > 0.8) {
@@ -465,6 +562,18 @@ function planActions(plan, phase, { heldOut, trainingLoss, tokensPerStep, tokens
     }
   }
 
+  if (phase.key === 'past-plan') {
+    actions.push({
+      key: 'set-a-plan',
+      urgency: 'normal',
+      text:
+        'The run is past the number of steps its schedule was shaped for, so the learning rate ' +
+        'is flat at its floor. Set Steps to the length you actually intend — a run that warms ' +
+        'up and then decays over its own length reaches a lower loss than one held at a ' +
+        'constant small rate.',
+    });
+  }
+
   if (phase.key === 'overfitting') {
     actions.push({
       key: 'stop-here',
@@ -472,16 +581,6 @@ function planActions(plan, phase, { heldOut, trainingLoss, tokensPerStep, tokens
       text:
         'Stop this run and go back to the best model, or add text and keep training. ' +
         'Continuing without either only makes it worse.',
-    });
-  }
-  if (plan.plateauScale <= 0.06) {
-    actions.push({
-      key: 'plateau-floor',
-      urgency: 'high',
-      text:
-        `The learning rate has been cut to ${plan.plateauScale.toFixed(2)}x the schedule and ` +
-        'held-out loss still is not improving. Cutting it further is not the answer: at this ' +
-        'point the limit is the corpus or the shape of the model, not the rate.',
     });
   }
   if (phase.key === 'plateau') {
@@ -499,10 +598,19 @@ function planActions(plan, phase, { heldOut, trainingLoss, tokensPerStep, tokens
     });
   }
 
+  if (plan.plateauScale <= 0.06) {
+    actions.push({
+      key: 'plateau-floor',
+      urgency: 'high',
+      text:
+        `The learning rate has been cut to ${plan.plateauScale.toFixed(2)}x the schedule and ` +
+        'held-out loss still is not improving. Cutting it further is not the answer: at this ' +
+        'point the limit is the corpus or the shape of the model, not the rate.',
+    });
+  }
+
   // What the samples themselves say. Loss can fall for a long time
-  // while the output is still not words, and that is exactly the
-  // situation where somebody stares at a falling curve and wonders why
-  // nothing reads like English.
+  // while the output is still not words.
   const q = plan.quality;
   if (q && q.words >= 20) {
     if (q.knownWordRate < 0.75) {
@@ -516,9 +624,7 @@ function planActions(plan, phase, { heldOut, trainingLoss, tokensPerStep, tokens
           (q.unknownExamples && q.unknownExamples.length
             ? ` (${q.unknownExamples.slice(0, 4).join(', ')})`
             : '') +
-          '. That is normal early and it is the first thing that should improve; if the loss ' +
-          'is falling and this is not, the tokenizer or the corpus is the problem, not the ' +
-          'number of steps.',
+          '. Expected this early; it is the first thing that should improve.',
       });
     }
     if (q.repeated4gramRate > 0.25) {
@@ -534,19 +640,17 @@ function planActions(plan, phase, { heldOut, trainingLoss, tokensPerStep, tokens
     }
   }
 
-  // How many times the run has been over the same text. Past a few
-  // passes a small corpus is being memorized whatever the loss says.
-  if (trainingTokens > 0 && tokensSeen > 0) {
-    const epochs = tokensSeen / trainingTokens;
-    if (epochs >= 2) {
-      actions.push({
-        key: 'epochs',
-        urgency: epochs >= 4 ? 'high' : 'normal',
-        text:
-          `This model has been over your text ${epochs.toFixed(1)} times. Repeated passes are ` +
-          'how a small corpus gets memorized; each further pass buys less than the last.',
-      });
-    }
+  // Repeated passes stop paying somewhere past four. Said once the run
+  // is actually there, not as a warning about a run that has done 0.3.
+  if (epochs >= USEFUL_EPOCHS) {
+    actions.push({
+      key: 'epochs',
+      urgency: epochs >= USEFUL_EPOCHS * 4 ? 'high' : 'normal',
+      text:
+        `This model has been over your text ${epochs.toFixed(1)} times. Repeated passes hold up ` +
+        `to about ${USEFUL_EPOCHS} (Muennighoff et al., 2023) and give back less after; past ` +
+        'that, more text does more than more steps.',
+    });
   }
 
   return actions;
@@ -559,14 +663,18 @@ function buildPlan(state) {
   plan.bitsPerByte = state.bitsPerByte || 0;
   const phase = trainingPhase(plan, state);
   const tokensPerStep = state.tokensPerStep || plan.contextLen;
-  // Tokens this model has seen over its whole life, not just this run.
-  // Approximate on purpose: earlier runs may have used a different batch
-  // size, and the step count is all that survives them.
-  const tokensSeen = plan.step * tokensPerStep;
+  // Counted as it happened, on the wasm side, and carried in the
+  // checkpoint. It used to be `step * whatever the batch size is now`,
+  // which is wrong twice: the batch size changes between runs, and the
+  // page's current setting has nothing to do with what earlier steps
+  // actually processed. A model trained at batch 4 and then looked at
+  // with the box set to 1 reported a quarter of its real training.
+  const tokensSeen = plan.tokensSeen;
   const remaining = plan.plannedSteps > plan.step ? plan.plannedSteps - plan.step : 0;
+  const tokensPerSecond = state.msPerStep > 0 ? tokensPerStep / (state.msPerStep / 1000) : 0;
   return {
     phase,
-    actions: planActions(plan, phase, { ...state, tokensPerStep, tokensSeen }),
+    actions: planActions(plan, phase, { ...state, tokensPerStep, tokensSeen, tokensPerSecond }),
     numbers: {
       step: plan.step,
       plannedSteps: plan.plannedSteps,
@@ -581,6 +689,8 @@ function buildPlan(state) {
       tokensPerParam: plan.params > 0 ? plan.trainingTokens / plan.params : 0,
       wantedTokens: Math.round(plan.params * TOKENS_PER_PARAM),
       epochs: plan.trainingTokens > 0 ? tokensSeen / plan.trainingTokens : 0,
+      corpusChars: plan.corpusChars,
+      tokensPerSecond,
       etaSeconds: state.msPerStep > 0 ? (remaining * state.msPerStep) / 1000 : null,
       mix: plan.mix,
       sources: plan.sources,
@@ -785,6 +895,13 @@ async function train({ batchSize, learningRate, maxSteps, effort, sampleEvery, s
   llm.set_planned_steps(maxSteps > 0 ? maxSteps : 2000);
 
   const info = llm.info();
+  if (batchSize <= 1) {
+    log(
+      `training at batch size ${batchSize}: ${batchSize * info.context_len} tokens per step. ` +
+        'That is the smallest batch there is — if this was not deliberate, the machine ' +
+        'benchmark has not run for this model shape and the page fell back to it.',
+    );
+  }
   log('training run starting', {
     device: llm.device_summary(),
     softwareRenderer: llm.gpu_is_software(),

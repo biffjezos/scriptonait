@@ -16,6 +16,7 @@
 //!   f32     rope_theta
 //!   u32     use_ple (0/1)
 //!   u64     training step the weights are from
+//!   u64     tokens this model has been trained on, cumulative (v3+)
 //!   u32     weight dtype: 0 = f32, 1 = bf16
 //!   u32     tokenizer length, then that many bytes (see tokenizer.rs)
 //!   u32     weight length in bytes, then the weights
@@ -43,7 +44,11 @@ use crate::model::ModelWeights;
 use crate::tokenizer::Tokenizer;
 
 const MAGIC: &[u8; 4] = b"SCCK";
-const VERSION: u32 = 2;
+/// Version 3 added the cumulative token count. Version 2 files still
+/// load; their token count is unknown rather than zero, and the page
+/// says so instead of reporting a number it does not have.
+const VERSION: u32 = 3;
+const MIN_READABLE_VERSION: u32 = 2;
 
 /// How the weights are stored in a checkpoint file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -96,6 +101,17 @@ pub struct Checkpoint {
     /// learning-rate schedule back up where it left off instead of
     /// restarting warmup.
     pub step: u64,
+    /// Tokens this model has been trained on, summed over every step of
+    /// every run, and 0 when the file predates the count.
+    ///
+    /// The step count cannot stand in for this. A step is one batch, and
+    /// a batch is however many sequences the machine could afford that
+    /// day — so "step 4,573" means four times as much training at batch
+    /// four as at batch one, and multiplying the step count by whatever
+    /// the batch size happens to be *now* gets both runs wrong. This is
+    /// the number that actually says how trained a model is, so it is
+    /// counted as it happens and carried with the weights.
+    pub tokens_seen: u64,
 }
 
 impl Checkpoint {
@@ -135,6 +151,7 @@ impl Checkpoint {
         out.extend_from_slice(&self.config.rope_theta.to_le_bytes());
         out.extend_from_slice(&u32::from(self.config.use_ple).to_le_bytes());
         out.extend_from_slice(&self.step.to_le_bytes());
+        out.extend_from_slice(&self.tokens_seen.to_le_bytes());
         out.extend_from_slice(&dtype.tag().to_le_bytes());
         out.extend_from_slice(&(tokenizer_bytes.len() as u32).to_le_bytes());
         out.extend_from_slice(&tokenizer_bytes);
@@ -149,8 +166,10 @@ impl Checkpoint {
             return Err("not a scriptonait checkpoint".to_string());
         }
         let version = r.u32()?;
-        if version != VERSION {
-            return Err(format!("checkpoint format version {version}, expected {VERSION}"));
+        if !(MIN_READABLE_VERSION..=VERSION).contains(&version) {
+            return Err(format!(
+                "checkpoint format version {version}, expected {MIN_READABLE_VERSION} to {VERSION}"
+            ));
         }
         let config = ModelConfig {
             num_layers: r.u32()? as usize,
@@ -165,6 +184,9 @@ impl Checkpoint {
         };
         config.validate().map_err(|e| format!("checkpoint config is invalid: {e}"))?;
         let step = r.u64()?;
+        // Absent before version 3. Zero reads as "not recorded" rather
+        // than as "trained on nothing", and the page distinguishes them.
+        let tokens_seen = if version >= 3 { r.u64()? } else { 0 };
         let dtype = WeightDtype::from_tag(r.u32()?)?;
 
         let tokenizer_len = r.u32()? as usize;
@@ -197,7 +219,7 @@ impl Checkpoint {
                 ModelWeights::from_bytes(&widened, &config)?
             }
         };
-        Ok(Checkpoint { config, weights, tokenizer, step })
+        Ok(Checkpoint { config, weights, tokenizer, step, tokens_seen })
     }
 }
 
@@ -251,7 +273,7 @@ mod tests {
             use_ple: false,
         };
         let weights = ModelWeights::init(&config, 5);
-        Checkpoint { config, weights, tokenizer, step: 4242 }
+        Checkpoint { config, weights, tokenizer, step: 4242, tokens_seen: 9_000_000 }
     }
 
     #[test]
@@ -260,8 +282,24 @@ mod tests {
         let restored = Checkpoint::from_bytes(&original.to_bytes()).unwrap();
         assert_eq!(restored.config, original.config);
         assert_eq!(restored.step, original.step);
+        assert_eq!(restored.tokens_seen, original.tokens_seen);
         assert_eq!(restored.weights.to_bytes(), original.weights.to_bytes());
         assert_eq!(restored.tokenizer.to_bytes(), original.tokenizer.to_bytes());
+    }
+
+    /// A file written before the token count existed still loads, and
+    /// reads as "not recorded" rather than as a wrong number.
+    #[test]
+    fn a_version_2_checkpoint_still_loads() {
+        let mut bytes = sample().to_bytes();
+        // Rewrite the version and cut the u64 that version 2 did not
+        // have, which sits directly after the step.
+        bytes[4..8].copy_from_slice(&2u32.to_le_bytes());
+        let step_at = 8 + 7 * 4 + 4 + 4;
+        bytes.drain(step_at + 8..step_at + 16);
+        let restored = Checkpoint::from_bytes(&bytes).expect("version 2 should still load");
+        assert_eq!(restored.step, 4242);
+        assert_eq!(restored.tokens_seen, 0);
     }
 
     #[test]

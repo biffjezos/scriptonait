@@ -321,6 +321,16 @@ impl Corpus {
         built
     }
 
+    /// Characters of cleaned text across every source.
+    ///
+    /// The stable measure of "how much text is there". The token count
+    /// is not: relearning the vocabulary re-encodes the same text into a
+    /// different number of tokens, and a number that moves for reasons
+    /// the user did not cause is a number they stop believing.
+    pub fn total_chars(&self) -> usize {
+        self.cleaned_text.values().map(|t| t.chars().count()).sum()
+    }
+
     /// Bytes of cleaned text per token, over the whole corpus.
     ///
     /// This is what turns a loss per token into bits per byte, which is
