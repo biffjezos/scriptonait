@@ -45,6 +45,23 @@ const PROGRESS_INTERVAL_MS = 250;
 /// stored profile from an older build is re-measured instead of trusted.
 const BENCH_VERSION = 1;
 
+/// How many held-out measurements may pass with no new best before the
+/// learning rate is cut. Four, at one measurement every twenty-five
+/// steps, is a hundred steps of no progress — long enough not to react
+/// to the noise in a single measurement, short enough not to spend an
+/// afternoon on a rate that is too large.
+const PLATEAU_PATIENCE = 4;
+/// What a cut multiplies the rate by, and how far the cuts may go in
+/// total. Halving is the standard move; a run that has fallen to a
+/// twentieth of its schedule has a problem another cut will not fix.
+const PLATEAU_FACTOR = 0.5;
+const PLATEAU_FLOOR = 0.05;
+/// How much better a measurement has to be to count as better at all.
+/// Held-out loss wobbles by a few thousandths between measurements on a
+/// corpus this size; without a threshold the patience counter resets on
+/// noise and the rate is never cut.
+const PLATEAU_MIN_DELTA = 0.005;
+
 function post(type, payload = {}) {
   self.postMessage({ type, ...payload });
 }
@@ -374,7 +391,11 @@ function trainingPhase(plan, { heldOut, trainingLoss, stepsDone }) {
     key: 'learning',
     title: 'Learning',
     detail:
-      `past warm-up, rate ${lrNow.toExponential(1)}, held-out loss still improving` +
+      `past warm-up, rate ${lrNow.toExponential(1)}` +
+      (plan.plateauScale < 1
+        ? ` (cut to ${plan.plateauScale.toFixed(2)}x the schedule after a plateau)`
+        : '') +
+      ', held-out loss still improving' +
       (stepsDone > 0 ? ` — ${stepsDone.toLocaleString()} steps into this run.` : '.'),
   };
 }
@@ -451,6 +472,16 @@ function planActions(plan, phase, { heldOut, trainingLoss, tokensPerStep, tokens
       text:
         'Stop this run and go back to the best model, or add text and keep training. ' +
         'Continuing without either only makes it worse.',
+    });
+  }
+  if (plan.plateauScale <= 0.06) {
+    actions.push({
+      key: 'plateau-floor',
+      urgency: 'high',
+      text:
+        `The learning rate has been cut to ${plan.plateauScale.toFixed(2)}x the schedule and ` +
+        'held-out loss still is not improving. Cutting it further is not the answer: at this ' +
+        'point the limit is the corpus or the shape of the model, not the rate.',
     });
   }
   if (phase.key === 'plateau') {
@@ -553,6 +584,7 @@ function buildPlan(state) {
       etaSeconds: state.msPerStep > 0 ? (remaining * state.msPerStep) / 1000 : null,
       mix: plan.mix,
       sources: plan.sources,
+      plateauScale: plan.plateauScale,
       bitsPerByte: plan.bitsPerByte,
       quality: plan.quality,
     },
@@ -763,6 +795,7 @@ async function train({ batchSize, learningRate, maxSteps, effort, sampleEvery, s
     maxSteps: maxSteps || 'until stopped',
     effort,
     learningRate: learningRate > 0 ? learningRate : 'automatic',
+    plateauScale: llm.plateau_scale(),
     params: info.params,
   });
 
@@ -796,6 +829,9 @@ async function train({ batchSize, learningRate, maxSteps, effort, sampleEvery, s
   /// is produced.
   let lastQuality = null;
   let lastBitsPerByte = 0;
+  // Held-out measurements since the last one that was actually better.
+  let sinceImprovement = 0;
+  let bestSeen = null;
   // Median-ish step cost, for the estimate of how long the rest takes.
   let recentStepMs = null;
 
@@ -881,6 +917,43 @@ async function train({ batchSize, learningRate, maxSteps, effort, sampleEvery, s
               (bpb > 0 ? `, ${bpb.toFixed(3)} bits per byte` : ''),
           );
           lastBitsPerByte = bpb;
+
+          // Plateau detection. A cosine schedule decays on a plan; it
+          // has no idea whether the run is following it. When held-out
+          // loss stops improving, the usual cause is steps too large to
+          // settle into the minimum the model is circling, and the
+          // usual answer is to cut the rate and let it.
+          if (bestSeen === null || measured < bestSeen - PLATEAU_MIN_DELTA) {
+            bestSeen = measured;
+            sinceImprovement = 0;
+          } else {
+            sinceImprovement += 1;
+            if (sinceImprovement >= PLATEAU_PATIENCE) {
+              sinceImprovement = 0;
+              const before = llm.plateau_scale();
+              const after = llm.decay_on_plateau(PLATEAU_FACTOR, PLATEAU_FLOOR);
+              if (after < before) {
+                log(
+                  `plateau: ${PLATEAU_PATIENCE} held-out measurements with no improvement past ` +
+                    `${bestSeen.toFixed(4)} — cutting the learning rate to ${after.toFixed(2)}x ` +
+                    `the schedule (was ${before.toFixed(2)}x)`,
+                );
+                post('train-advice', {
+                  step: llm.step(),
+                  advice:
+                    `held-out loss has not improved in ${PLATEAU_PATIENCE} measurements, so the ` +
+                    `learning rate has been cut to ${after.toFixed(2)}x the schedule. If it ` +
+                    'does not start improving again, the corpus is the limit, not the rate.',
+                });
+              } else {
+                log(
+                  `plateau: the learning rate is already at its floor (${after.toFixed(2)}x the ` +
+                    'schedule) and held-out loss is still not improving. More text, or a ' +
+                    'different model shape — not a smaller rate.',
+                );
+              }
+            }
+          }
           // A run's best model is rarely its last, and training past the
           // best is exactly what a small corpus makes it do. Tell the
           // page whenever this is the best held-out loss so far so it can
@@ -1081,6 +1154,9 @@ const handlers = {
   },
 
   async 'upsert-source'(payload) {
+    // More text is a different problem from the one the last plateau
+    // was found on: whatever cut the rate then does not apply now.
+    llm.reset_plateau_scale();
     const stats = llm.upsert_source(
       text(payload.id, 'the source id'),
       text(payload.text, `the text of source ${payload.id}`),
@@ -1095,6 +1171,7 @@ const handlers = {
   },
 
   async 'remove-source'({ id }) {
+    llm.reset_plateau_scale();
     llm.remove_source(text(id, 'the source id'));
     return describeModel();
   },

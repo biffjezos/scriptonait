@@ -35,6 +35,12 @@ device the page says so and does not train.
   moment buffers stay in GPU memory between steps.
 - AdamW with decoupled weight decay, global gradient-norm clipping, and a
   cosine schedule with warmup shaped to the run length you asked for.
+- Plateau detection: when held-out loss goes four measurements without
+  improving, the learning rate is halved on top of the schedule, down to
+  a floor. The cosine says where the plan expected to be; this says what
+  the run actually needed, and the two are kept separate so both are
+  readable. At the floor the page says so rather than cutting again —
+  by then the limit is the corpus, not the rate.
 - Model shape is yours to set: layers, hidden size, heads, KV heads,
   context length, attention window. So are steps, batch size, learning
   rate, and an effort setting that decides how much of the machine the
