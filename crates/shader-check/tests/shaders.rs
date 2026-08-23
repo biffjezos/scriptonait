@@ -55,7 +55,7 @@ fn every_shader_parses_and_validates() {
         // rather than wait for a machine that has it.
         let mut validator = naga::valid::Validator::new(
             naga::valid::ValidationFlags::all(),
-            naga::valid::Capabilities::default() | naga::valid::Capabilities::SHADER_F16,
+            naga::valid::Capabilities::default() | naga::valid::Capabilities::SHADER_FLOAT16,
         );
         if let Err(err) = validator.validate(&module) {
             failures.push(format!("{name}: validation error\n{}", err.emit_to_string(&source)));
