@@ -305,6 +305,12 @@ async function train({ batchSize, learningRate, maxSteps, effort, sampleEvery, s
   // First sample after the first interval, not immediately: a sample at
   // step 0 is noise from an untouched model.
   let nextSampleAt = llm.step() + (sampleEvery || 0);
+  // Held-out loss on the same cadence as the loss chart's own reporting:
+  // often enough to see the two curves separate, rare enough that its
+  // forward passes are a rounding error against training.
+  const validateEvery = 25;
+  let nextValidateAt = llm.step() + validateEvery;
+  let validationLoss = null;
 
   while (!stopRequested && (maxSteps <= 0 || steps < maxSteps)) {
     const sliceStart = performance.now();
@@ -347,6 +353,7 @@ async function train({ batchSize, learningRate, maxSteps, effort, sampleEvery, s
           steps,
           loss: report.loss,
           smoothedLoss,
+          validationLoss,
           lr: report.lr,
           gradNorm: report.grad_norm,
           elapsedSeconds: elapsed,
@@ -355,6 +362,24 @@ async function train({ batchSize, learningRate, maxSteps, effort, sampleEvery, s
         });
       }
       if (stopRequested || (maxSteps > 0 && steps >= maxSteps)) break;
+    }
+
+    // Held-out loss, between slices for the same reason sampling is.
+    if (llm.step() >= nextValidateAt) {
+      nextValidateAt = llm.step() + validateEvery;
+      try {
+        const measured = await llm.validation_loss(batchSize);
+        if (measured >= 0) {
+          validationLoss = measured;
+          const gap = smoothedLoss === null ? null : measured - smoothedLoss;
+          log(
+            `step ${llm.step().toLocaleString()}: held-out loss ${measured.toFixed(4)}` +
+              (gap === null ? '' : ` (training ${smoothedLoss.toFixed(4)}, gap ${gap.toFixed(4)})`),
+          );
+        }
+      } catch (error) {
+        log(`held-out loss failed: ${(error && error.message) || error}`);
+      }
     }
 
     // Between slices, never inside one: sampling takes as long as it
@@ -448,6 +473,19 @@ const handlers = {
   async 'export-checkpoint'() {
     const bytes = await llm.export_checkpoint();
     return { bytes: bytes.buffer, byteLength: bytes.length };
+  },
+
+  /// The Adam moment buffers, for the page to store beside the
+  /// checkpoint. Weights alone resume with the momentum reset, and the
+  /// loss jumps every time.
+  async 'export-optimizer'() {
+    const bytes = await llm.export_optimizer();
+    return { bytes: bytes.buffer, byteLength: bytes.length };
+  },
+
+  async 'import-optimizer'({ bytes }) {
+    await llm.import_optimizer(new Uint8Array(bytes));
+    return { restored: true };
   },
 
   async 'model-info'() {

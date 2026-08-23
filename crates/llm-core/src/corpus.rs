@@ -25,6 +25,12 @@ use crate::tokenizer::{self, Tokenizer};
 /// keeps seeing ordinary mid-document continuations too.
 const BOUNDARY_ALIGNED_SAMPLE_RATE: f32 = 0.4;
 
+/// Fraction of the corpus held out of training, to measure loss on text
+/// the model has never been shown. Five percent is enough to be a
+/// meaningful sample of a corpus this size while costing almost nothing
+/// in training data.
+const VALIDATION_FRACTION: f32 = 0.05;
+
 pub struct Corpus {
     sources: HashMap<String, Vec<u32>>,
     cleaned_text: HashMap<String, String>,
@@ -263,6 +269,58 @@ impl Corpus {
         self.flat_cache.len() > context_len
     }
 
+    /// Where the training data ends and the held-out data begins.
+    ///
+    /// The last `VALIDATION_FRACTION` of the corpus is never trained on,
+    /// so the loss measured there says whether the model is learning the
+    /// language or memorizing the sample - which training loss alone
+    /// cannot tell you. It is the tail rather than a random selection of
+    /// windows because windows overlap: a randomly held-out window would
+    /// share most of its tokens with a trained one, and report as
+    /// "unseen" text the model has in fact seen.
+    fn split_point(&self, context_len: usize) -> usize {
+        let total = self.flat_cache.len();
+        let held_out = ((total as f32 * VALIDATION_FRACTION) as usize).max(context_len + 1);
+        // Never hold out so much that training has nothing left.
+        if total < (context_len + 1) * 4 {
+            return total;
+        }
+        total - held_out.min(total / 2)
+    }
+
+    /// Whether there is enough text for a held-out split at all.
+    pub fn can_validate(&mut self, context_len: usize) -> bool {
+        self.rebuild_flat_if_needed();
+        let split = self.split_point(context_len);
+        split < self.flat_cache.len() && self.flat_cache.len() - split > context_len
+    }
+
+    /// A batch drawn from the held-out tail, for measuring validation
+    /// loss. Deterministic given `rng`, and never overlapping the
+    /// windows `sample_batch` can return.
+    pub fn sample_validation_batch(
+        &mut self,
+        batch_size: usize,
+        context_len: usize,
+        rng: &mut Rng,
+    ) -> Option<Batch> {
+        self.rebuild_flat_if_needed();
+        let split = self.split_point(context_len);
+        let available = self.flat_cache.len().checked_sub(split)?;
+        if available <= context_len + 1 {
+            return None;
+        }
+        let max_start = available - context_len - 1;
+        let mut inputs = Vec::with_capacity(batch_size * context_len);
+        let mut targets = Vec::with_capacity(batch_size * context_len);
+        for _ in 0..batch_size {
+            let start = split + rng.gen_range(max_start + 1);
+            inputs.extend_from_slice(&self.flat_cache[start..start + context_len]);
+            targets.extend_from_slice(&self.flat_cache[start + 1..start + 1 + context_len]);
+        }
+        Some(Batch { inputs, targets, batch_size, context_len })
+    }
+
     /// Sample a batch of `(input, target)` windows for next-token
     /// prediction. `inputs`/`targets` are flattened row-major
     /// `[batch_size * context_len]` arrays; `targets[i]` is `inputs[i]`
@@ -280,7 +338,13 @@ impl Corpus {
         if self.flat_cache.len() <= context_len {
             return None;
         }
-        let max_start = self.flat_cache.len() - context_len - 1;
+        // Training windows stop at the split: everything after it is the
+        // held-out tail.
+        let train_end = self.split_point(context_len);
+        if train_end <= context_len + 1 {
+            return None;
+        }
+        let max_start = train_end - context_len - 1;
         let boundary_starts: Vec<usize> = self.boundaries.iter().copied().filter(|&b| b <= max_start).collect();
 
         let mut inputs = Vec::with_capacity(batch_size * context_len);
@@ -383,6 +447,39 @@ mod tests {
         assert_eq!(suggested_vocab_size(2_000), 512);
         assert!(suggested_vocab_size(200_000) > 1_000);
         assert!(suggested_vocab_size(5_000_000) > 4_096);
+    }
+
+    #[test]
+    fn validation_windows_never_overlap_training_windows() {
+        let mut c = Corpus::new();
+        // Distinct text so an overlap would be visible, and long enough
+        // for a real split.
+        c.upsert("a", &"the quick brown fox jumps over the lazy dog ".repeat(200), false);
+        let context = 32;
+        assert!(c.can_validate(context));
+        let mut rng = Rng::seed_from_u64(4);
+
+        let split = {
+            c.rebuild_flat_if_needed();
+            c.split_point(context)
+        };
+        for _ in 0..20 {
+            let train = c.sample_batch(2, context, &mut rng).expect("train batch");
+            assert_eq!(train.inputs.len(), 2 * context);
+            let val = c.sample_validation_batch(2, context, &mut rng).expect("val batch");
+            assert_eq!(val.inputs.len(), 2 * context);
+        }
+        assert!(split > 0 && split < c.total_tokens(), "split sits inside the corpus");
+    }
+
+    #[test]
+    fn a_tiny_corpus_has_no_validation_split() {
+        let mut c = Corpus::new();
+        c.upsert("a", "the quick brown fox jumps over the lazy dog", false);
+        assert!(!c.can_validate(32), "too little text to hold any out");
+        // ...and training still works.
+        let mut rng = Rng::seed_from_u64(1);
+        assert!(c.sample_batch(1, 4, &mut rng).is_some());
     }
 
     #[test]

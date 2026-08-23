@@ -338,6 +338,19 @@ impl AdamState {
         out
     }
 
+    /// Build the state from moment buffers held elsewhere — the GPU
+    /// trainer keeps its own on the device and downloads them to save.
+    pub fn from_parts(m: ModelWeights, v: ModelWeights, t: i32) -> Self {
+        let decay = m.decay_flags();
+        Self { m, v, t, decay }
+    }
+
+    /// The moment buffers and the step count, for a caller that has to
+    /// upload them somewhere.
+    pub fn parts(&self) -> (&ModelWeights, &ModelWeights, i32) {
+        (&self.m, &self.v, self.t)
+    }
+
     pub fn from_bytes(bytes: &[u8], config: &ModelConfig) -> Result<Self, String> {
         if bytes.len() < 8 {
             return Err("optimizer state truncated".to_string());
