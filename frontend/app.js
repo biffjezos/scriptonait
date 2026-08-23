@@ -967,6 +967,7 @@ $('train-btn').addEventListener('click', async () => {
       notify('Training finished', `${result.steps} steps, loss ${loss}.`);
     }
     if (result.model) renderModel(result.model);
+    await saveModel();
   } catch (error) {
     showError(error);
   } finally {
@@ -1055,6 +1056,53 @@ window.scriptonait = {
     }),
 };
 
+/// Write the trained model to IndexedDB.
+///
+/// A run is hours of someone's GPU and it lived in the tab only: a
+/// reload threw it away without asking. Saved after every training run,
+/// so the most that can be lost is the run you are in.
+async function saveModel() {
+  if (!model) return;
+  try {
+    const started = performance.now();
+    const { bytes } = await call('export-checkpoint');
+    await db.putModel({ bytes, step: model.step, params: model.params });
+    console.info(
+      `[scriptonait] saved the model (${formatCount(bytes.byteLength)} bytes, ` +
+        `step ${model.step.toLocaleString()}) in ${(performance.now() - started).toFixed(0)} ms`,
+    );
+  } catch (error) {
+    // Storage can be full or denied; that must not cost you the run
+    // you just did, so it is a warning rather than an error.
+    console.warn('[scriptonait] could not save the model:', error);
+    showError(
+      `the model could not be saved (${(error && error.message) || error}). ` +
+        'It is still loaded — use "Save this model to a file" to keep it.',
+    );
+  }
+}
+
+/// Load the model saved by an earlier visit, if there is one.
+async function restoreModel() {
+  let stored = null;
+  try {
+    stored = await db.getModel();
+  } catch (error) {
+    console.warn('[scriptonait] could not read the saved model:', error);
+    return;
+  }
+  if (!stored || !stored.bytes) return;
+  setModelStatus('loading', 'Loading your saved model…');
+  try {
+    renderModel(await call('load-model', { bytes: stored.bytes }, [], 0));
+    await syncAllSources();
+    await refreshStoryState();
+  } catch (error) {
+    console.warn('[scriptonait] the saved model would not load:', error);
+    setModelStatus('absent', 'No model yet.');
+  }
+}
+
 // --- Start -------------------------------------------------------------
 
 (async function start() {
@@ -1065,9 +1113,12 @@ window.scriptonait = {
   renderSources();
   updateGuidance();
 
-  // Nothing is fetched here. The page loads, shows what you already
-  // have, and waits. No model is downloaded, ever.
+  // Nothing is fetched from the network here. The page loads, shows what
+  // you already have — including the model your last visit trained — and
+  // waits. No model is downloaded, ever.
   await refreshSources();
   setModelStatus('absent', 'No model yet.');
+  updateGuidance();
+  await restoreModel();
   updateGuidance();
 })();

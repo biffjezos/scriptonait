@@ -35,11 +35,9 @@ function openDb() {
       if (!db.objectStoreNames.contains(SOURCES_STORE)) {
         db.createObjectStore(SOURCES_STORE, { keyPath: 'id' });
       }
-      // Kept so an existing database doesn't need a version bump.
-      // Nothing writes to it: a checkpoint carries its own tokenizer and
-      // is a single file, so "Download this model" and "Load a model
-      // file" cover saving and sharing without a second copy of tens of
-      // MB hidden in the browser.
+      // Holds the trained model between visits. A training run is hours
+      // of the user's GPU; keeping it only in the tab meant a reload
+      // threw all of it away, silently.
       if (!db.objectStoreNames.contains(MODELS_STORE)) {
         db.createObjectStore(MODELS_STORE, { keyPath: 'id' });
       }
@@ -152,4 +150,26 @@ export async function listSources() {
 
 export async function getSource(id) {
   return withStore(SOURCES_STORE, 'readonly', (store) => store.get(id));
+}
+
+// --- The trained model -------------------------------------------------
+//
+// One record, always under the same key: the checkpoint bytes plus what
+// the page needs to describe it before loading. A checkpoint carries its
+// own tokenizer and shape, so nothing else has to be stored beside it.
+
+const CURRENT_MODEL = 'current';
+
+export async function putModel({ bytes, step, params }) {
+  const record = { id: CURRENT_MODEL, bytes, step, params, savedAt: Date.now() };
+  await withStore(MODELS_STORE, 'readwrite', (store) => store.put(record));
+  return record;
+}
+
+export async function getModel() {
+  return withStore(MODELS_STORE, 'readonly', (store) => store.get(CURRENT_MODEL));
+}
+
+export async function deleteModel() {
+  await withStore(MODELS_STORE, 'readwrite', (store) => store.delete(CURRENT_MODEL));
 }
