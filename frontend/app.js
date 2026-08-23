@@ -860,15 +860,31 @@ $('add-url-btn').addEventListener('click', async () => {
 // --- Fine-tuning -------------------------------------------------------
 
 const lossHistory = [];
+/// Held-out loss, with the index into `lossHistory` it was measured at,
+/// so the two curves share a time axis despite different cadences.
+const validationHistory = [];
 
 onStream('train-progress', (progress) => {
   setProgress('train-progress-bar', progress.fractionDone);
   const on = model && model.device ? ` · on ${model.device}` : '';
+  // Held-out loss is the one that says whether it is learning the
+  // language or the sample, so it sits next to the training loss.
+  const held =
+    typeof progress.validationLoss === 'number'
+      ? ` · held-out ${progress.validationLoss.toFixed(3)}`
+      : '';
   $('train-stats').textContent =
-    `step ${progress.step.toLocaleString()} · loss ${progress.smoothedLoss.toFixed(3)} · ` +
+    `step ${progress.step.toLocaleString()} · loss ${progress.smoothedLoss.toFixed(3)}${held} · ` +
     `${progress.tokensPerSecond.toFixed(0)} tokens/s · ${formatDuration(progress.elapsedSeconds)} elapsed${on}`;
   setTitleProgress('Fine-tuning', progress.fractionDone);
   lossHistory.push(progress.smoothedLoss);
+  if (
+    typeof progress.validationLoss === 'number' &&
+    (validationHistory.length === 0 ||
+      validationHistory[validationHistory.length - 1].loss !== progress.validationLoss)
+  ) {
+    validationHistory.push({ at: lossHistory.length - 1, loss: progress.validationLoss });
+  }
   drawLossChart();
 });
 
@@ -898,6 +914,7 @@ $('train-btn').addEventListener('click', async () => {
   clearError();
   training = true;
   lossHistory.length = 0;
+  validationHistory.length = 0;
   $('train-btn').disabled = true;
   $('train-stop-btn').hidden = false;
   $('train-stop-btn').disabled = false;
@@ -985,6 +1002,13 @@ $('train-stop-btn').addEventListener('click', () => {
   call('stop', {}, [], 0).catch(() => {});
 });
 
+/// Both curves on one pair of axes: training loss, and the held-out loss
+/// measured every 25 steps.
+///
+/// They are drawn against the same scale on purpose. Training loss alone
+/// always falls; what tells you whether the model is learning the
+/// language rather than memorizing your text is the two curves drifting
+/// apart, and that is only visible if they share an axis.
 function drawLossChart() {
   const canvas = $('loss-chart');
   const ctx = canvas.getContext('2d');
@@ -992,23 +1016,46 @@ function drawLossChart() {
   ctx.clearRect(0, 0, width, height);
   if (lossHistory.length < 2) return;
 
-  const min = Math.min(...lossHistory);
-  const max = Math.max(...lossHistory);
+  const points = lossHistory.concat(validationHistory.map((p) => p.loss));
+  const min = Math.min(...points);
+  const max = Math.max(...points);
   const span = max - min || 1;
+  const yFor = (loss) => height - ((loss - min) / span) * (height - 12) - 6;
+
   ctx.strokeStyle = '#7aa2f7';
   ctx.lineWidth = 2;
   ctx.beginPath();
   lossHistory.forEach((loss, i) => {
     const x = (i / (lossHistory.length - 1)) * width;
-    const y = height - ((loss - min) / span) * (height - 12) - 6;
+    const y = yFor(loss);
     if (i === 0) ctx.moveTo(x, y);
     else ctx.lineTo(x, y);
   });
   ctx.stroke();
+
+  if (validationHistory.length > 1) {
+    ctx.strokeStyle = '#e0af68';
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    validationHistory.forEach((point, i) => {
+      // Positioned by where in the run it was measured, so the two
+      // curves line up in time rather than by index.
+      const x = (point.at / Math.max(lossHistory.length - 1, 1)) * width;
+      const y = yFor(point.loss);
+      if (i === 0) ctx.moveTo(x, y);
+      else ctx.lineTo(x, y);
+    });
+    ctx.stroke();
+  }
+
   ctx.fillStyle = '#8891a8';
   ctx.font = '11px system-ui, sans-serif';
   ctx.fillText(max.toFixed(3), 4, 12);
   ctx.fillText(min.toFixed(3), 4, height - 4);
+  ctx.fillStyle = '#7aa2f7';
+  ctx.fillText('training', width - 108, 12);
+  ctx.fillStyle = '#e0af68';
+  ctx.fillText('held-out', width - 52, 12);
 }
 
 // --- Saving and loading models ----------------------------------------
@@ -1066,9 +1113,11 @@ async function saveModel() {
   try {
     const started = performance.now();
     const { bytes } = await call('export-checkpoint');
-    await db.putModel({ bytes, step: model.step, params: model.params });
+    const optimizer = await call('export-optimizer').then((r) => r.bytes).catch(() => null);
+    await db.putModel({ bytes, step: model.step, params: model.params, optimizer });
     console.info(
-      `[scriptonait] saved the model (${formatCount(bytes.byteLength)} bytes, ` +
+      `[scriptonait] saved the model (${formatCount(bytes.byteLength)} bytes` +
+        `${optimizer ? ` + ${formatCount(optimizer.byteLength)} of optimizer state` : ''}, ` +
         `step ${model.step.toLocaleString()}) in ${(performance.now() - started).toFixed(0)} ms`,
     );
   } catch (error) {
@@ -1097,6 +1146,16 @@ async function restoreModel() {
     renderModel(await call('load-model', { bytes: stored.bytes }, [], 0));
     await syncAllSources();
     await refreshStoryState();
+    if (stored.optimizer) {
+      // Momentum, so training continues where it left off instead of
+      // restarting Adam from nothing.
+      try {
+        await call('import-optimizer', { bytes: stored.optimizer }, [], 0);
+        console.info('[scriptonait] restored the optimizer state with the model');
+      } catch (error) {
+        console.warn('[scriptonait] optimizer state did not fit this model:', error);
+      }
+    }
   } catch (error) {
     console.warn('[scriptonait] the saved model would not load:', error);
     setModelStatus('absent', 'No model yet.');

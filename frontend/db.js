@@ -160,8 +160,11 @@ export async function getSource(id) {
 
 const CURRENT_MODEL = 'current';
 
-export async function putModel({ bytes, step, params }) {
-  const record = { id: CURRENT_MODEL, bytes, step, params, savedAt: Date.now() };
+export async function putModel({ bytes, step, params, optimizer = null }) {
+  // The optimizer's moment buffers ride along with the weights: a model
+  // restored without them resumes with Adam's momentum reset, and the
+  // loss jumps at every visit.
+  const record = { id: CURRENT_MODEL, bytes, step, params, optimizer, savedAt: Date.now() };
   await withStore(MODELS_STORE, 'readwrite', (store) => store.put(record));
   return record;
 }

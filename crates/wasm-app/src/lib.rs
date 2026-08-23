@@ -30,7 +30,7 @@ use llm_core::corpus::Corpus;
 use llm_core::generate::{SamplingConfig, StopReason};
 use llm_core::instruct;
 use llm_core::tokenizer::Tokenizer;
-use llm_core::model::ModelWeights;
+use llm_core::model::{AdamState, ModelWeights};
 use llm_core::rng::Rng;
 use llm_core::train::TrainConfig;
 
@@ -279,6 +279,34 @@ impl WasmLLM {
     pub async fn sync_from_gpu(&self) -> Result<(), JsValue> {
         self.acquire()?;
         let result = self.sync_from_gpu_inner().await;
+        self.release();
+        result
+    }
+
+    /// Loss on held-out text — the number that separates learning from
+    /// memorizing. Returns -1 when there is not enough text to hold any
+    /// out, or no training state on the GPU yet.
+    pub async fn validation_loss(&self, batch_size: u32) -> Result<f32, JsValue> {
+        self.acquire()?;
+        let result = self.validation_loss_inner(batch_size).await;
+        self.release();
+        result
+    }
+
+    /// The Adam moment buffers, serialized. Saved beside the checkpoint
+    /// so a restored model resumes with its momentum instead of jolting.
+    pub async fn export_optimizer(&self) -> Result<Vec<u8>, JsValue> {
+        self.acquire()?;
+        let result = self.export_optimizer_inner().await;
+        self.release();
+        result
+    }
+
+    /// Restore moment buffers saved by `export_optimizer`. A mismatch
+    /// with the current model's shape is an error, not a silent reset.
+    pub async fn import_optimizer(&self, bytes: &[u8]) -> Result<(), JsValue> {
+        self.acquire()?;
+        let result = self.import_optimizer_inner(bytes).await;
         self.release();
         result
     }
@@ -936,6 +964,86 @@ impl WasmLLM {
             p.adam,
             report.tokens,
         ))
+    }
+
+    async fn validation_loss_inner(&self, batch_size: u32) -> Result<f32, JsValue> {
+        let batch = {
+            let inner = &mut *self.0.borrow_mut();
+            if inner.gpu.as_ref().is_none_or(|gpu| gpu.trainer.is_none()) {
+                return Ok(-1.0);
+            }
+            let context_len = inner.config.context_len;
+            match inner.corpus.sample_validation_batch(batch_size as usize, context_len, &mut inner.rng) {
+                Some(batch) => batch,
+                None => return Ok(-1.0),
+            }
+        };
+        let (ctx, trainer) = {
+            let inner = &mut *self.0.borrow_mut();
+            let gpu = inner.gpu.as_mut().expect("checked above");
+            (Rc::clone(&gpu.ctx), gpu.trainer.take())
+        };
+        let mut trainer = trainer.expect("checked above");
+        let result = trainer.eval_loss(&ctx, &batch.inputs, &batch.targets).await;
+        {
+            let inner = &mut *self.0.borrow_mut();
+            if let Some(gpu) = inner.gpu.as_mut() {
+                gpu.trainer = Some(trainer);
+            }
+        }
+        result.map_err(js_err)
+    }
+
+    async fn export_optimizer_inner(&self) -> Result<Vec<u8>, JsValue> {
+        let (ctx, trainer) = {
+            let inner = &mut *self.0.borrow_mut();
+            let Some(gpu) = inner.gpu.as_mut() else { return Ok(Vec::new()) };
+            (Rc::clone(&gpu.ctx), gpu.trainer.take())
+        };
+        let Some(trainer) = trainer else { return Ok(Vec::new()) };
+        let downloaded = trainer.download_optimizer(&ctx).await;
+        {
+            let inner = &mut *self.0.borrow_mut();
+            if let Some(gpu) = inner.gpu.as_mut() {
+                gpu.trainer = Some(trainer);
+            }
+        }
+        let (m, v, step) = downloaded.map_err(js_err)?;
+        Ok(AdamState::from_parts(m, v, step).to_bytes())
+    }
+
+    async fn import_optimizer_inner(&self, bytes: &[u8]) -> Result<(), JsValue> {
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        let config = self.0.borrow().config;
+        let state = AdamState::from_bytes(bytes, &config).map_err(js_err)?;
+        // The trainer is built lazily by the first step; build it now so
+        // the restored moments have somewhere to live.
+        let (ctx, trainer) = {
+            let inner = &mut *self.0.borrow_mut();
+            let Some(gpu) = inner.gpu.as_mut() else {
+                return Err(js_err("no GPU device to restore optimizer state onto"));
+            };
+            (Rc::clone(&gpu.ctx), gpu.trainer.take())
+        };
+        let mut trainer = match trainer {
+            Some(existing) => existing,
+            None => {
+                let (weights, t_len) = {
+                    let inner = self.0.borrow();
+                    (inner.weights.clone(), inner.config.context_len)
+                };
+                llm_gpu::GpuTrainer::new(&ctx, &config, &weights, t_len).map_err(js_err)?
+            }
+        };
+        let (m, v, step) = state.parts();
+        let result = trainer.upload_optimizer(&ctx, m, v, step);
+        let inner = &mut *self.0.borrow_mut();
+        if let Some(gpu) = inner.gpu.as_mut() {
+            gpu.trainer = Some(trainer);
+        }
+        result.map_err(js_err)
     }
 
     /// Bring the trained weights back from the GPU and re-upload them to
