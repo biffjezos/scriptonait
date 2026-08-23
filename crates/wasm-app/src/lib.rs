@@ -465,13 +465,14 @@ impl WasmLLM {
         let training_bytes = gpu.trainer.as_ref().map(|t| t.allocated_bytes()).unwrap_or(0);
         format!(
             "{{\"available\":true,\"adapter\":{:?},\"backend\":{:?},\"deviceType\":{:?},\
-             \"isSoftware\":{},\"maxWorkgroupsPerDimension\":{},\
+             \"isSoftware\":{},\"f16\":{},\"maxWorkgroupsPerDimension\":{},\
              \"maxStorageBufferBindingSize\":{},\"maxBufferSize\":{},\
              \"trainingStateBytes\":{},\"trainerReady\":{}}}",
             ctx.adapter_name,
             ctx.backend,
             ctx.device_type,
             ctx.is_software,
+            ctx.has_f16,
             ctx.max_workgroups_per_dimension,
             ctx.max_storage_buffer_binding_size,
             ctx.max_buffer_size,

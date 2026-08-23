@@ -152,7 +152,11 @@ async function initGpu() {
   try {
     const summary = await llm.init_gpu();
     const report = JSON.parse(llm.gpu_report());
-    log(`WebGPU device acquired in ${(performance.now() - startedAt).toFixed(0)} ms`, report);
+    log(
+      `WebGPU device acquired in ${(performance.now() - startedAt).toFixed(0)} ms` +
+        ` (matmuls in ${report.f16 ? 'f16' : 'f32'})`,
+      report,
+    );
     if (report.isSoftware) {
       log(
         'WARNING: this is a SOFTWARE renderer, not your GPU. Training will run at ' +
