@@ -501,6 +501,35 @@ impl GpuTrainer {
         })
     }
 
+    /// One step's worth of work, timed, with nothing learned from it.
+    ///
+    /// The same dispatch sequence `train_step` runs, at learning rate and
+    /// weight decay zero, so the weights the caller had are the weights
+    /// it keeps and the step counter does not move. The Adam moments do
+    /// see these gradients, which is a warm start for the estimates and
+    /// nothing more.
+    ///
+    /// This exists so the page can measure this machine — how much work
+    /// per command buffer, how many sequences per batch it wants —
+    /// instead of a constant chosen on somebody else's GPU.
+    pub async fn bench_step(
+        &mut self,
+        ctx: &GpuContext,
+        inputs: &[u32],
+        targets: &[u32],
+    ) -> Result<f64, String> {
+        let before = self.step;
+        let start = Instant::now();
+        // grad_clip infinite: the clip factor stays 1.0, so the bench
+        // runs the same arithmetic whatever the gradients happen to be.
+        self.train_step(ctx, inputs, targets, 0.0, 0.0, f32::INFINITY).await?;
+        // The AdamW pass is submitted but not waited for by `train_step`;
+        // a measurement has to include it.
+        self.sync(ctx).await?;
+        self.step = before;
+        Ok(start.elapsed().as_secs_f64() * 1000.0)
+    }
+
     /// Times each kernel on its own, at the shapes a step actually uses.
     ///
     /// The phase profile says forward and backward are the whole step;

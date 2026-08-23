@@ -96,8 +96,9 @@
         <div class="settings-grid">
           <label>Effort
             <select id="train-effort">
+              <option value="auto" selected>Auto — full speed, steps kept interruptible</option>
               <option value="0.25">Gentle — leaves the machine usable</option>
-              <option value="0.5" selected>Balanced</option>
+              <option value="0.5">Balanced</option>
               <option value="1">Full speed — will make things sluggish</option>
             </select>
           </label>
@@ -105,13 +106,24 @@
             <input type="number" id="train-steps" value="500" min="0" max="1000000" />
           </label>
           <label>Batch size
-            <input type="number" id="train-batch" value="2" min="1" max="256" />
+            <input type="number" id="train-batch" value="0" min="0" max="256" />
           </label>
           <label>Learning rate
             <input type="number" id="train-lr" value="0" min="0" max="0.01" step="0.00001" />
           </label>
         </div>
-        <p class="hint">0 = pick automatically.</p>
+        <p class="hint">
+          Every setting here is optional. Effort on Auto runs flat out — the benchmark
+          below only accepts a batch whose step stays short enough to interrupt —
+          batch size 0 uses whatever that benchmark measured fastest on this machine,
+          learning rate 0 picks one from whether the model is new or already trained, and
+          steps 0 trains until you press Stop.
+        </p>
+        <div class="row">
+          <span class="hint" id="machine-profile-text">Machine profile: not measured yet.</span>
+          <button id="bench-btn" type="button" class="secondary">Measure this machine</button>
+          <button id="bench-forget-btn" type="button" class="secondary" hidden>Forget it</button>
+        </div>
         <p class="hint" id="batch-hint">
           Batch size costs time, not memory: the sequences of a batch run one at a time and
           their gradients add up, so a larger batch is a steadier gradient at the same

@@ -29,6 +29,11 @@ const streamHandlers = new Map();
 // silence.
 const DEFAULT_TIMEOUT_MS = 60000;
 
+/// Matches worker.js. A stored profile from an older benchmark measured
+/// something the current one does not, so it is discarded rather than
+/// trusted.
+const BENCH_VERSION = 1;
+
 function call(type, payload = {}, transfer = [], timeoutMs = DEFAULT_TIMEOUT_MS) {
   const id = nextRequestId++;
   return new Promise((resolve, reject) => {
@@ -229,11 +234,18 @@ function updateGuidance() {
 
   // Say what a step will actually cover, since batch size and context
   // multiply and neither number means much alone.
-  const batch = Number($('train-batch').value) || 1;
+  const typedBatch = Number($('train-batch').value);
+  const batch = chosenBatchSize();
   const context = model ? model.contextLen : Number($('cfg-context').value) || 0;
+  const where = typedBatch > 0
+    ? ''
+    : machineProfile && profileShapeMatches(machineProfile)
+      ? ' (measured on this machine)'
+      : ' (until this machine is measured)';
   $('batch-hint').textContent =
     `Batch size costs time, not memory: the sequences of a batch run one at a time and their ` +
-    `gradients add up. ${batch} x ${context} = ${(batch * context).toLocaleString()} tokens per step.`;
+    `gradients add up. ${batch}${where} x ${context} = ` +
+    `${(batch * context).toLocaleString()} tokens per step.`;
 
   $('train-btn').textContent = model
     ? (model.pretrained ? 'Keep training on my writing' : 'Keep training this model')
@@ -265,6 +277,8 @@ function updateGuidance() {
   } else {
     step.textContent = 'Ready. Step 3: type a prompt.';
   }
+
+  renderMachineProfile();
 }
 
 /// Hand the model everything already in the list.
@@ -436,6 +450,8 @@ onStream('log', ({ message, data }) => {
 
 onStream('gpu-status', ({ available, device, reason, report }) => {
   if (available) {
+    gpuReport = report || null;
+    loadMachineProfile().catch((error) => console.warn('[scriptonait]', error));
     console.info(`[scriptonait] device: ${device}`, report || {});
     if (report && report.isSoftware) {
       console.warn(
@@ -998,6 +1014,172 @@ onStream('train-sample', ({ step, loss, text }) => {
   box.replaceChildren(block);
 });
 
+
+// --- The machine profile -----------------------------------------------
+//
+// Nothing about how fast a step runs can be worked out from here. How
+// much work fits in one command buffer before the driver's watchdog
+// takes the device away, and how many sequences a batch can hold before
+// a step stops being interruptible, are properties of the GPU, its
+// driver and the model's shape together.
+//
+// So the page measures them, once, on the machine it is actually running
+// on, and stores the answer. Later visits load it and set the settings
+// from it. Nothing here is a constant chosen for anybody's hardware.
+
+/// The device report from the worker, which names the adapter the
+/// profile is keyed by.
+let gpuReport = null;
+/// The stored profile for this adapter, once it has been read back.
+let machineProfile = null;
+let benchmarking = false;
+
+/// True when a stored profile was measured against a model of a
+/// different shape. Its command-buffer size still applies — that is
+/// about the driver — but its batch size does not, because the batch
+/// ceiling is a step-duration ceiling and the step's duration is the
+/// model's.
+function profileShapeMatches(profile) {
+  if (!profile || !profile.shape || !model) return false;
+  const s = profile.shape;
+  return (
+    s.layers === model.layers &&
+    s.hidden === model.hidden &&
+    s.heads === model.heads &&
+    s.kvHeads === model.kvHeads &&
+    s.contextLen === model.contextLen &&
+    s.window === model.window &&
+    s.vocabSize === model.vocabSize
+  );
+}
+
+function renderMachineProfile() {
+  const text = $('machine-profile-text');
+  const forget = $('bench-forget-btn');
+  if (!text) return;
+  if (benchmarking) {
+    text.textContent = 'Measuring this machine…';
+    forget.hidden = true;
+    return;
+  }
+  if (!machineProfile) {
+    text.textContent = gpuReport
+      ? 'Machine profile: not measured yet. The first training run measures it once.'
+      : 'Machine profile: needs a GPU.';
+    forget.hidden = true;
+    return;
+  }
+  const p = machineProfile;
+  const stale = model && !profileShapeMatches(p);
+  text.textContent =
+    `Machine profile: ${p.adapter} — ${p.dispatchesPerSubmit} dispatches per command buffer, ` +
+    `batch ${p.batchSize}, ${Math.round(p.msPerStep)} ms per step ` +
+    `(${Math.round(p.tokensPerSecond)} tokens/s)` +
+    (stale ? '. Measured on a differently shaped model — measure again for its batch size.' : '.');
+  forget.hidden = false;
+}
+
+/// Read the stored profile for whatever adapter the browser handed over,
+/// and put its command-buffer size back into the worker.
+async function loadMachineProfile() {
+  if (!gpuReport || !gpuReport.available) return null;
+  let stored = null;
+  try {
+    stored = await db.getMachineProfile(gpuReport);
+  } catch (error) {
+    console.warn('[scriptonait] could not read the machine profile', error);
+    return null;
+  }
+  // A profile from an older benchmark measured something else; re-measure
+  // rather than act on it.
+  if (stored && stored.version !== BENCH_VERSION) {
+    console.info('[scriptonait] the stored machine profile is from an older benchmark — ignoring it');
+    stored = null;
+  }
+  machineProfile = stored;
+  if (stored) {
+    await call('apply-machine-profile', { dispatchesPerSubmit: stored.dispatchesPerSubmit });
+    console.info('[scriptonait] machine profile loaded', stored);
+  }
+  renderMachineProfile();
+  updateGuidance();
+  return stored;
+}
+
+/// Run the benchmark and store what it found. Needs a model and enough
+/// text, since it times the real step on the real shapes.
+async function runBenchmark() {
+  // Not gated on `training`: the first thing a training run does is
+  // measure the machine it is about to train on, and by then the page
+  // already considers itself training. The worker refuses a benchmark
+  // that would land in the middle of an actual run.
+  if (benchmarking) return machineProfile;
+  benchmarking = true;
+  $('bench-btn').disabled = true;
+  renderMachineProfile();
+  try {
+    const result = await call('benchmark', {}, [], 0);
+    if (result.error) {
+      console.warn(`[scriptonait] benchmark: ${result.error}`);
+      return machineProfile;
+    }
+    machineProfile = await db.putMachineProfile(result.profile);
+    console.info('[scriptonait] machine profile stored', machineProfile);
+    return machineProfile;
+  } finally {
+    benchmarking = false;
+    $('bench-btn').disabled = false;
+    renderMachineProfile();
+    updateGuidance();
+  }
+}
+
+/// Batch size to train at: the box if it was filled in, otherwise what
+/// the benchmark measured, otherwise one sequence — which is the only
+/// size that is safe on an unmeasured machine.
+function chosenBatchSize() {
+  const typed = Number($('train-batch').value);
+  if (typed > 0) return typed;
+  if (machineProfile && profileShapeMatches(machineProfile)) return machineProfile.batchSize;
+  return 1;
+}
+
+/// Effort, when it is left on Auto.
+///
+/// Effort is the share of the time the worker spends training rather
+/// than sitting idle, and it exists so a run does not make the rest of
+/// the machine unusable. Auto is full speed, and that is a measurement
+/// rather than an opinion: the benchmark refuses any batch whose step
+/// runs past the interruptible ceiling, so a step already ends often
+/// enough for the browser to get the device back, and the worker spends
+/// almost all of a step awaiting the GPU rather than holding a core.
+/// Insert an idle share only if you want the machine back — the two
+/// slower settings are still there, and Auto never picks them for you.
+function chosenEffort() {
+  const value = $('train-effort').value;
+  return value === 'auto' ? 1 : Number(value);
+}
+
+onStream('bench-progress', ({ stage, dispatchesPerSubmit }) => {
+  if (!benchmarking || stage !== 'chunk') return;
+  $('machine-profile-text').textContent =
+    `Measuring this machine — ${dispatchesPerSubmit} dispatches per command buffer is ` +
+    'fastest so far; now finding the batch size…';
+});
+
+$('bench-btn').addEventListener('click', () => {
+  clearError();
+  runBenchmark().catch(showError);
+});
+
+$('bench-forget-btn').addEventListener('click', async () => {
+  if (!gpuReport) return;
+  await db.deleteMachineProfile(gpuReport);
+  machineProfile = null;
+  renderMachineProfile();
+  updateGuidance();
+});
+
 $('train-btn').addEventListener('click', async () => {
   if (training) return;
   clearError();
@@ -1041,16 +1223,32 @@ $('train-btn').addEventListener('click', async () => {
       if (learned && learned.model) renderModel(learned.model);
     }
 
+    // Measure the machine once, before the first run on it. The
+    // settings that follow are read off that measurement, so it has to
+    // happen first — and it only ever happens once per adapter and
+    // model shape, because the answer is stored.
+    if (!machineProfile || !profileShapeMatches(machineProfile)) {
+      $('train-stats').textContent =
+        'Measuring this machine — timing a few steps to pick the settings…';
+      await runBenchmark().catch((error) => {
+        // A benchmark that fails is not a reason not to train: the
+        // fallbacks are one sequence per batch and the default command
+        // buffer, which are the safe values.
+        console.warn('[scriptonait] the machine benchmark failed', error);
+      });
+    }
+
     const fromScratch = model && !model.pretrained;
     const chosenRate = Number($('train-lr').value);
+    const batchSize = chosenBatchSize();
     const result = await call('train', {
-      batchSize: Number($('train-batch').value),
+      batchSize,
       // 0 means "pick one": a new model needs a rate large enough to
       // learn a language from nothing; a working one needs a small
       // enough rate not to forget it.
       learningRate: chosenRate > 0 ? chosenRate : (fromScratch ? 3e-4 : 5e-5),
       maxSteps: Number($('train-steps').value),
-      effort: Number($('train-effort').value),
+      effort: chosenEffort(),
       // 0 turns sampling off; anything else is a step interval.
       sampleEvery: $('sample-toggle').checked ? Number($('sample-every').value) : 0,
       samplePrompt: $('sample-prompt').value.trim() || 'Write a 40 word scene.',
@@ -1201,6 +1399,18 @@ window.scriptonait = {
       console.error(`[scriptonait] profile: ${(error && error.message) || error}`);
       return null;
     }),
+
+  /// Re-measure this machine and store the result, whatever is stored
+  /// now. The first training run does this by itself; this is for after
+  /// a driver update, or to see the sweep again.
+  benchmark: () =>
+    runBenchmark().catch((error) => {
+      console.error(`[scriptonait] benchmark: ${(error && error.message) || error}`);
+      return null;
+    }),
+
+  /// What the machine measured, as stored.
+  machine: () => machineProfile,
 };
 
 /// Write the trained model to IndexedDB.

@@ -41,6 +41,10 @@ let stopRequested = false;
 
 const PROGRESS_INTERVAL_MS = 250;
 
+/// Bumped whenever the benchmark measures something different, so a
+/// stored profile from an older build is re-measured instead of trusted.
+const BENCH_VERSION = 1;
+
 function post(type, payload = {}) {
   self.postMessage({ type, ...payload });
 }
@@ -278,6 +282,170 @@ async function trainingSample(prompt, words) {
   return result.text;
 }
 
+/// Measure this machine, once, and let the measurement pick the
+/// settings.
+///
+/// Two things about a training step are properties of the GPU and its
+/// driver rather than of the model, and neither can be reasoned out from
+/// here:
+///
+///   * How much work belongs in one command buffer. Too little pays the
+///     submission cost on every dispatch; too much hands the driver a
+///     buffer long enough to trip its watchdog and lose the device. The
+///     best value differs by adapter, by backend and by driver version.
+///   * How many sequences a batch should hold. A larger batch is a
+///     steadier gradient and usually more tokens per second, up to the
+///     point where a single step takes long enough that stopping feels
+///     broken and the watchdog gets interested.
+///
+/// So both are timed here, on this machine, with the model that is
+/// actually loaded, and the winner is stored. `bench_step` runs at
+/// learning rate zero and restores the step counter, so this costs time
+/// and changes nothing else.
+async function benchmark({ ceilingMs = 1500, budgetMs = 60000, repeats = 3 } = {}) {
+  const device = JSON.parse(llm.gpu_report());
+  if (!device.available) throw new Error('benchmarking needs a GPU device');
+  const info = llm.info();
+  const contextLen = info.context_len;
+  const startedAt = performance.now();
+  const overBudget = () => performance.now() - startedAt > budgetMs;
+  const tokensPerSecond = (batch, ms) => (ms > 0 ? (batch * contextLen) / (ms / 1000) : 0);
+
+  log('benchmarking this machine — one timed sweep, nothing is learned from it', {
+    adapter: device.adapter,
+    backend: device.backend,
+    deviceType: device.deviceType,
+    contextLen,
+    params: info.params,
+  });
+
+  // The first step allocates every training buffer and compiles every
+  // pipeline. Timing that would measure the driver's lazy work, not the
+  // step.
+  const warmupStart = performance.now();
+  await llm.bench_step(1, 32);
+  log(`benchmark warmup ${(performance.now() - warmupStart).toFixed(0)} ms ` +
+      '(allocating training state and compiling pipelines)');
+
+  /// Fastest of `repeats` runs, not the mean: a slow run is another
+  /// process getting the GPU, and the fastest is the one this
+  /// configuration is capable of.
+  async function timeStep(batch, chunk, runs) {
+    let best = Infinity;
+    for (let i = 0; i < runs; i += 1) {
+      const started = performance.now();
+      await llm.bench_step(batch, chunk);
+      best = Math.min(best, performance.now() - started);
+    }
+    return best;
+  }
+
+  // --- How much work per command buffer, at one sequence -------------
+  const chunkSweep = [];
+  let chunk = 32;
+  let chunkMs = Infinity;
+  for (const candidate of [8, 16, 32, 64, 128, 256]) {
+    if (overBudget()) {
+      log(`benchmark: out of time budget, stopping the command-buffer sweep at ${candidate}`);
+      break;
+    }
+    let ms;
+    try {
+      ms = await timeStep(1, candidate, repeats);
+    } catch (error) {
+      // A device lost to the watchdog takes everything with it, so a
+      // failure here ends the sweep rather than continuing past it.
+      log(`benchmark: ${candidate} dispatches/submit failed (${error && error.message || error}) ` +
+          '— keeping the best value measured before it');
+      break;
+    }
+    chunkSweep.push({ dispatchesPerSubmit: candidate, msPerStep: ms });
+    log(`benchmark: ${candidate} dispatches/submit -> ${ms.toFixed(1)} ms/step ` +
+        `(${tokensPerSecond(1, ms).toFixed(0)} tok/s at batch 1)`);
+    if (ms < chunkMs) {
+      chunkMs = ms;
+      chunk = candidate;
+    }
+  }
+  if (chunkSweep.length === 0) {
+    throw new Error('the benchmark could not time a single step on this device');
+  }
+  post('bench-progress', { stage: 'chunk', dispatchesPerSubmit: chunk });
+
+  // --- How many sequences per batch ----------------------------------
+  //
+  // Ascending, and stopping at the first candidate that is slower per
+  // token or takes longer than the ceiling: past that point a batch buys
+  // a marginally steadier gradient with a step nobody can interrupt.
+  const batchSweep = [];
+  let batchSize = 1;
+  let bestRate = 0;
+  let bestMs = chunkMs;
+  for (const candidate of [1, 2, 4, 8, 16]) {
+    if (overBudget()) {
+      log(`benchmark: out of time budget, stopping the batch sweep at ${candidate}`);
+      break;
+    }
+    let ms;
+    try {
+      ms = await timeStep(candidate, chunk, candidate >= 8 ? 1 : 2);
+    } catch (error) {
+      log(`benchmark: batch ${candidate} failed (${error && error.message || error}) ` +
+          '— keeping the largest batch that worked');
+      break;
+    }
+    const rate = tokensPerSecond(candidate, ms);
+    batchSweep.push({ batchSize: candidate, msPerStep: ms, tokensPerSecond: rate });
+    log(`benchmark: batch ${candidate} -> ${ms.toFixed(0)} ms/step, ${rate.toFixed(0)} tok/s`);
+    // The smallest batch is taken whatever it costs — there is nothing
+    // below it — but a larger one has to earn its step time.
+    const first = bestRate === 0;
+    if (!first && ms > ceilingMs) {
+      log(`benchmark: batch ${candidate} takes ${ms.toFixed(0)} ms, past the ${ceilingMs} ms ` +
+          `ceiling that keeps a step interruptible — staying at ${batchSize}`);
+      break;
+    }
+    // Three percent, because anything smaller is inside the noise of two
+    // runs and not worth a step that takes twice as long to interrupt.
+    if (!first && rate <= bestRate * 1.03) {
+      log(`benchmark: batch ${candidate} is no faster per token than ${batchSize} — stopping here`);
+      break;
+    }
+    bestRate = rate;
+    bestMs = ms;
+    batchSize = candidate;
+  }
+
+  const profile = {
+    version: BENCH_VERSION,
+    adapter: device.adapter,
+    backend: device.backend,
+    deviceType: device.deviceType,
+    isSoftware: device.isSoftware,
+    dispatchesPerSubmit: chunk,
+    batchSize,
+    msPerStep: bestMs,
+    tokensPerSecond: bestRate,
+    // The batch ceiling depends on the model's shape, so a profile
+    // measured against a different model says nothing about this one.
+    shape: {
+      layers: info.layers,
+      hidden: info.hidden,
+      heads: info.heads,
+      kvHeads: info.kv_heads,
+      contextLen: info.context_len,
+      window: info.window,
+      vocabSize: info.vocab_size,
+    },
+    chunkSweep,
+    batchSweep,
+    elapsedSeconds: (performance.now() - startedAt) / 1000,
+  };
+  llm.set_dispatches_per_submit(chunk);
+  log('machine profile measured', profile);
+  return profile;
+}
+
 async function train({ batchSize, learningRate, maxSteps, effort, sampleEvery, samplePrompt, sampleWords }) {
   stopRequested = false;
   training = true;
@@ -293,6 +461,7 @@ async function train({ batchSize, learningRate, maxSteps, effort, sampleEvery, s
     batchSize,
     contextLen: info.context_len,
     tokensPerStep: batchSize * info.context_len,
+    dispatchesPerSubmit: llm.dispatches_per_submit(),
     maxSteps: maxSteps || 'until stopped',
     effort,
     learningRate: learningRate > 0 ? learningRate : 'automatic',
@@ -673,6 +842,29 @@ const handlers = {
     return { rows };
   },
 
+  /// Time this machine and return the settings it wants. The page
+  /// stores the result and hands it back on the next visit.
+  async benchmark(payload = {}) {
+    if (!llm.has_gpu()) return { error: 'no GPU device' };
+    if (training) {
+      const message = 'a training run is in flight — press Stop, then benchmark';
+      log(`benchmark refused: ${message}`);
+      return { error: message };
+    }
+    if (!llm.can_train()) {
+      return { error: 'not enough source text to fill one context window' };
+    }
+    return { profile: await benchmark(payload) };
+  },
+
+  /// Apply a stored profile's command-buffer size without re-measuring.
+  async 'apply-machine-profile'({ dispatchesPerSubmit }) {
+    if (dispatchesPerSubmit > 0) llm.set_dispatches_per_submit(dispatchesPerSubmit);
+    const applied = llm.dispatches_per_submit();
+    log(`machine profile applied: ${applied} dispatches per command buffer`);
+    return { dispatchesPerSubmit: applied };
+  },
+
   async train(payload) {
     // Training is GPU work. Without a device there is nothing to fall
     // back to, so say which of the two reasons stopped it.
@@ -718,9 +910,9 @@ self.onmessage = async (event) => {
     fail(
       rid,
       new Error(
-        type === 'profile'
-          ? 'profiling needs a model: press Train first (a model lives in this tab only, so ' +
-            'a reload leaves none), then run scriptonait.profile() again'
+        type === 'profile' || type === 'benchmark'
+          ? `${type === 'profile' ? 'profiling' : 'benchmarking'} needs a model: press Train ` +
+            'first (a model lives in this tab only, so a reload leaves none), then run it again'
           : 'no model loaded yet',
       ),
     );

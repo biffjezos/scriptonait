@@ -39,6 +39,13 @@ device the page says so and does not train.
   context length, attention window. So are steps, batch size, learning
   rate, and an effort setting that decides how much of the machine the
   run may take.
+- Every training setting is optional. The first run benchmarks the
+  machine it is on — how much work fits in one command buffer before the
+  driver's watchdog takes the device away, how many sequences a batch can
+  hold before a step stops being interruptible — and the settings are
+  read off that measurement. The result is stored per adapter and loaded
+  on the next visit, so it is measured once, not guessed and not
+  hard-coded for anybody's hardware.
 - Stop any time; progress is kept.
 - Live loss chart with two curves — training loss and held-out loss, on
   one axis, because the gap between them is what says whether the model
@@ -72,6 +79,8 @@ device the page says so and does not train.
 - `scriptonait.profile()` in the console times one step per phase — zero,
   forward, loss, backward, reduce, readback, AdamW — at four
   command-buffer sizes, so "it is slow" becomes a measurement.
+- `scriptonait.benchmark()` re-runs the machine sweep and logs every
+  candidate it timed; `scriptonait.machine()` shows what is stored.
 - The device the browser handed over is named, and a software renderer
   is called out as one.
 - Export the model to a `.ckpt` file, and load one back.
@@ -134,7 +143,8 @@ crates/
 frontend/
   index.html, style.css, app.js   The page.
   worker.js                       Owns the wasm module, off the main thread.
-  db.js                           IndexedDB: your sources and your model.
+  db.js                           IndexedDB: your sources, your model, and
+                                  what this machine benchmarked.
 ```
 
 `llm-core` has 156 tests that run without network access, including
