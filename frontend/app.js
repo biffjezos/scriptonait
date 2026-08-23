@@ -733,6 +733,7 @@ $('remove-all-btn').addEventListener('click', async () => {
     }
   }
   await refreshStoryState();
+  await refreshPlan();
 });
 
 async function removeSource(id) {
@@ -742,6 +743,7 @@ async function removeSource(id) {
   try {
     renderModel(await call('remove-source', { id }));
     await refreshStoryState();
+    await refreshPlan();
   } catch (error) {
     /* no model loaded: it was only ever in the list */
   }
@@ -776,7 +778,14 @@ function updateSourceSummary(list, note = '') {
     return;
   }
   const chars = list.reduce((sum, s) => sum + (s.rawText || '').length, 0);
-  const seen = model ? '' : ' — no model loaded, so nothing is using them yet';
+  // Sources live in two places: this list, which is the browser's, and
+  // the model's corpus, which is the wasm side's. Without a model the
+  // second one does not exist, so a file added now is in the list and
+  // nowhere else until a model is made — and any number computed from
+  // the corpus is about a corpus that no longer matches this list.
+  const seen = model
+    ? ''
+    : ' — no model yet, so none of this is in a corpus: make or open one and it is all handed over';
   const saved = persistenceWorks ? '' : ' · not saved (storage unavailable)';
   stats.textContent =
     `${list.length} source${list.length === 1 ? '' : 's'}, ` +
@@ -861,6 +870,10 @@ async function addSources(entries) {
   await Promise.allSettled(syncing);
   renderSources();
   await refreshStoryState();
+  // The corpus just changed, so every number the plan is built from
+  // did too. Without this the plan keeps reporting the corpus it was
+  // last computed against.
+  await refreshPlan();
   if (failures.length) {
     showError(
       `${failures.length} of ${entries.length} couldn't be added: ${failures.slice(0, 3).join(', ')}` +
@@ -1044,8 +1057,17 @@ $('restore-best-btn').addEventListener('click', async () => {
 let lastPhaseKey = null;
 
 function renderPlan(plan) {
-  if (!plan || !plan.phase) return;
   const box = $('train-plan');
+  // No model means no corpus on the wasm side, so there is nothing to
+  // compute a plan from — and the numbers on screen are from whatever
+  // was there last. Stale numbers next to a list that has changed under
+  // them is exactly how the page stops being believed: 66 sources and
+  // 17.67M characters above, a token count from a 30-source corpus
+  // below, and no way to tell which is current.
+  if (!model || !plan || !plan.phase) {
+    box.hidden = true;
+    return;
+  }
   $('plan-phase-title').textContent = plan.phase.title;
   $('plan-phase-detail').textContent = plan.phase.detail;
 
@@ -1084,6 +1106,18 @@ function renderPlan(plan) {
   if (n.corpusChars > 0) corpus.push(`${formatCount(n.corpusChars)} characters`);
   corpus.push(`${formatCount(n.trainingTokens)} tokens at this vocabulary`);
   corpus.push(`${formatCount(n.params)} parameters`);
+
+  // The list and the corpus are two different things, and they can
+  // disagree: a source added while no model existed is in the list and
+  // not in the corpus. Saying so beats letting somebody compare the two
+  // lines and conclude the page is making numbers up.
+  const listedChars = sources.reduce((sum, s) => sum + (s.rawText || '').length, 0);
+  if (n.corpusChars > 0 && Math.abs(listedChars - n.corpusChars) > n.corpusChars * 0.05) {
+    corpus.push(
+      `the list above holds ${formatCount(listedChars)} characters — press Train to hand the ` +
+        'difference over',
+    );
+  }
 
   $('plan-numbers').textContent = `Trained: ${progress.join(' · ')}`;
   $('plan-corpus').textContent = `Corpus: ${corpus.join(' · ')}`;
