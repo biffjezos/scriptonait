@@ -4,12 +4,9 @@
 // into one gradient buffer the caller zeroes once per step - matching
 // llm_core::model::backward_into.
 //
-// Same 64x64 tile, 4x4 per thread structure as linear.wgsl. Here the
-// contraction runs over the rows (t), and both operands are stored
-// [t][*], so both tiles are loaded transposed into workgroup memory.
-//
-// Dispatch: gid.x covers in_dim in blocks of 64, gid.y covers out_dim in
-// blocks of 64.
+// Same 64x64 tile, 8x8 per thread structure as linear.wgsl. Here the
+// contraction runs over the rows (t) and both operands are stored
+// [t][*], so both tiles are loaded transposed.
 struct Params {
     rows: u32,
     in_dim: u32,
@@ -24,32 +21,32 @@ struct Params {
 
 const TILE: u32 = 64u;
 const DEPTH: u32 = 16u;
-const PER: u32 = 4u;
+const PER: u32 = 8u;
 
 var<workgroup> tile_dy: array<f32, 1024>; // [64 o][16 t]
 var<workgroup> tile_x: array<f32, 1024>;  // [64 i][16 t]
 
-@compute @workgroup_size(16, 16, 1)
+@compute @workgroup_size(8, 8, 1)
 fn main(
     @builtin(workgroup_id) wid: vec3<u32>,
     @builtin(local_invocation_id) lid: vec3<u32>,
 ) {
     let out_base = wid.y * TILE;
     let in_base = wid.x * TILE;
-    let tid = lid.y * 16u + lid.x;
+    let tid = lid.y * 8u + lid.x;
 
-    var acc: array<f32, 16>;
-    for (var n: u32 = 0u; n < 16u; n = n + 1u) {
+    var acc: array<f32, 64>;
+    for (var n: u32 = 0u; n < 64u; n = n + 1u) {
         acc[n] = 0.0;
     }
 
     let slabs = (p.rows + DEPTH - 1u) / DEPTH;
     for (var s: u32 = 0u; s < slabs; s = s + 1u) {
         let t_base = s * DEPTH;
-        for (var f: u32 = 0u; f < 4u; f = f + 1u) {
-            let index = tid + f * 256u;
-            let t = index / TILE;   // 0..15
-            let c = index % TILE;   // 0..63
+        for (var f: u32 = 0u; f < 16u; f = f + 1u) {
+            let index = tid + f * 64u;
+            let t = index / TILE;
+            let c = index % TILE;
 
             var dv: f32 = 0.0;
             if (t_base + t < p.rows && out_base + c < p.out_dim) {
@@ -66,8 +63,8 @@ fn main(
         workgroupBarrier();
 
         for (var t: u32 = 0u; t < DEPTH; t = t + 1u) {
-            var a: array<f32, 4>;
-            var b: array<f32, 4>;
+            var a: array<f32, 8>;
+            var b: array<f32, 8>;
             for (var n: u32 = 0u; n < PER; n = n + 1u) {
                 a[n] = tile_dy[(lid.y * PER + n) * DEPTH + t];
                 b[n] = tile_x[(lid.x * PER + n) * DEPTH + t];

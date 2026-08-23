@@ -1,19 +1,15 @@
 // y[rows,out_dim] = x[rows,in_dim] @ w[out_dim,in_dim]^T  (no bias)
 // GPU translation of llm_core's ops::linear_fwd.
 //
-// 64x64 output tile per workgroup, 4x4 outputs per thread, accumulated in
-// registers over 16-deep k-slabs held in workgroup memory.
+// A 64-thread workgroup owns a 64x64 output tile; each thread keeps an
+// 8x8 block of it in registers and walks the contraction in 16-deep
+// slabs held in workgroup memory.
 //
-// The previous version had each thread produce one output. That reloads
-// every operand from shared memory for every single multiply-add: one
-// FMA per two loads, which is memory-bound at a small fraction of the
-// device's arithmetic. Holding a 4x4 block in registers reuses each
-// loaded value four times, an 8x cut in shared-memory traffic for the
-// same arithmetic - and the matmuls are where essentially all of a
-// training step's time goes.
-//
-// Dispatch convention: gid.x covers out_dim in blocks of 64, gid.y covers
-// rows in blocks of 64. model.rs's dispatch_linear must match.
+// The block size is the whole point. With a 4x4 block a thread does 16
+// multiply-adds per 8 values read from shared memory; with 8x8 it does
+// 64 per 16 - twice the arithmetic per byte moved. The profiler put 97%
+// of a training step in the forward and backward passes, and ~90% of
+// those FLOPs are these matmuls, so this ratio is the step's speed.
 struct Params {
     rows: u32,
     in_dim: u32,
@@ -26,35 +22,34 @@ struct Params {
 @group(0) @binding(2) var<storage, read> w: array<f32>;
 @group(0) @binding(3) var<storage, read_write> y: array<f32>;
 
-const TILE: u32 = 64u;   // rows and columns per workgroup
-const DEPTH: u32 = 16u;  // k elements per slab
-const PER: u32 = 4u;     // outputs per thread, each dimension
+const TILE: u32 = 64u;   // output rows and columns per workgroup
+const DEPTH: u32 = 16u;  // contraction elements per slab
+const PER: u32 = 8u;     // outputs per thread, each dimension
 
-var<workgroup> tile_x: array<f32, 1024>; // [64][16], row-major
-var<workgroup> tile_w: array<f32, 1024>; // [64][16], row-major
+var<workgroup> tile_x: array<f32, 1024>; // [64][16]
+var<workgroup> tile_w: array<f32, 1024>; // [64][16]
 
-@compute @workgroup_size(16, 16, 1)
+@compute @workgroup_size(8, 8, 1)
 fn main(
     @builtin(workgroup_id) wid: vec3<u32>,
     @builtin(local_invocation_id) lid: vec3<u32>,
 ) {
     let row_base = wid.y * TILE;
     let col_base = wid.x * TILE;
-    let tid = lid.y * 16u + lid.x;
+    let tid = lid.y * 8u + lid.x;
 
-    var acc: array<f32, 16>; // 4x4 block, [i][j]
-    for (var n: u32 = 0u; n < 16u; n = n + 1u) {
+    var acc: array<f32, 64>;
+    for (var n: u32 = 0u; n < 64u; n = n + 1u) {
         acc[n] = 0.0;
     }
 
     let slabs = (p.in_dim + DEPTH - 1u) / DEPTH;
     for (var s: u32 = 0u; s < slabs; s = s + 1u) {
         let k_base = s * DEPTH;
-        // 256 threads cooperatively load two 64x16 tiles, four elements
-        // each. Consecutive threads read consecutive k, so every load is
-        // coalesced.
-        for (var f: u32 = 0u; f < 4u; f = f + 1u) {
-            let index = tid + f * 256u;
+        // 64 threads load two 64x16 tiles, sixteen elements each.
+        // Consecutive threads read consecutive k, so loads coalesce.
+        for (var f: u32 = 0u; f < 16u; f = f + 1u) {
+            let index = tid + f * 64u;
             let i = index / DEPTH;
             let k = index % DEPTH;
 
@@ -75,8 +70,8 @@ fn main(
         workgroupBarrier();
 
         for (var k: u32 = 0u; k < DEPTH; k = k + 1u) {
-            var a: array<f32, 4>;
-            var b: array<f32, 4>;
+            var a: array<f32, 8>;
+            var b: array<f32, 8>;
             for (var i: u32 = 0u; i < PER; i = i + 1u) {
                 a[i] = tile_x[(lid.y * PER + i) * DEPTH + k];
                 b[i] = tile_w[(lid.x * PER + i) * DEPTH + k];

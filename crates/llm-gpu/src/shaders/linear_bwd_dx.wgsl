@@ -1,13 +1,10 @@
 // dx[t,i] = sum_o dy[t,o]*w[o,i]. Mirrors ops::linear_bwd's dx.
 //
-// Same 64x64 tile, 4x4 per thread structure as linear.wgsl - see that
-// file for why. The one difference: the contraction runs over out_dim,
-// and w is stored [out_dim, in_dim], so its tile is loaded transposed
-// into workgroup memory (still a coalesced read, because consecutive
-// threads take consecutive `i`).
-//
-// Dispatch: gid.x covers in_dim in blocks of 64, gid.y covers rows in
-// blocks of 64.
+// Same 64x64 tile, 8x8 per thread structure as linear.wgsl - see that
+// file for why the block size is the point. The difference here: the
+// contraction runs over out_dim, and w is stored [out_dim, in_dim], so
+// its tile is loaded transposed into workgroup memory (still coalesced,
+// because consecutive threads take consecutive `i`).
 struct Params {
     rows: u32,
     in_dim: u32,
@@ -22,33 +19,32 @@ struct Params {
 
 const TILE: u32 = 64u;
 const DEPTH: u32 = 16u;
-const PER: u32 = 4u;
+const PER: u32 = 8u;
 
 var<workgroup> tile_dy: array<f32, 1024>; // [64 rows][16 o]
 var<workgroup> tile_w: array<f32, 1024>;  // [64 i][16 o], transposed on load
 
-@compute @workgroup_size(16, 16, 1)
+@compute @workgroup_size(8, 8, 1)
 fn main(
     @builtin(workgroup_id) wid: vec3<u32>,
     @builtin(local_invocation_id) lid: vec3<u32>,
 ) {
     let row_base = wid.y * TILE;
     let col_base = wid.x * TILE;
-    let tid = lid.y * 16u + lid.x;
+    let tid = lid.y * 8u + lid.x;
 
-    var acc: array<f32, 16>;
-    for (var n: u32 = 0u; n < 16u; n = n + 1u) {
+    var acc: array<f32, 64>;
+    for (var n: u32 = 0u; n < 64u; n = n + 1u) {
         acc[n] = 0.0;
     }
 
     let slabs = (p.out_dim + DEPTH - 1u) / DEPTH;
     for (var s: u32 = 0u; s < slabs; s = s + 1u) {
         let o_base = s * DEPTH;
-        for (var f: u32 = 0u; f < 4u; f = f + 1u) {
-            let index = tid + f * 256u;
-            let a = index / DEPTH;   // row within the tile
-            let o = index % DEPTH;   // position within the slab
-
+        for (var f: u32 = 0u; f < 16u; f = f + 1u) {
+            let index = tid + f * 64u;
+            let a = index / DEPTH;
+            let o = index % DEPTH;
             var dv: f32 = 0.0;
             let row = row_base + a;
             if (row < p.rows && o_base + o < p.out_dim) {
@@ -56,12 +52,10 @@ fn main(
             }
             tile_dy[index] = dv;
         }
-        // w's tile is [i][o]: the group loads 16 rows of w (one per o) and
-        // 64 columns (i), writing them transposed.
-        for (var f: u32 = 0u; f < 4u; f = f + 1u) {
-            let index = tid + f * 256u;
-            let o = index / TILE;    // 0..15
-            let i = index % TILE;    // 0..63
+        for (var f: u32 = 0u; f < 16u; f = f + 1u) {
+            let index = tid + f * 64u;
+            let o = index / TILE;
+            let i = index % TILE;
             var wv: f32 = 0.0;
             if (o_base + o < p.out_dim && col_base + i < p.in_dim) {
                 wv = w[(o_base + o) * p.in_dim + col_base + i];
@@ -71,8 +65,8 @@ fn main(
         workgroupBarrier();
 
         for (var o: u32 = 0u; o < DEPTH; o = o + 1u) {
-            var a: array<f32, 4>;
-            var b: array<f32, 4>;
+            var a: array<f32, 8>;
+            var b: array<f32, 8>;
             for (var n: u32 = 0u; n < PER; n = n + 1u) {
                 a[n] = tile_dy[(lid.y * PER + n) * DEPTH + o];
                 b[n] = tile_w[(lid.x * PER + n) * DEPTH + o];
