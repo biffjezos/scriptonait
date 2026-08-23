@@ -1046,7 +1046,12 @@ function renderPlan(plan) {
   // and the character count does not - and a number that moves for
   // reasons the user did not cause is a number they stop believing.
   const progress = [`step ${n.step.toLocaleString()}`];
-  if (n.plannedSteps > n.step) progress.push(`of ${n.plannedSteps.toLocaleString()} planned`);
+  // Step counts in two frames: the model's lifetime, and this run. The
+  // schedule works in the second, so a run's progress has to be shown
+  // in it — "step 4,977 of 500 planned" is what happens otherwise.
+  if (n.plannedSteps > n.runStep) {
+    progress.push(`${n.runStep.toLocaleString()} of ${n.plannedSteps.toLocaleString()} this run`);
+  }
   progress.push(
     n.tokensSeen > 0
       ? `${formatCount(n.tokensSeen)} tokens trained on`

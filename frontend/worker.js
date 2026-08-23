@@ -359,7 +359,7 @@ const TOKENS_BEFORE_JUDGING_THE_CORPUS = 10e6;
 /// fraction of its peak, and the opposite thing two thousand steps
 /// later. Saying which is which is the difference between waiting and
 /// wasting an afternoon.
-function trainingPhase(plan, { heldOut, trainingLoss, stepsDone }) {
+function trainingPhase(plan, { heldOut, trainingLoss }) {
   const { step, plannedSteps, warmupSteps, peakLr, lrNow, minLrRatio } = plan;
   if (step < warmupSteps) {
     return {
@@ -440,12 +440,12 @@ function trainingPhase(plan, { heldOut, trainingLoss, stepsDone }) {
     key: 'learning',
     title: 'Learning',
     detail:
-      `past warm-up, rate ${lrNow.toExponential(1)}` +
+      `${step.toLocaleString()} of ${plannedSteps.toLocaleString()} steps into this run, past ` +
+      `warm-up, rate ${lrNow.toExponential(1)} of a ${peakLr.toExponential(1)} peak` +
       (plan.plateauScale < 1
         ? ` (cut to ${plan.plateauScale.toFixed(2)}x the schedule after a plateau)`
         : '') +
-      ', held-out loss still improving' +
-      (stepsDone > 0 ? ` — ${stepsDone.toLocaleString()} steps into this run.` : '.'),
+      ', held-out loss still improving.',
   };
 }
 
@@ -670,13 +670,16 @@ function buildPlan(state) {
   // actually processed. A model trained at batch 4 and then looked at
   // with the box set to 1 reported a quarter of its real training.
   const tokensSeen = plan.tokensSeen;
-  const remaining = plan.plannedSteps > plan.step ? plan.plannedSteps - plan.step : 0;
+  const runStep = Math.max(0, plan.step - plan.startStep);
+  const remaining = plan.plannedSteps > runStep ? plan.plannedSteps - runStep : 0;
   const tokensPerSecond = state.msPerStep > 0 ? tokensPerStep / (state.msPerStep / 1000) : 0;
   return {
     phase,
     actions: planActions(plan, phase, { ...state, tokensPerStep, tokensSeen, tokensPerSecond }),
     numbers: {
       step: plan.step,
+      // Steps into this run, which is the frame the schedule works in.
+      runStep: Math.max(0, plan.step - plan.startStep),
       plannedSteps: plan.plannedSteps,
       warmupSteps: plan.warmupSteps,
       lrNow: plan.lrNow,
@@ -890,9 +893,11 @@ async function train({ batchSize, learningRate, maxSteps, effort, sampleEvery, s
   stopRequested = false;
   training = true;
   if (learningRate > 0) llm.set_learning_rate(learningRate);
-  // The schedule has to know how long the run is, or its warmup and its
-  // cosine decay are shaped for a run nobody asked for.
-  llm.set_planned_steps(maxSteps > 0 ? maxSteps : 2000);
+  // The schedule has to know how long the run is, and where it starts:
+  // it is shaped around this run, anchored to the step the model is
+  // already at. Set it before anything reads a learning rate.
+  const plannedSteps = maxSteps > 0 ? maxSteps : 2000;
+  llm.set_planned_steps(plannedSteps);
 
   const info = llm.info();
   if (batchSize <= 1) {
@@ -909,7 +914,9 @@ async function train({ batchSize, learningRate, maxSteps, effort, sampleEvery, s
     contextLen: info.context_len,
     tokensPerStep: batchSize * info.context_len,
     dispatchesPerSubmit: llm.dispatches_per_submit(),
-    maxSteps: maxSteps || 'until stopped',
+    maxSteps: maxSteps || `until stopped (schedule shaped for ${plannedSteps})`,
+    startingAtStep: llm.step(),
+    peakLearningRate: JSON.parse(llm.training_plan()).peakLr,
     effort,
     learningRate: learningRate > 0 ? learningRate : 'automatic',
     plateauScale: llm.plateau_scale(),

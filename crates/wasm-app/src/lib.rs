@@ -535,7 +535,8 @@ impl WasmLLM {
              \"params\":{},\"layers\":{},\"hidden\":{},\"vocabSize\":{},\
              \"contextLen\":{},\"sources\":{},\"corpusTokens\":{},\
              \"trainingTokens\":{},\"validationTokens\":{},\"pretrained\":{},\
-             \"plateauScale\":{},\"tokensSeen\":{},\"corpusChars\":{},\"mix\":[{}]}}",
+             \"plateauScale\":{},\"tokensSeen\":{},\"corpusChars\":{},\"startStep\":{},\
+             \"mix\":[{}]}}",
             step,
             train.total_steps,
             train.warmup_steps,
@@ -557,6 +558,7 @@ impl WasmLLM {
             train.plateau_scale,
             inner.tokens_seen,
             corpus_chars,
+            train.start_step,
             mix,
         )
     }
@@ -1362,8 +1364,25 @@ impl WasmLLM {
             return;
         }
         let steps = steps as u64;
+        // Anchored to where the model actually is. Without this the
+        // cosine is handed a lifetime step against a run-length total,
+        // its progress clamps to 1.0 on every run after the first, and
+        // the whole run trains at the floor rate — a tenth of the peak
+        // it was meant to reach — with nothing saying so.
+        inner.train.start_step = inner.step;
         inner.train.total_steps = steps;
+        // A resumed run warms up again, briefly. The optimizer's moments
+        // survive a reload so this is not the cold start a new model
+        // needs, but jumping straight to the peak rate on weights that
+        // have been sitting still is how a resume undoes an hour of the
+        // run before it.
         inner.train.warmup_steps = (steps / 50).clamp(10, 200).min(steps.max(1) / 2);
+    }
+
+    /// Where in the current run a given step falls, 0 to 1.
+    pub fn run_progress(&self) -> f32 {
+        let inner = self.0.borrow();
+        inner.train.progress_at(inner.step)
     }
 
     /// Cut the learning rate because held-out loss stopped improving,

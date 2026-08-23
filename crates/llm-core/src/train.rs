@@ -25,16 +25,30 @@ use crate::rng::Rng;
 pub struct TrainConfig {
     /// Peak learning rate, reached at the end of warmup.
     pub lr: f32,
-    /// Steps spent ramping the learning rate from ~0 to `lr`.
+    /// Steps *into the run* spent ramping the learning rate from ~0 to
+    /// `lr`.
     ///
     /// A transformer's first few hundred steps are the dangerous ones:
     /// the attention softmax is near-uniform, gradients are large and
     /// badly conditioned, and a full-size step there can put the model
     /// somewhere it spends thousands of steps climbing back out of.
     pub warmup_steps: u64,
-    /// Total steps the run is planned for, used to shape the cosine
-    /// decay. Training past it just holds the floor learning rate.
+    /// How many steps the run is planned to last, used to shape the
+    /// cosine decay. Training past it just holds the floor rate.
     pub total_steps: u64,
+    /// The model's step count when this run began.
+    ///
+    /// Without this the schedule silently breaks on every run after the
+    /// first. `lr_at` is handed the model's lifetime step — 4,977, say —
+    /// while `total_steps` is the length of the run somebody asked for —
+    /// 500. The cosine's progress is then 10x past its end, clamps to
+    /// 1.0, and the whole run trains at the floor rate: a tenth of the
+    /// peak it was supposed to reach, for every step, with nothing
+    /// anywhere saying so.
+    ///
+    /// So the schedule works in steps-into-this-run, and this is what
+    /// the lifetime step is measured from.
+    pub start_step: u64,
     /// Floor of the cosine decay, as a fraction of `lr`.
     pub min_lr_ratio: f32,
     /// Decoupled weight decay (AdamW).
@@ -63,6 +77,7 @@ impl Default for TrainConfig {
             min_lr_ratio: 0.1,
             weight_decay: 0.1,
             grad_clip: 1.0,
+            start_step: 0,
             plateau_scale: 1.0,
         }
     }
@@ -71,19 +86,29 @@ impl Default for TrainConfig {
 impl TrainConfig {
     /// Learning rate for `step` (0-based): linear warmup, then cosine
     /// decay to `min_lr_ratio * lr`.
+    /// `step` is the model's lifetime step; the schedule is shaped
+    /// around this run, which began at `start_step`.
     pub fn lr_at(&self, step: u64) -> f32 {
-        // Warmup is deliberately not scaled: a plateau cut made
-        // mid-warmup would shrink the ramp the run has not finished
+        let into_run = step.saturating_sub(self.start_step);
+        // Warmup is deliberately not scaled by `plateau_scale`: a cut
+        // made mid-warmup would shrink the ramp the run has not finished
         // climbing, and warmup exists precisely to get past the part of
         // training where the rate cannot be judged yet.
-        if self.warmup_steps > 0 && step < self.warmup_steps {
-            // +1 so step 0 isn't a literal zero-size step.
-            return self.lr * (step + 1) as f32 / self.warmup_steps as f32;
+        if self.warmup_steps > 0 && into_run < self.warmup_steps {
+            // +1 so the first step isn't a literal zero-size step.
+            return self.lr * (into_run + 1) as f32 / self.warmup_steps as f32;
         }
         let decay_steps = self.total_steps.saturating_sub(self.warmup_steps).max(1);
-        let progress = ((step - self.warmup_steps) as f32 / decay_steps as f32).clamp(0.0, 1.0);
+        let progress = ((into_run - self.warmup_steps) as f32 / decay_steps as f32).clamp(0.0, 1.0);
         let cosine = 0.5 * (1.0 + (std::f32::consts::PI * progress).cos());
         self.lr * (self.min_lr_ratio + (1.0 - self.min_lr_ratio) * cosine) * self.plateau_scale
+    }
+
+    /// Where in this run a lifetime step falls, as a fraction. Past 1.0
+    /// the run is over and the rate is parked on its floor.
+    pub fn progress_at(&self, step: u64) -> f32 {
+        let into_run = step.saturating_sub(self.start_step) as f32;
+        if self.total_steps == 0 { 0.0 } else { into_run / self.total_steps as f32 }
     }
 }
 
@@ -493,8 +518,49 @@ mod tests {
         }
     }
 
+    /// The bug this exists to prevent: a run asked for 500 steps on a
+    /// model already at step 4,977 used to spend every one of them at
+    /// the floor rate, because the cosine was handed a lifetime step
+    /// against a run-length total.
+    #[test]
+    fn a_resumed_run_gets_its_whole_schedule_not_the_floor() {
+        let cfg = TrainConfig {
+            lr: 5e-4,
+            min_lr_ratio: 0.1,
+            warmup_steps: 10,
+            total_steps: 500,
+            start_step: 4977,
+            ..Default::default()
+        };
+        let floor = cfg.lr * cfg.min_lr_ratio;
+        // Ramping, not floored, at the start of the run.
+        assert!(cfg.lr_at(4977) < cfg.lr, "warmup should start below the peak");
+        assert!(cfg.lr_at(4977) > 0.0);
+        // At the peak once warmup is done.
+        assert!((cfg.lr_at(4987) - cfg.lr).abs() < 1e-9, "{}", cfg.lr_at(4987));
+        // Halfway through, halfway down.
+        let middle = cfg.lr_at(4977 + 255);
+        assert!(middle < cfg.lr && middle > floor, "{middle}");
+        // On the floor at the end, and staying there past it.
+        assert!((cfg.lr_at(4977 + 500) - floor).abs() < 1e-9);
+        assert!((cfg.lr_at(4977 + 9000) - floor).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_run_from_zero_is_unchanged_by_the_run_offset() {
+        let from_zero = TrainConfig { warmup_steps: 10, total_steps: 500, ..schedule() };
+        let resumed = TrainConfig { start_step: 3000, ..from_zero };
+        for into_run in [0, 1, 9, 10, 100, 499, 500, 900] {
+            assert!(
+                (from_zero.lr_at(into_run) - resumed.lr_at(3000 + into_run)).abs() < 1e-9,
+                "step {into_run} into the run"
+            );
+        }
+    }
+
     #[test]
     fn the_schedule_is_untouched_by_default() {
         assert_eq!(TrainConfig::default().plateau_scale, 1.0);
+        assert_eq!(TrainConfig::default().start_step, 0);
     }
 }

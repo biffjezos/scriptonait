@@ -34,7 +34,9 @@ device the page says so and does not train.
   and AdamW are WGSL compute kernels. Weights, gradients and both Adam
   moment buffers stay in GPU memory between steps.
 - AdamW with decoupled weight decay, global gradient-norm clipping, and a
-  cosine schedule with warmup shaped to the run length you asked for.
+  cosine schedule with warmup shaped to the run length you asked for and
+  anchored to the step the model is already at, so a resumed run gets a
+  whole schedule rather than the tail of one.
 - Plateau detection: when held-out loss goes four measurements without
   improving, the learning rate is halved on top of the schedule, down to
   a floor. The cosine says where the plan expected to be; this says what
