@@ -32,12 +32,16 @@ use crate::model::{ceil_div, dispatch, dispatch_add_inplace, dispatch_linear, di
 /// Must match `llm_core::model`'s RMS_EPS, which is private there.
 const RMS_EPS: f32 = 1e-6;
 
-/// Operations per command buffer. One matmul over this project's shapes
-/// is single-digit milliseconds even on a small integrated GPU, so a
-/// chunk of four stays two orders of magnitude under the driver's
-/// watchdog while costing only a few hundred microseconds of submission
-/// overhead per step.
-const DEFAULT_DISPATCHES_PER_SUBMIT: u32 = 4;
+/// Operations per command buffer.
+///
+/// A submission is not free: the profiler measured the zeroing phase -
+/// 74 dispatches of trivial work - at 376 ms, which is around 20 ms per
+/// submission and nothing at all per dispatch. Chunks of four were
+/// paying that cost 250 times a step. Thirty-two keeps a chunk at a few
+/// tens of milliseconds of GPU work, well under the driver watchdog that
+/// a whole sequence in one submission tripped, while cutting the
+/// submissions by eight.
+const DEFAULT_DISPATCHES_PER_SUBMIT: u32 = 32;
 
 /// Workgroups a reduction splits its tensor across. Enough to keep a
 /// small GPU busy on a multi-million element tensor, small enough that
@@ -812,7 +816,8 @@ impl GpuTrainer {
             wgpu::BindGroupEntry { binding: 3, resource: self.scratch.d_logits.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 4, resource: self.scratch.loss_rows.as_entire_binding() },
         ];
-        dispatch(chunks.enc(), ctx, &ctx.pipelines.cross_entropy, &entries, (ceil_div(t, 64), 1, 1));
+        // One workgroup per row; its 256 threads split the vocabulary.
+        dispatch(chunks.enc(), ctx, &ctx.pipelines.cross_entropy, &entries, (t as u32, 1, 1));
         // The per-row losses reduce straight into the step's loss slot,
         // so the batch costs one readback in total rather than one per
         // sequence.

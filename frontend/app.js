@@ -1044,7 +1044,15 @@ $('import-input').addEventListener('change', async (event) => {
 // Profiling from the console: `scriptonait.profile()` runs one step per
 // command-buffer size and logs where the milliseconds go.
 window.scriptonait = {
-  profile: (batchSize = 2) => call('profile', { batchSize }, [], 0),
+  /// Times one step per phase at four command-buffer sizes and logs the
+  /// result. Returns the rows too, but the log is the point - and it
+  /// catches its own failure, so a missing model prints one line instead
+  /// of an unhandled rejection.
+  profile: (batchSize = 2) =>
+    call('profile', { batchSize }, [], 0).catch((error) => {
+      console.error(`[scriptonait] profile: ${(error && error.message) || error}`);
+      return null;
+    }),
 };
 
 // --- Start -------------------------------------------------------------

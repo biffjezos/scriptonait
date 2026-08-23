@@ -22,7 +22,7 @@ use crate::rng::Rng;
 use crate::tokenizer::{self, Tokenizer};
 
 /// How a token is picked from a row of logits.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct SamplingConfig {
     /// `<= 0.0` means greedy (deterministic) decoding.
     pub temperature: f32,
@@ -49,6 +49,19 @@ pub struct SamplingConfig {
     pub repetition_penalty: f32,
     pub repetition_window: usize,
     pub seed: u64,
+    /// Tokens the model is allowed to emit, one flag per id. `None`
+    /// allows everything.
+    ///
+    /// A vocabulary contains every byte value so that any input can be
+    /// encoded, but a corpus of English screenplays contains almost none
+    /// of the high ones. Their embedding rows are never a target, so a
+    /// model early in training has no reason to have pushed them down,
+    /// and sampling from the top of an barely-trained distribution emits
+    /// them - which is what turns an early sample into a wall of
+    /// replacement characters rather than readable nonsense. Restricting
+    /// generation to the tokens the training text actually contains
+    /// costs nothing and makes early samples legible.
+    pub allowed: Option<std::rc::Rc<[bool]>>,
 }
 
 impl Default for SamplingConfig {
@@ -60,6 +73,7 @@ impl Default for SamplingConfig {
             repetition_penalty: 1.1,
             repetition_window: 128,
             seed: 0,
+            allowed: None,
         }
     }
 }
@@ -299,6 +313,16 @@ pub fn sample_with(
     rng: &mut Rng,
 ) -> u32 {
     let mut work: Vec<f32> = logits.to_vec();
+
+    if let Some(allowed) = sampling.allowed.as_deref() {
+        for (id, l) in work.iter_mut().enumerate() {
+            // End-of-text is always allowed: it is how a generation
+            // stops, and it is a special token rather than text.
+            if id as u32 != tokenizer::EOS && !allowed.get(id).copied().unwrap_or(true) {
+                *l = f32::NEG_INFINITY;
+            }
+        }
+    }
 
     if sampling.repetition_penalty != 1.0 {
         for &id in recent {

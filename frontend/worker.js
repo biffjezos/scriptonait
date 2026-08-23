@@ -29,6 +29,10 @@
 let wasm = null;
 let llm = null;
 let wasmReady = null;
+/// True while a training run owns the GPU. Anything else that wants the
+/// device waits for it - the wasm side refuses overlapping GPU work, and
+/// finding that out as an error beats finding it out as a panic.
+let training = false;
 
 // Set by a `stop` message. Checked by the generation callback and between
 // training steps — both cooperative, since neither can be interrupted
@@ -272,7 +276,11 @@ async function trainingSample(prompt, words) {
 
 async function train({ batchSize, learningRate, maxSteps, effort, sampleEvery, samplePrompt, sampleWords }) {
   stopRequested = false;
+  training = true;
   if (learningRate > 0) llm.set_learning_rate(learningRate);
+  // The schedule has to know how long the run is, or its warmup and its
+  // cosine decay are shaped for a run nobody asked for.
+  llm.set_planned_steps(maxSteps > 0 ? maxSteps : 2000);
 
   const info = llm.info();
   log('training run starting', {
@@ -305,6 +313,7 @@ async function train({ batchSize, learningRate, maxSteps, effort, sampleEvery, s
       const stepStart = performance.now();
       const report = await llm.train_step(batchSize);
       if (!report) {
+        training = false;
         return { steps, stopReason: 'no-data', elapsedSeconds: (performance.now() - startedAt) / 1000 };
       }
       const stepMs = performance.now() - stepStart;
@@ -379,6 +388,7 @@ async function train({ batchSize, learningRate, maxSteps, effort, sampleEvery, s
     await new Promise((resolve) => setTimeout(resolve, pauseMs));
   }
 
+  training = false;
   const elapsedSeconds = (performance.now() - startedAt) / 1000;
   log(
     `training run finished: ${steps} steps in ${elapsedSeconds.toFixed(1)} s ` +
@@ -524,6 +534,11 @@ const handlers = {
   /// per-submission cost, instead of anybody guessing.
   async profile({ batchSize = 2 }) {
     if (!llm.has_gpu()) return { error: 'no GPU device' };
+    if (training) {
+      const message = 'a training run is in flight — press Stop, then profile';
+      log(`profile refused: ${message}`);
+      return { error: message };
+    }
     const rows = [];
     for (const perSubmit of [4, 16, 64, 256]) {
       const report = JSON.parse(await llm.profile_step(batchSize, perSubmit));
@@ -556,6 +571,7 @@ const handlers = {
       result.model = describeModel();
       return result;
     } catch (error) {
+      training = false;
       const explained = describeTrainingFailure(error);
       log(`training failed: ${explained}`);
       throw new Error(explained);
@@ -581,7 +597,15 @@ self.onmessage = async (event) => {
   }
   // Everything except `stop` needs a model; saying so beats a wasm panic.
   if (!llm && !['load-model', 'create-model', 'import-checkpoint', 'parse-prompt', 'stop'].includes(type)) {
-    fail(rid, new Error('no model loaded yet'));
+    fail(
+      rid,
+      new Error(
+        type === 'profile'
+          ? 'profiling needs a model: press Train first (a model lives in this tab only, so ' +
+            'a reload leaves none), then run scriptonait.profile() again'
+          : 'no model loaded yet',
+      ),
+    );
     return;
   }
   try {
