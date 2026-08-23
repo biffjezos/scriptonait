@@ -32,8 +32,17 @@ struct Params {
 @group(0) @binding(5) var<storage, read_write> probs: array<f32>;
 
 const THREADS: u32 = 64u;
+/// Largest head dimension the query cache holds; `supports` refuses a
+/// model past it, so this is never silently exceeded.
+const MAX_HEAD_DIM: u32 = 256u;
 
 var<workgroup> partial: array<f32, 64>;
+/// This row's query vector, read once from global memory instead of
+/// once per key by every thread. The kernel was reading `n * head_dim`
+/// values of `q` per row where `head_dim` would do - a third of all its
+/// traffic, on a kernel that turned out to be memory-bound and 40% of a
+/// training step.
+var<workgroup> q_row: array<f32, 256>;
 
 @compute @workgroup_size(64)
 fn main(
@@ -60,13 +69,18 @@ fn main(
     let n = select(0u, t - lo + 1u, live);
     let scale = 1.0 / sqrt(f32(p.head_dim));
 
+    for (var d: u32 = lane; d < p.head_dim; d = d + THREADS) {
+        q_row[d] = select(0.0, q[base_q + d], live);
+    }
+    workgroupBarrier();
+
     // Scores, and this row's maximum, split over the window.
     var lane_max: f32 = -3.0e38;
     for (var j: u32 = lane; j < n; j = j + THREADS) {
         let base_k = (lo + j) * kvd + kvh * p.head_dim;
         var acc: f32 = 0.0;
         for (var d: u32 = 0u; d < p.head_dim; d = d + 1u) {
-            acc = acc + q[base_q + d] * k[base_k + d];
+            acc = acc + q_row[d] * k[base_k + d];
         }
         let s = acc * scale;
         probs[row + j] = s;
