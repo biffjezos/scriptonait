@@ -54,6 +54,12 @@ pub struct Corpus {
     /// question it is supposed to: how does this model do on writing like
     /// the writing it was trained on.
     val_cache: Vec<u32>,
+    /// `(start, len)` of every source's held-out slice inside
+    /// `val_cache`, so a held-out window can be drawn from inside one
+    /// source rather than across the seam between two — the same rule
+    /// the training sampler has always had, and which the held-out
+    /// sampler was missing.
+    val_spans: Vec<(usize, usize)>,
     /// Every distinct word the sources use, built once and thrown away
     /// whenever a source changes. Generated text is measured against it
     /// (see `eval::text_stats`), and rebuilding it per measurement would
@@ -97,6 +103,7 @@ impl Corpus {
             boundaries: Vec::new(),
             spans: Vec::new(),
             val_cache: Vec::new(),
+            val_spans: Vec::new(),
             word_vocab: None,
             dirty: true,
             tokenizer: Tokenizer::byte_level(),
@@ -282,6 +289,7 @@ impl Corpus {
         self.boundaries.clear();
         self.spans.clear();
         self.val_cache.clear();
+        self.val_spans.clear();
         for id in &self.order {
             let Some(tokens) = self.sources.get(id) else { continue };
             // Each source contributes its own held-out slice, taken from
@@ -300,6 +308,7 @@ impl Corpus {
             self.boundaries.push(self.flat_cache.len());
             self.spans.push((self.flat_cache.len(), split));
             self.flat_cache.extend_from_slice(&tokens[..split]);
+            self.val_spans.push((self.val_cache.len(), tokens.len() - split));
             self.val_cache.extend_from_slice(&tokens[split..]);
         }
         self.dirty = false;
@@ -319,6 +328,16 @@ impl Corpus {
         let built = std::rc::Rc::new(crate::eval::vocabulary(self.cleaned_text.values()));
         self.word_vocab = Some(std::rc::Rc::clone(&built));
         built
+    }
+
+    /// Characters of cleaned text across every source.
+    ///
+    /// The stable measure of "how much text is there". The token count
+    /// is not: relearning the vocabulary re-encodes the same text into a
+    /// different number of tokens, and a number that moves for reasons
+    /// the user did not cause is a number they stop believing.
+    pub fn total_chars(&self) -> usize {
+        self.cleaned_text.values().map(|t| t.chars().count()).sum()
     }
 
     /// Bytes of cleaned text per token, over the whole corpus.
@@ -382,6 +401,103 @@ impl Corpus {
 
     /// A batch drawn from the held-out stream — a slice of every source,
     /// never anything a training window can reach.
+    /// A fixed set of windows drawn from one token stream, spread
+    /// evenly across the sources in it and never crossing the seam
+    /// between two. The same windows every call.
+    ///
+    /// Two things this has to get right, and the old held-out sampler
+    /// got neither:
+    ///
+    /// **Fixed.** Fresh random windows every measurement means two
+    /// consecutive numbers differ by which text was drawn, not by how
+    /// the model changed, and at a few thousand tokens a measurement
+    /// that term is the larger one. A fixed set removes it entirely.
+    ///
+    /// **Inside one source.** The stream is a concatenation, and a
+    /// window spanning the seam asks the model to predict one script's
+    /// title page from another script's last line. The training sampler
+    /// has always refused to do that; the held-out sampler did it
+    /// freely, which put a floor under held-out loss that had nothing to
+    /// do with the model.
+    fn fixed_windows(
+        cache: &[u32],
+        spans: &[(usize, usize)],
+        count: usize,
+        context_len: usize,
+    ) -> Option<Batch> {
+        if count == 0 {
+            return None;
+        }
+        let usable: Vec<(usize, usize)> =
+            spans.iter().copied().filter(|&(_, len)| len > context_len + 1).collect();
+        if usable.is_empty() {
+            return None;
+        }
+        // Total room for a window across every usable source. Walking a
+        // position into this and then into the source that holds it
+        // spreads the set in proportion to how much text each source
+        // is, the same weighting the training sampler uses.
+        let total: usize = usable.iter().map(|&(_, len)| len - context_len - 1).sum();
+        let mut inputs = Vec::with_capacity(count * context_len);
+        let mut targets = Vec::with_capacity(count * context_len);
+        for i in 0..count {
+            let mut offset = (i * total) / count;
+            let mut start = usable[0].0;
+            for &(base, len) in &usable {
+                let room = len - context_len - 1;
+                if offset < room {
+                    start = base + offset;
+                    break;
+                }
+                offset -= room;
+            }
+            if start + context_len + 1 > cache.len() {
+                continue;
+            }
+            inputs.extend_from_slice(&cache[start..start + context_len]);
+            targets.extend_from_slice(&cache[start + 1..start + 1 + context_len]);
+        }
+        let batch_size = inputs.len() / context_len.max(1);
+        if batch_size == 0 {
+            return None;
+        }
+        Some(Batch { inputs, targets, batch_size, context_len })
+    }
+
+    /// The held-out set: a fixed set of windows the model is never
+    /// trained on.
+    pub fn validation_batch(&mut self, count: usize, context_len: usize) -> Option<Batch> {
+        self.rebuild_flat_if_needed();
+        Self::fixed_windows(&self.val_cache, &self.val_spans, count, context_len)
+    }
+
+    /// The same thing drawn from the *training* text, and the reason it
+    /// exists is the whole point of this pair.
+    ///
+    /// The training loss a run reports is measured on the batches it
+    /// happens to be training on, and those are not a fair sample: 40%
+    /// of them start at a source's opening (see
+    /// `BOUNDARY_ALIGNED_SAMPLE_RATE`), which is the most predictable
+    /// text in the corpus and which the model learns within a few
+    /// hundred steps. Held-out windows never start at an opening,
+    /// because openings live in the training portion of each source.
+    ///
+    /// So the two numbers measure different distributions, and their gap
+    /// opens up the moment the model learns what an opening looks like —
+    /// which reads exactly like overfitting, at a point in a run where
+    /// the model has seen a tenth of its text and cannot possibly be
+    /// memorizing it.
+    ///
+    /// This probe is drawn from training text the same way the held-out
+    /// set is drawn from held-out text. The difference between the two
+    /// is then a real answer to "does this model do worse on text it has
+    /// not seen", because sampling is the one thing that is no longer
+    /// different about them.
+    pub fn training_probe_batch(&mut self, count: usize, context_len: usize) -> Option<Batch> {
+        self.rebuild_flat_if_needed();
+        Self::fixed_windows(&self.flat_cache, &self.spans, count, context_len)
+    }
+
     pub fn sample_validation_batch(
         &mut self,
         batch_size: usize,
@@ -605,6 +721,89 @@ mod tests {
             assert!(c.sample_batch(2, 32, &mut rng).is_some());
             assert!(c.sample_validation_batch(2, 32, &mut rng).is_some());
         }
+    }
+
+    #[test]
+    fn the_validation_set_is_the_same_every_time() {
+        let mut c = Corpus::new();
+        c.upsert("a", &"the cave and the fire and the shadows on the wall. ".repeat(400), false);
+        let first = c.validation_batch(4, 32).expect("enough held-out text");
+        for _ in 0..5 {
+            let again = c.validation_batch(4, 32).expect("enough held-out text");
+            assert_eq!(again.inputs, first.inputs, "the validation set must not move");
+            assert_eq!(again.targets, first.targets);
+        }
+    }
+
+    #[test]
+    fn the_validation_set_spreads_across_the_held_out_stream() {
+        let mut c = Corpus::new();
+        for i in 0..6 {
+            c.upsert(&format!("s{i}"), &format!("source {i} text. ").repeat(500), false);
+        }
+        let batch = c.validation_batch(4, 32).expect("enough held-out text");
+        // Four windows drawn from four different places: if they were
+        // the first four in a row they would share most of their tokens.
+        let windows: Vec<&[u32]> = batch.inputs.chunks(32).collect();
+        assert_eq!(windows.len(), 4);
+        assert!(
+            windows[0] != windows[3],
+            "windows from opposite ends of the stream should differ"
+        );
+    }
+
+    #[test]
+    fn no_validation_set_without_enough_held_out_text() {
+        let mut c = Corpus::new();
+        c.upsert("a", "too short", false);
+        assert!(c.validation_batch(4, 32).is_none());
+    }
+
+    #[test]
+    fn a_held_out_window_never_spans_two_sources_either() {
+        let mut c = Corpus::new();
+        // Six sources with disjoint vocabularies, so a window that
+        // crossed a seam would hold tokens from two of them.
+        for letter in ["a", "b", "c", "d", "e", "f"] {
+            c.upsert(letter, &format!("{letter} ").repeat(4000), false);
+        }
+        let batch = c.validation_batch(6, 16).expect("enough held-out text");
+        for window in batch.inputs.chunks(16) {
+            // Each source is one letter and a space, so a window inside
+            // one has at most three distinct ids counting the boundary
+            // tokens. One that crossed a seam would carry two letters.
+            let mut letters: Vec<u32> = window
+                .iter()
+                .copied()
+                .filter(|&id| (b'a' as u32..=b'f' as u32).contains(&id))
+                .collect();
+            letters.sort_unstable();
+            letters.dedup();
+            assert!(
+                letters.len() <= 1,
+                "a held-out window crossed a source seam: {letters:?}"
+            );
+        }
+    }
+
+    /// The probe and the held-out set are drawn the same way, from the
+    /// two halves of the same split. That is what makes their difference
+    /// mean something.
+    #[test]
+    fn the_training_probe_matches_the_held_out_set_in_shape() {
+        let mut c = Corpus::new();
+        for i in 0..4 {
+            c.upsert(&format!("s{i}"), &format!("source {i} text here. ").repeat(600), false);
+        }
+        let probe = c.training_probe_batch(8, 32).expect("training text");
+        let held = c.validation_batch(8, 32).expect("held-out text");
+        assert_eq!(probe.batch_size, held.batch_size);
+        assert_eq!(probe.context_len, held.context_len);
+        // And both are fixed.
+        assert_eq!(c.training_probe_batch(8, 32).unwrap().inputs, probe.inputs);
+        assert_eq!(c.validation_batch(8, 32).unwrap().inputs, held.inputs);
+        // Drawn from different halves, so they are not the same text.
+        assert_ne!(probe.inputs, held.inputs);
     }
 
     #[test]

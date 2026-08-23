@@ -25,8 +25,11 @@ device the page says so and does not train.
   IndexedDB and reloaded on the next visit.
 - A BPE vocabulary is learned from your own corpus, sized to it, so the
   tokens are the phrases your text actually uses.
-- The last 5% of the corpus is held out of training, to measure the model
-  against text it has never seen.
+- Five percent of every source is held out of training, to measure the
+  model against text it has never seen. The measurement uses a fixed set
+  of windows, evenly spaced across that held-out text and identical on
+  every measurement, so two numbers differ because the weights differ
+  and not because two random draws landed on different text.
 
 **Training**
 
@@ -34,7 +37,9 @@ device the page says so and does not train.
   and AdamW are WGSL compute kernels. Weights, gradients and both Adam
   moment buffers stay in GPU memory between steps.
 - AdamW with decoupled weight decay, global gradient-norm clipping, and a
-  cosine schedule with warmup shaped to the run length you asked for.
+  cosine schedule with warmup shaped to the run length you asked for and
+  anchored to the step the model is already at, so a resumed run gets a
+  whole schedule rather than the tail of one.
 - Plateau detection: when held-out loss goes four measurements without
   improving, the learning rate is halved on top of the schedule, down to
   a floor. The cosine says where the plan expected to be; this says what
@@ -60,9 +65,15 @@ device the page says so and does not train.
   what would actually help, named with the number behind it. Sources are
   classified by line shape (film scripts, novels, essays, verse), so a
   corpus that is all one thing is told so.
-- Live loss chart with two curves — training loss and held-out loss, on
-  one axis, because the gap between them is what says whether the model
-  is learning the language or memorizing your text.
+- Live loss chart with three curves on one axis: per-step training loss,
+  held-out loss, and training loss measured on a fixed set of windows
+  drawn exactly as the held-out set is. That third one exists because
+  the first two cannot honestly be compared — 40% of training windows
+  start at a source's opening and no held-out window ever does, so the
+  two separate as soon as the model learns what an opening looks like,
+  a few hundred steps in and long before anything could be memorized.
+  The gap worth reading is between the dashed curve and the held-out
+  one.
 - Samples the model as it trains, into a single card that updates in
   place.
 - The trained model and its optimizer state are saved to the browser

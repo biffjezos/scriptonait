@@ -81,6 +81,13 @@ struct Inner {
     /// `sync_from_gpu` when something needs it here.
     weights: ModelWeights,
     step: u64,
+    /// Tokens this model has been trained on, cumulative over every run.
+    ///
+    /// Not derivable from `step`: a step is one batch, and the batch
+    /// size changes between runs and between machines. This is counted
+    /// as it happens and carried in the checkpoint, because it — not the
+    /// step count — is what says how trained a model is.
+    tokens_seen: u64,
     /// The seed the model was built from, so a rebuild at a new
     /// vocabulary size starts from the same place.
     seed: u64,
@@ -318,12 +325,25 @@ impl WasmLLM {
         result
     }
 
-    /// Loss on held-out text — the number that separates learning from
-    /// memorizing. Returns -1 when there is not enough text to hold any
-    /// out, or no training state on the GPU yet.
+    /// Loss on a fixed set of held-out windows — the number that
+    /// separates learning from memorizing. Returns -1 when there is not
+    /// enough text to hold any out, or no training state on the GPU yet.
+    ///
+    /// `batch_size` is how many windows the set holds, not a sample
+    /// size: the same windows come back every call, so two measurements
+    /// differ only because the weights differ.
     pub async fn validation_loss(&self, batch_size: u32) -> Result<f32, JsValue> {
         self.acquire()?;
         let result = self.validation_loss_inner(batch_size).await;
+        self.release();
+        result
+    }
+
+    /// Loss on a fixed set of *training* windows, drawn exactly as the
+    /// held-out set is drawn. The number to compare held-out against.
+    pub async fn training_probe_loss(&self, batch_size: u32) -> Result<f32, JsValue> {
+        self.acquire()?;
+        let result = self.fixed_set_loss(batch_size, false).await;
         self.release();
         result
     }
@@ -371,6 +391,7 @@ impl WasmLLM {
             config: checkpoint.config,
             weights: checkpoint.weights,
             step: checkpoint.step,
+            tokens_seen: checkpoint.tokens_seen,
             seed: 1,
             rng: Rng::seed_from_u64(1),
             corpus: Corpus::with_tokenizer(checkpoint.tokenizer),
@@ -419,6 +440,7 @@ impl WasmLLM {
             config,
             weights: ModelWeights::init(&config, seed as u64),
             step: 0,
+            tokens_seen: 0,
             seed: seed as u64,
             rng: Rng::seed_from_u64(seed as u64),
             corpus: Corpus::with_tokenizer(tokenizer),
@@ -503,6 +525,12 @@ impl WasmLLM {
         let train = inner.train;
         let step = inner.step;
         let context_len = config.context_len;
+        // Characters as well as tokens, because the token count moves
+        // when the vocabulary is relearned and the character count does
+        // not. The same corpus reads as 6.5M tokens at a 4k vocabulary
+        // and 4.5M at an 8k one, and somebody watching that number
+        // change with no explanation is right to distrust all of them.
+        let corpus_chars = inner.corpus.total_chars();
         let training_tokens = inner.corpus.training_tokens();
         let validation_tokens = inner.corpus.validation_tokens();
         let mix = inner
@@ -520,7 +548,8 @@ impl WasmLLM {
              \"params\":{},\"layers\":{},\"hidden\":{},\"vocabSize\":{},\
              \"contextLen\":{},\"sources\":{},\"corpusTokens\":{},\
              \"trainingTokens\":{},\"validationTokens\":{},\"pretrained\":{},\
-             \"plateauScale\":{},\"mix\":[{}]}}",
+             \"plateauScale\":{},\"tokensSeen\":{},\"corpusChars\":{},\"startStep\":{},\
+             \"mix\":[{}]}}",
             step,
             train.total_steps,
             train.warmup_steps,
@@ -540,6 +569,9 @@ impl WasmLLM {
             validation_tokens,
             inner.pretrained,
             train.plateau_scale,
+            inner.tokens_seen,
+            corpus_chars,
+            train.start_step,
             mix,
         )
     }
@@ -1033,6 +1065,9 @@ impl WasmLLM {
 
         let inner = &mut *self.0.borrow_mut();
         inner.step += 1;
+        // The tokens this step actually consumed, not an estimate from
+        // the batch size the page happens to be set to.
+        inner.tokens_seen += report.tokens as u64;
         Ok(Some(StepReport {
             loss: report.loss,
             lr: report.lr,
@@ -1185,13 +1220,35 @@ impl WasmLLM {
     }
 
     async fn validation_loss_inner(&self, batch_size: u32) -> Result<f32, JsValue> {
+        self.fixed_set_loss(batch_size, true).await
+    }
+
+    /// Loss on one of the two fixed sets: held-out text, or training
+    /// text drawn the same way.
+    ///
+    /// Both exist so their difference means something. The per-step
+    /// training loss cannot be compared with held-out loss, because 40%
+    /// of training windows start at a source's opening and no held-out
+    /// window ever does — so the two diverge as soon as the model learns
+    /// what an opening looks like, which is not overfitting and happens
+    /// within a few hundred steps.
+    async fn fixed_set_loss(&self, batch_size: u32, held_out: bool) -> Result<f32, JsValue> {
         let batch = {
             let inner = &mut *self.0.borrow_mut();
             if inner.gpu.as_ref().is_none_or(|gpu| gpu.trainer.is_none()) {
                 return Ok(-1.0);
             }
             let context_len = inner.config.context_len;
-            match inner.corpus.sample_validation_batch(batch_size as usize, context_len, &mut inner.rng) {
+            // The same windows every time. A fresh random draw each
+            // measurement makes consecutive numbers differ by which text
+            // they happened to pick, and at a few thousand tokens a
+            // measurement that term is larger than the learning.
+            let picked = if held_out {
+                inner.corpus.validation_batch(batch_size as usize, context_len)
+            } else {
+                inner.corpus.training_probe_batch(batch_size as usize, context_len)
+            };
+            match picked {
                 Some(batch) => batch,
                 None => return Ok(-1.0),
             }
@@ -1342,8 +1399,25 @@ impl WasmLLM {
             return;
         }
         let steps = steps as u64;
+        // Anchored to where the model actually is. Without this the
+        // cosine is handed a lifetime step against a run-length total,
+        // its progress clamps to 1.0 on every run after the first, and
+        // the whole run trains at the floor rate — a tenth of the peak
+        // it was meant to reach — with nothing saying so.
+        inner.train.start_step = inner.step;
         inner.train.total_steps = steps;
+        // A resumed run warms up again, briefly. The optimizer's moments
+        // survive a reload so this is not the cold start a new model
+        // needs, but jumping straight to the peak rate on weights that
+        // have been sitting still is how a resume undoes an hour of the
+        // run before it.
         inner.train.warmup_steps = (steps / 50).clamp(10, 200).min(steps.max(1) / 2);
+    }
+
+    /// Where in the current run a given step falls, 0 to 1.
+    pub fn run_progress(&self) -> f32 {
+        let inner = self.0.borrow();
+        inner.train.progress_at(inner.step)
     }
 
     /// Cut the learning rate because held-out loss stopped improving,
@@ -1398,6 +1472,7 @@ impl WasmLLM {
             weights: inner.weights.clone(),
             tokenizer: inner.corpus.tokenizer().clone(),
             step: inner.step,
+            tokens_seen: inner.tokens_seen,
         };
         Ok(checkpoint.to_bytes_with(WeightDtype::Bf16))
     }
@@ -1411,6 +1486,7 @@ impl WasmLLM {
         inner.config = checkpoint.config;
         inner.weights = checkpoint.weights;
         inner.step = checkpoint.step;
+        inner.tokens_seen = checkpoint.tokens_seen;
         inner.corpus.set_tokenizer(checkpoint.tokenizer);
         inner.pretrained = true;
         // Both the uploaded generation weights and any resident training
