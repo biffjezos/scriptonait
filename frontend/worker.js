@@ -207,7 +207,7 @@ function describePrompt(prompt) {
   };
 }
 
-async function generate({ prompt, extraContext, temperature, topK, topP, repetitionPenalty, seed }) {
+async function generate({ prompt, extraContext, temperature, topK, topP, minP, repetitionPenalty, seed }) {
   stopRequested = false;
   const startedAt = performance.now();
   let lastPost = 0;
@@ -219,6 +219,7 @@ async function generate({ prompt, extraContext, temperature, topK, topP, repetit
     temperature,
     topK,
     topP,
+    minP || 0,
     repetitionPenalty,
     seed,
     (piece, words) => {
@@ -275,6 +276,11 @@ async function trainingSample(prompt, words) {
     0.9,
     40,
     0.95,
+    // A training sample is the one place min-p earns its keep without
+    // being asked for: an early model's distribution is nearly flat, so
+    // this keeps the field wide, and a later one's is peaked, so it
+    // stops the sample wandering into the tail.
+    0.05,
     1.1,
     Math.floor(Math.random() * 1e9),
     (_piece, produced) => produced < words,

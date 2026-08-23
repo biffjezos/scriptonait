@@ -199,6 +199,9 @@
           <label>Top-p
             <input type="number" id="opt-top-p" value="0.95" min="0.05" max="1" step="0.01" />
           </label>
+          <label>Min-p
+            <input type="number" id="opt-min-p" value="0.05" min="0" max="1" step="0.01" />
+          </label>
           <label>Repetition penalty
             <input type="number" id="opt-repetition" value="1.1" min="1" max="2" step="0.05" />
           </label>
@@ -206,7 +209,12 @@
             <input type="number" id="opt-seed" value="0" min="0" />
           </label>
         </div>
-        <p class="hint">Temperature 0 = repeatable.</p>
+        <p class="hint">
+          Temperature 0 = repeatable. Min-p keeps only tokens at least that fraction as likely
+          as the best one, so a confident step stays sharp and an uncertain one stays open —
+          which is what top-p, at a fixed 95% of the mass, cannot do. It generally does the
+          truncating on its own; 0 turns it off.
+        </p>
       </details>
     </section>
 

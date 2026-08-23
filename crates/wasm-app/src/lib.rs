@@ -609,6 +609,7 @@ impl WasmLLM {
         temperature: f32,
         top_k: u32,
         top_p: f32,
+        min_p: f32,
         repetition_penalty: f32,
         seed: f64,
         on_token: &js_sys::Function,
@@ -618,6 +619,7 @@ impl WasmLLM {
             temperature,
             top_k: top_k as usize,
             top_p,
+            min_p,
             repetition_penalty,
             seed: seed as u64,
             // Never emit a token the training text does not contain. A

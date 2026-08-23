@@ -519,6 +519,7 @@ $('generate-btn').addEventListener('click', async () => {
       temperature: Number($('opt-temperature').value),
       topK: Number($('opt-top-k').value),
       topP: Number($('opt-top-p').value),
+      minP: Number($('opt-min-p').value),
       repetitionPenalty: Number($('opt-repetition').value),
       seed: Number($('opt-seed').value) || Math.floor(Math.random() * 1e9),
       useStoryState: $('use-story-state').checked,

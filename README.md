@@ -65,8 +65,12 @@ device the page says so and does not train.
 
 **Writing**
 
-- Generate from a prompt, with temperature, top-k, top-p, repetition
-  penalty and seed. Text streams in and can be stopped.
+- Generate from a prompt, with temperature, top-k, top-p, min-p,
+  repetition penalty and seed. Text streams in and can be stopped.
+- Min-p truncates relative to the best token rather than to a fixed
+  share of the mass, so a confident step stays sharp and an uncertain
+  one stays open. At this model size the distribution is often barely
+  peaked, and that is exactly where top-p behaves worst.
 - The prompt is read as an instruction — form (screenplay, novel,
   allegory, …), length, subject, a work to echo — and shown back as chips
   before generating, so a misread prompt is visibly misread.
