@@ -584,7 +584,15 @@ self.onmessage = async (event) => {
   }
   // Everything except `stop` needs a model; saying so beats a wasm panic.
   if (!llm && !['load-model', 'create-model', 'import-checkpoint', 'parse-prompt', 'stop'].includes(type)) {
-    fail(rid, new Error('no model loaded yet'));
+    fail(
+      rid,
+      new Error(
+        type === 'profile'
+          ? 'profiling needs a model: press Train first (a model lives in this tab only, so ' +
+            'a reload leaves none), then run scriptonait.profile() again'
+          : 'no model loaded yet',
+      ),
+    );
     return;
   }
   try {
