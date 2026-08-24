@@ -1111,15 +1111,41 @@ function renderBestModel(best) {
     row.hidden = true;
     return;
   }
+  // A "best" a few hundred steps back, while the curve is still falling
+  // steeply, is the measurement wobbling rather than a model worth
+  // going back to — and the button beside this offers to throw away
+  // real training for it. So the line says which of the two it is.
+  const behind = model ? model.step - best.step : 0;
+  const early = model && model.step > 0 && behind > 0 && behind < 500;
   $('best-model-text').textContent =
-    `Best so far: held-out ${best.validationLoss.toFixed(3)} at step ${best.step.toLocaleString()}.`;
+    `Best so far: held-out ${best.validationLoss.toFixed(3)} at step ` +
+    `${best.step.toLocaleString()}` +
+    (behind > 0 ? `, ${behind.toLocaleString()} steps back` : '') +
+    (early
+      ? ' — close enough to now that it is probably the measurement wobbling, not a better model.'
+      : '.');
   row.hidden = false;
 }
 
 $('restore-best-btn').addEventListener('click', async () => {
   const best = await db.getBestModel();
   if (!best) return;
-  if (!confirm(`Go back to the model from step ${best.step.toLocaleString()}? The current one is replaced.`)) {
+  // What this costs has to be on the button, not discovered afterwards.
+  // The snapshot is weights only: the Adam moments are three times the
+  // size of the model and keeping a copy of them per snapshot is the
+  // kind of memory pressure that has already cost somebody a run. So a
+  // restore resumes with the optimizer reset, the loss steps up, and it
+  // takes a few hundred steps to get the momentum back.
+  const behind = model ? model.step - best.step : 0;
+  if (!confirm(
+    `Go back to the model from step ${best.step.toLocaleString()}?\n\n` +
+      (behind > 0 ? `That discards the last ${behind.toLocaleString()} steps. ` : '') +
+      'The snapshot holds the weights but not the optimizer state, so training resumes with ' +
+      "Adam's momentum reset — the loss will step up and take a few hundred steps to come " +
+      'back down.\n\nWorth it when a run has genuinely gone past its best. Early in a run, ' +
+      'when both curves are still falling steeply, a "best" a few hundred steps back is ' +
+      'usually just the measurement wobbling.',
+  )) {
     return;
   }
   setModelStatus('loading', 'Restoring the best model…');
