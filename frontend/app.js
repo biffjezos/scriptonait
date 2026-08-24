@@ -294,8 +294,26 @@ function updateGuidance() {
 /// Called whenever a model appears, because sources can be added before
 /// one exists — that's the normal order now — and the model starts empty.
 async function syncAllSources() {
+  // Counted, because syncSource swallows its failures — it has to, since
+  // one unreadable record must not stop the other sixty-five. But a
+  // silent partial hand-over means training on a fraction of the corpus
+  // while every number on the page describes the whole of it, and
+  // nothing anywhere says which.
+  let handed = 0;
+  const failed = [];
   for (const source of sources) {
-    await syncSource(source);
+    if (await syncSource(source)) handed += 1;
+    else failed.push(source.title || source.id);
+  }
+  if (failed.length > 0) {
+    console.warn(`[scriptonait] ${failed.length} sources did not reach the model:`, failed);
+    showError(
+      `${failed.length} of ${sources.length} sources could not be given to the model ` +
+        `(${failed.slice(0, 3).join(', ')}${failed.length > 3 ? ', …' : ''}). ` +
+        'It will train on the rest — remove and re-add those, or reload the page.',
+    );
+  } else if (handed > 0) {
+    console.info(`[scriptonait] handed ${handed} sources to the model`);
   }
   await reportDuplicates();
   await refreshPlan();
