@@ -77,7 +77,7 @@ impl WeightDtype {
 }
 
 /// f32 -> bf16: keep the top 16 bits, rounding to nearest even.
-fn to_bf16(x: f32) -> u16 {
+pub(crate) fn to_bf16(x: f32) -> u16 {
     let bits = x.to_bits();
     if x.is_nan() {
         // Keep it a NaN rather than letting the rounding add turn it
@@ -114,6 +114,55 @@ pub struct Checkpoint {
     pub tokens_seen: u64,
 }
 
+/// Write a checkpoint from borrowed parts, at the requested width.
+///
+/// Borrowed, and streaming, for one reason: a 38M-parameter model is
+/// 153 MB of f32 weights. Cloning them to build a `Checkpoint`, then
+/// serializing that to an f32 `Vec`, then converting that to bf16, holds
+/// four copies at once inside a wasm heap that also contains the live
+/// weights and the copy just downloaded from the GPU. That is around
+/// 750 MB, it is how an export ends in `rust_oom`, and an allocation
+/// failure in wasm is not an error anybody catches — it aborts the
+/// module and takes the model with it.
+///
+/// This holds one copy: the output.
+pub fn write_checkpoint(
+    config: &ModelConfig,
+    weights: &ModelWeights,
+    tokenizer: &Tokenizer,
+    step: u64,
+    tokens_seen: u64,
+    dtype: WeightDtype,
+) -> Vec<u8> {
+    let tokenizer_bytes = tokenizer.to_bytes();
+    let bf16 = dtype == WeightDtype::Bf16;
+    let weight_len = weights.param_count() * if bf16 { 2 } else { 4 };
+    let mut out = Vec::with_capacity(64 + tokenizer_bytes.len() + weight_len);
+    out.extend_from_slice(MAGIC);
+    out.extend_from_slice(&VERSION.to_le_bytes());
+    for value in [
+        config.num_layers,
+        config.hidden_dim,
+        config.num_heads,
+        config.num_kv_heads,
+        config.context_len,
+        config.local_window,
+        config.vocab_size,
+    ] {
+        out.extend_from_slice(&(value as u32).to_le_bytes());
+    }
+    out.extend_from_slice(&config.rope_theta.to_le_bytes());
+    out.extend_from_slice(&u32::from(config.use_ple).to_le_bytes());
+    out.extend_from_slice(&step.to_le_bytes());
+    out.extend_from_slice(&tokens_seen.to_le_bytes());
+    out.extend_from_slice(&dtype.tag().to_le_bytes());
+    out.extend_from_slice(&(tokenizer_bytes.len() as u32).to_le_bytes());
+    out.extend_from_slice(&tokenizer_bytes);
+    out.extend_from_slice(&(weight_len as u32).to_le_bytes());
+    weights.write_into(&mut out, bf16);
+    out
+}
+
 impl Checkpoint {
     /// Serialize at full precision — the trainer's own format.
     pub fn to_bytes(&self) -> Vec<u8> {
@@ -123,41 +172,14 @@ impl Checkpoint {
     /// Serialize with the weights in `dtype`. `Bf16` is what gets
     /// published to the site.
     pub fn to_bytes_with(&self, dtype: WeightDtype) -> Vec<u8> {
-        let tokenizer_bytes = self.tokenizer.to_bytes();
-        let f32_bytes = self.weights.to_bytes();
-        let weight_bytes = match dtype {
-            WeightDtype::F32 => f32_bytes,
-            WeightDtype::Bf16 => f32_bytes
-                .chunks_exact(4)
-                .flat_map(|c| {
-                    to_bf16(f32::from_le_bytes(c.try_into().unwrap())).to_le_bytes()
-                })
-                .collect(),
-        };
-        let mut out = Vec::with_capacity(64 + tokenizer_bytes.len() + weight_bytes.len());
-        out.extend_from_slice(MAGIC);
-        out.extend_from_slice(&VERSION.to_le_bytes());
-        for value in [
-            self.config.num_layers,
-            self.config.hidden_dim,
-            self.config.num_heads,
-            self.config.num_kv_heads,
-            self.config.context_len,
-            self.config.local_window,
-            self.config.vocab_size,
-        ] {
-            out.extend_from_slice(&(value as u32).to_le_bytes());
-        }
-        out.extend_from_slice(&self.config.rope_theta.to_le_bytes());
-        out.extend_from_slice(&u32::from(self.config.use_ple).to_le_bytes());
-        out.extend_from_slice(&self.step.to_le_bytes());
-        out.extend_from_slice(&self.tokens_seen.to_le_bytes());
-        out.extend_from_slice(&dtype.tag().to_le_bytes());
-        out.extend_from_slice(&(tokenizer_bytes.len() as u32).to_le_bytes());
-        out.extend_from_slice(&tokenizer_bytes);
-        out.extend_from_slice(&(weight_bytes.len() as u32).to_le_bytes());
-        out.extend_from_slice(&weight_bytes);
-        out
+        write_checkpoint(
+            &self.config,
+            &self.weights,
+            &self.tokenizer,
+            self.step,
+            self.tokens_seen,
+            dtype,
+        )
     }
 
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, String> {

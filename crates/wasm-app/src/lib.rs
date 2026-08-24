@@ -1560,7 +1560,9 @@ pub fn describe_shape(
             (0, 0, 0, 1.0, 0, 0, 0)
         };
     format!(
-        "{{"valid":{},"problem":{:?},"params":{},"vocabSize":{},"headDim":{},         "kvDim":{},"ffnDim":{},"trainingBytes":{},"inferenceBytes":{},         "memoryLimitBytes":{},"tileEfficiency":{:.4},"band":{}}}",
+        "{{\"valid\":{},\"problem\":{:?},\"params\":{},\"vocabSize\":{},\"headDim\":{},\
+         \"kvDim\":{},\"ffnDim\":{},\"trainingBytes\":{},\"inferenceBytes\":{},\
+         \"memoryLimitBytes\":{},\"tileEfficiency\":{:.4},\"band\":{}}}",
         problem.is_empty(),
         problem,
         params,

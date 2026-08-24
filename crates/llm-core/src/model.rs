@@ -214,12 +214,33 @@ impl ModelWeights {
     /// passes it back into `from_bytes`.
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(self.param_count() * 4);
+        self.write_into(&mut out, false);
+        out
+    }
+
+    /// Append every parameter to `out`, at four bytes each or two.
+    ///
+    /// Appending rather than returning is the point. A 38M-parameter
+    /// model is 153 MB of f32; building that as a `Vec` and then
+    /// converting it to bf16 holds 230 MB at once, inside a wasm heap
+    /// that also holds the live weights, the copy just downloaded from
+    /// the GPU, and whatever the page was doing when it asked. That is
+    /// how an export ends in `rust_oom` and takes the whole module with
+    /// it — there is no unwinding from an allocation failure, so a model
+    /// somebody trained overnight is simply gone.
+    ///
+    /// Writing straight into the destination at the width it wants holds
+    /// one copy instead of three.
+    pub fn write_into(&self, out: &mut Vec<u8>, bf16: bool) {
         for t in self.tensors() {
             for v in t.iter() {
-                out.extend_from_slice(&v.to_le_bytes());
+                if bf16 {
+                    out.extend_from_slice(&crate::checkpoint::to_bf16(*v).to_le_bytes());
+                } else {
+                    out.extend_from_slice(&v.to_le_bytes());
+                }
             }
         }
-        out
     }
 
     /// Inverse of `to_bytes`, validated against `config`'s expected shapes.
