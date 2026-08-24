@@ -59,6 +59,10 @@ const PLATEAU_PATIENCE = 4;
 /// a plateau that was never there. The same gate the corpus advice
 /// uses, for the same reason.
 const TOKENS_BEFORE_CUTTING_THE_RATE = 2e6;
+
+/// How often an unattended run writes itself down. A few minutes of
+/// work at risk instead of a night's.
+const AUTOSAVE_EVERY_STEPS = 1000;
 /// What a cut multiplies the rate by, and how far the cuts may go in
 /// total. Halving is the standard move; a run that has fallen to a
 /// twentieth of its schedule has a problem another cut will not fix.
@@ -116,8 +120,9 @@ const VALIDATE_EVERY = 100;
 /// time it is right.
 const TOKENS_BEFORE_JUDGING_HELD_OUT = 2e6;
 
-function post(type, payload = {}) {
-  self.postMessage({ type, ...payload });
+function post(type, payload = {}, transfer) {
+  if (transfer) self.postMessage({ type, ...payload }, transfer);
+  else self.postMessage({ type, ...payload });
 }
 
 // Anything that escapes a handler - or happens outside one - reaches the
@@ -1064,6 +1069,9 @@ async function train({ batchSize, learningRate, maxSteps, effort, sampleEvery, s
       'same windows each time — so two measurements differ only because the weights differ',
   );
   let nextValidateAt = llm.step() + validateEvery;
+  // Counted from where this run starts, so a model at step 4,441 does
+  // not save on its very first progress report.
+  let nextAutosaveAt = llm.step() + AUTOSAVE_EVERY_STEPS;
   let validationLoss = null;
   // Held-out losses in order, so the run can say when more text would
   // help more than more steps.
@@ -1129,7 +1137,24 @@ async function train({ batchSize, learningRate, maxSteps, effort, sampleEvery, s
     // Work for a slice...
     while (performance.now() - sliceStart < sliceMs) {
       const stepStart = performance.now();
-      const report = await llm.train_step(batchSize);
+      let report;
+      try {
+        report = await llm.train_step(batchSize);
+      } catch (error) {
+        // A step that is refused must not end the run in silence.
+        //
+        // It used to: the guard that stops two GPU operations
+        // overlapping returns an error, nothing caught it, the promise
+        // rejected, and the loop simply stopped — leaving the page
+        // showing the last sample it had produced, with no message
+        // anywhere. A run that ends has to say so.
+        training = false;
+        const explained = describeTrainingFailure(error);
+        log(`training stopped at step ${llm.step().toLocaleString()}: ${explained}`);
+        recordEvent(llm.step(), 'run-failed', `training stopped: ${explained}`);
+        post('train-stopped', { step: llm.step(), reason: explained });
+        throw error;
+      }
       if (!report) {
         training = false;
         return { steps, stopReason: 'no-data', elapsedSeconds: (performance.now() - startedAt) / 1000 };
@@ -1325,6 +1350,34 @@ async function train({ batchSize, learningRate, maxSteps, effort, sampleEvery, s
         }
       } catch (error) {
         log(`held-out loss failed: ${(error && error.message) || error}`);
+      }
+    }
+
+    // Write the model down, between slices like everything else that
+    // needs the GPU to itself.
+    //
+    // This used to be driven from the page's progress handler, which
+    // fires every 250 ms *during* a slice. Exporting takes the same
+    // `busy` guard a training step takes, so the two collided: the
+    // export won, the next `train_step` was refused, and the run died
+    // on the spot — leaving the sample card frozen on whatever it had
+    // last produced, which looks exactly like a model that stopped
+    // getting better.
+    if (llm.step() >= nextAutosaveAt) {
+      nextAutosaveAt = llm.step() + AUTOSAVE_EVERY_STEPS;
+      const savedAt = performance.now();
+      try {
+        const bytes = await llm.export_checkpoint();
+        post('train-autosave', {
+          step: llm.step(),
+          bytes: bytes.buffer,
+          byteLength: bytes.length,
+        }, [bytes.buffer]);
+        log(`auto-saved at step ${llm.step().toLocaleString()} in ` +
+          `${(performance.now() - savedAt).toFixed(0)} ms`);
+      } catch (error) {
+        // A failed save must never take the run with it.
+        log(`auto-save failed: ${(error && error.message) || error}`);
       }
     }
 

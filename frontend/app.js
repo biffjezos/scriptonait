@@ -1059,9 +1059,6 @@ onStream('train-progress', (progress) => {
     `step ${progress.step.toLocaleString()} · loss ${progress.smoothedLoss.toFixed(3)}${held} · ` +
     `${progress.tokensPerSecond.toFixed(0)} tokens/s · ${formatDuration(progress.elapsedSeconds)} elapsed${on}`;
   setTitleProgress('Fine-tuning', progress.fractionDone);
-  // Written down on a step boundary, without waiting for the run to
-  // end. The run ending is exactly what a crash prevents.
-  autosave(progress.step);
   lossHistory.push(progress.smoothedLoss);
   if (
     typeof progress.validationLoss === 'number' &&
@@ -1510,6 +1507,22 @@ async function copyToClipboard(text, label) {
     showError('The browser would not give the page the clipboard — it is in the console instead.');
   }
 }
+
+// A run that ends before you asked it to has to say so, loudly. It used
+// to end in silence: the page kept showing the last sample it received
+// and nothing said the steps had stopped.
+onStream('train-stopped', ({ step, reason }) => {
+  console.error(`[scriptonait] training stopped at step ${step.toLocaleString()}: ${reason}`);
+  showError(
+    `Training stopped at step ${step.toLocaleString()}: ${reason}. ` +
+      'The model is saved — press Train to continue from where it stopped.',
+  );
+  $('train-stats').textContent = `Stopped at step ${step.toLocaleString()}: ${reason}`;
+});
+
+onStream('train-autosave', ({ step, bytes }) => {
+  autosave(step, { bytes });
+});
 
 onStream('train-record', async (record) => {
   // Seed the live control from what the run actually started with, so
@@ -2109,14 +2122,17 @@ async function writeModelToFile(bytes) {
 /// Skipped rather than queued when one is already in flight: an export
 /// pulls the weights off the GPU, and stacking two of those is the exact
 /// thing that exhausted the heap and lost a model in the first place.
-async function autosave(step, { force = false } = {}) {
+async function autosave(step, { force = false, bytes: given = null } = {}) {
   if (autosaveInFlight) return;
-  if (!force && step - lastAutosaveStep < AUTOSAVE_EVERY_STEPS) return;
+  if (!force && !given && step - lastAutosaveStep < AUTOSAVE_EVERY_STEPS) return;
   autosaveInFlight = true;
   lastAutosaveStep = step;
   try {
     const started = performance.now();
-    const { bytes } = await call('export-checkpoint', {}, [], 0);
+    // During a run the worker exports between slices and hands the
+    // bytes over, because asking for them from here means asking while
+    // a training step is running — and both take the same GPU guard.
+    const bytes = given || (await call('export-checkpoint', {}, [], 0)).bytes;
     // Keep whatever optimizer state is already stored rather than
     // writing null over it.
     //
