@@ -294,8 +294,26 @@ function updateGuidance() {
 /// Called whenever a model appears, because sources can be added before
 /// one exists — that's the normal order now — and the model starts empty.
 async function syncAllSources() {
+  // Counted, because syncSource swallows its failures — it has to, since
+  // one unreadable record must not stop the other sixty-five. But a
+  // silent partial hand-over means training on a fraction of the corpus
+  // while every number on the page describes the whole of it, and
+  // nothing anywhere says which.
+  let handed = 0;
+  const failed = [];
   for (const source of sources) {
-    await syncSource(source);
+    if (await syncSource(source)) handed += 1;
+    else failed.push(source.title || source.id);
+  }
+  if (failed.length > 0) {
+    console.warn(`[scriptonait] ${failed.length} sources did not reach the model:`, failed);
+    showError(
+      `${failed.length} of ${sources.length} sources could not be given to the model ` +
+        `(${failed.slice(0, 3).join(', ')}${failed.length > 3 ? ', …' : ''}). ` +
+        'It will train on the rest — remove and re-add those, or reload the page.',
+    );
+  } else if (handed > 0) {
+    console.info(`[scriptonait] handed ${handed} sources to the model`);
   }
   await reportDuplicates();
   await refreshPlan();
@@ -1059,9 +1077,6 @@ onStream('train-progress', (progress) => {
     `step ${progress.step.toLocaleString()} · loss ${progress.smoothedLoss.toFixed(3)}${held} · ` +
     `${progress.tokensPerSecond.toFixed(0)} tokens/s · ${formatDuration(progress.elapsedSeconds)} elapsed${on}`;
   setTitleProgress('Fine-tuning', progress.fractionDone);
-  // Written down on a step boundary, without waiting for the run to
-  // end. The run ending is exactly what a crash prevents.
-  autosave(progress.step);
   lossHistory.push(progress.smoothedLoss);
   if (
     typeof progress.validationLoss === 'number' &&
@@ -1497,19 +1512,65 @@ function historyAsMarkdown() {
   return out.join('\n');
 }
 
+/// Put the text where it can be copied, by whatever means works.
+///
+/// `navigator.clipboard.writeText` needs a secure context, a focused
+/// document and an unexpired user gesture, and it fails by doing
+/// nothing — which is what happened: a button that appears to work and
+/// leaves an empty clipboard is worse than one that plainly cannot.
+///
+/// So the text always lands in a visible box first, selected and ready
+/// for Ctrl+C. The clipboard write is then attempted as a convenience
+/// on top of that, and its failure costs nothing because the text is
+/// already on screen.
 async function copyToClipboard(text, label) {
+  const box = $('history-output');
+  const note = $('history-copied');
+  box.value = text;
+  box.hidden = false;
+  box.focus();
+  box.select();
+
+  let copied = false;
   try {
-    await navigator.clipboard.writeText(text);
-    const note = $('history-copied');
-    note.textContent = `Copied ${label}.`;
-    note.hidden = false;
-    setTimeout(() => { note.hidden = true; }, 2500);
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      await navigator.clipboard.writeText(text);
+      copied = true;
+    }
   } catch (error) {
-    // Clipboard access can be refused; the console is always there.
-    console.info('[scriptonait] clipboard refused, here it is instead:\n', text);
-    showError('The browser would not give the page the clipboard — it is in the console instead.');
+    console.info(`[scriptonait] the clipboard refused (${error && error.message}); ` +
+      'the text is in the box on the page');
   }
+  if (!copied) {
+    // The older path, which works in places the async one does not.
+    try {
+      copied = document.execCommand('copy');
+    } catch (error) {
+      copied = false;
+    }
+  }
+  note.textContent = copied
+    ? `Copied ${label} — and it is in the box below if you want to check.`
+    : `${label} is in the box below, selected. Press Ctrl+C (or Cmd+C).`;
+  note.hidden = false;
+  setTimeout(() => { note.hidden = true; }, 8000);
 }
+
+// A run that ends before you asked it to has to say so, loudly. It used
+// to end in silence: the page kept showing the last sample it received
+// and nothing said the steps had stopped.
+onStream('train-stopped', ({ step, reason }) => {
+  console.error(`[scriptonait] training stopped at step ${step.toLocaleString()}: ${reason}`);
+  showError(
+    `Training stopped at step ${step.toLocaleString()}: ${reason}. ` +
+      'The model is saved — press Train to continue from where it stopped.',
+  );
+  $('train-stats').textContent = `Stopped at step ${step.toLocaleString()}: ${reason}`;
+});
+
+onStream('train-autosave', ({ step, bytes }) => {
+  autosave(step, { bytes });
+});
 
 onStream('train-record', async (record) => {
   // Seed the live control from what the run actually started with, so
@@ -1529,11 +1590,27 @@ onStream('train-record', async (record) => {
   }
 });
 
+/// Build the text, then hand it over. Wrapped because a throw inside
+/// the builder used to take the click with it and leave no trace: the
+/// button did nothing, said nothing, and looked broken for a reason
+/// nobody could see.
+function copyHistory(build, label) {
+  let text;
+  try {
+    text = build();
+  } catch (error) {
+    console.error('[scriptonait] could not build the history text', error);
+    showError(`the history could not be assembled: ${(error && error.message) || error}`);
+    return;
+  }
+  copyToClipboard(text, label).catch((error) => showError(error));
+}
+
 $('history-copy-btn').addEventListener('click', () =>
-  copyToClipboard(historyAsMarkdown(), 'as Markdown'));
+  copyHistory(historyAsMarkdown, 'as Markdown'));
 
 $('history-json-btn').addEventListener('click', () =>
-  copyToClipboard(JSON.stringify(history, null, 2), 'as JSON'));
+  copyHistory(() => JSON.stringify(history, null, 2), 'as JSON'));
 
 $('history-clear-btn').addEventListener('click', async () => {
   history.length = 0;
@@ -2109,15 +2186,39 @@ async function writeModelToFile(bytes) {
 /// Skipped rather than queued when one is already in flight: an export
 /// pulls the weights off the GPU, and stacking two of those is the exact
 /// thing that exhausted the heap and lost a model in the first place.
-async function autosave(step, { force = false } = {}) {
+async function autosave(step, { force = false, bytes: given = null } = {}) {
   if (autosaveInFlight) return;
-  if (!force && step - lastAutosaveStep < AUTOSAVE_EVERY_STEPS) return;
+  if (!force && !given && step - lastAutosaveStep < AUTOSAVE_EVERY_STEPS) return;
   autosaveInFlight = true;
   lastAutosaveStep = step;
   try {
     const started = performance.now();
-    const { bytes } = await call('export-checkpoint', {}, [], 0);
-    await db.putModel({ bytes, step, params: model ? model.params : 0, optimizer: null });
+    // During a run the worker exports between slices and hands the
+    // bytes over, because asking for them from here means asking while
+    // a training step is running — and both take the same GPU guard.
+    const bytes = given || (await call('export-checkpoint', {}, [], 0)).bytes;
+    // Keep whatever optimizer state is already stored rather than
+    // writing null over it.
+    //
+    // Exporting the moments here is not an option: they are twice the
+    // size of the model, and pulling that across every thousand steps is
+    // the memory pressure that lost a run in the first place. But
+    // nulling them means this safety net quietly destroys the momentum
+    // in the saved copy — so a crash-and-recover would resume with Adam
+    // reset, which is most of what the saved copy was for.
+    //
+    // Slightly stale moments are fine. They are running averages of
+    // gradient statistics and do not reference particular weights, so
+    // moments from a thousand steps ago paired with current weights cost
+    // almost nothing. Zero costs a visible bump and a few hundred steps.
+    let optimizer = null;
+    try {
+      const stored = await db.getModel();
+      optimizer = (stored && stored.optimizer) || null;
+    } catch (error) {
+      /* no stored copy yet: there is nothing to preserve */
+    }
+    await db.putModel({ bytes, step, params: model ? model.params : 0, optimizer });
     let wroteFile = false;
     if (autosaveHandle) {
       await writeModelToFile(bytes);
