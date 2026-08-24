@@ -51,16 +51,41 @@ const BENCH_VERSION = 1;
 /// to the noise in a single measurement, short enough not to spend an
 /// afternoon on a rate that is too large.
 const PLATEAU_PATIENCE = 4;
+/// Tokens that must have gone through the model before the rate may be
+/// cut for a plateau.
+///
+/// A cut at 0.8 passes is a cut made on a curve that is still falling
+/// steeply, and halving the rate there costs the run real progress for
+/// a plateau that was never there. The same gate the corpus advice
+/// uses, for the same reason.
+const TOKENS_BEFORE_CUTTING_THE_RATE = 2e6;
 /// What a cut multiplies the rate by, and how far the cuts may go in
 /// total. Halving is the standard move; a run that has fallen to a
 /// twentieth of its schedule has a problem another cut will not fix.
 const PLATEAU_FACTOR = 0.5;
 const PLATEAU_FLOOR = 0.05;
-/// How much better a measurement has to be to count as better at all.
-/// Held-out loss wobbles by a few thousandths between measurements on a
-/// corpus this size; without a threshold the patience counter resets on
-/// noise and the rate is never cut.
+/// The smallest movement that counts as movement at all, when there is
+/// not enough curve yet to measure the noise from.
 const PLATEAU_MIN_DELTA = 0.005;
+
+/// How much the held-out curve moves on its own, measured from the
+/// curve rather than assumed.
+///
+/// Everything that asks "has this stopped improving" has to ask it the
+/// same way, or the page contradicts itself — which it did: the plateau
+/// detector cut the learning rate in half at step 3,800 while the phase
+/// beside it said "held-out loss still improving". Both were reading
+/// the same numbers through different rules, and one of them was a
+/// constant somebody picked.
+function heldOutNoise(series, window) {
+  const recent = series.slice(-window * 2);
+  if (recent.length < 4) return PLATEAU_MIN_DELTA;
+  const mean = recent.reduce((a, b) => a + b, 0) / recent.length;
+  const spread = Math.sqrt(
+    recent.reduce((a, b) => a + (b - mean) ** 2, 0) / (recent.length - 1),
+  );
+  return Math.max(spread, 0.002);
+}
 
 /// How many held-out windows the validation set holds, and how often it
 /// is measured.
@@ -1191,9 +1216,19 @@ async function train({ batchSize, learningRate, maxSteps, effort, sampleEvery, s
           // loss stops improving, the usual cause is steps too large to
           // settle into the minimum the model is circling, and the
           // usual answer is to cut the rate and let it.
-          if (bestSeen === null || measured < bestSeen - PLATEAU_MIN_DELTA) {
+          // Judged against how much this curve moves anyway, not against
+          // a constant — and not at all until the model has had enough
+          // training for a plateau to be a real thing rather than the
+          // shape of a steep descent seen through noise.
+          const noise = heldOutNoise(heldOut, PLATEAU_PATIENCE);
+          const trained = JSON.parse(llm.training_plan()).tokensSeen;
+          if (bestSeen === null || measured < bestSeen - noise) {
             bestSeen = measured;
             sinceImprovement = 0;
+          } else if (trained < TOKENS_BEFORE_CUTTING_THE_RATE) {
+            // Counted, but not acted on: a run that crosses the
+            // threshold mid-plateau should not have to start over.
+            sinceImprovement += 1;
           } else {
             sinceImprovement += 1;
             if (sinceImprovement >= PLATEAU_PATIENCE) {
@@ -1216,7 +1251,7 @@ async function train({ batchSize, learningRate, maxSteps, effort, sampleEvery, s
                 recordEvent(llm.step(), 'rate-cut',
                   `learning rate cut to ${after.toFixed(2)}x the schedule after ` +
                   `${PLATEAU_PATIENCE} measurements with no improvement past ` +
-                  `${bestSeen.toFixed(4)}`);
+                  `${bestSeen.toFixed(4)} (noise floor ${noise.toFixed(4)})`);
               } else {
                 log(
                   `plateau: the learning rate is already at its floor (${after.toFixed(2)}x the ` +
@@ -1696,6 +1731,29 @@ const handlers = {
       `peak learning rate changed by hand from ${before.toExponential(2)} to ` +
       `${plan.peakLr.toExponential(2)} (in force: ${plan.lrNow.toExponential(2)})`);
     return { peakLr: plan.peakLr, lrNow: plan.lrNow, changed: true };
+  },
+
+  /// Put the schedule back to full strength after a plateau cut.
+  ///
+  /// A cut is a guess made from a curve, and a guess can be wrong — the
+  /// detector that made it has been wrong, on a noisy measurement, at
+  /// four-fifths of a pass. Until now the only way to undo one was to
+  /// add or remove a source, which resets it as a side effect. That is
+  /// not a control, it is a trick.
+  async 'reset-schedule'() {
+    const before = llm.plateau_scale();
+    llm.reset_plateau_scale();
+    const plan = JSON.parse(llm.training_plan());
+    log(
+      `schedule restored to full strength (was ${before.toFixed(2)}x); the rate in force is ` +
+        `now ${plan.lrNow.toExponential(2)}`,
+    );
+    if (before < 1) {
+      recordEvent(plan.step, 'schedule-restored',
+        `plateau cut undone by hand: ${before.toFixed(2)}x back to 1.00x, rate in force now ` +
+        `${plan.lrNow.toExponential(2)}`);
+    }
+    return { plateauScale: plan.plateauScale, lrNow: plan.lrNow, was: before };
   },
 
   async stop() {

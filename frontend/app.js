@@ -1533,6 +1533,18 @@ $('sample-next').addEventListener('click', () => {
   renderSampleHistory();
 });
 
+$('reset-schedule-btn').addEventListener('click', async () => {
+  try {
+    const result = await call('reset-schedule');
+    console.info(
+      `[scriptonait] schedule restored from ${result.was.toFixed(2)}x to full strength; ` +
+        `rate in force ${result.lrNow.toExponential(2)}`,
+    );
+  } catch (error) {
+    showError(error);
+  }
+});
+
 $('live-lr-btn').addEventListener('click', async () => {
   const rate = Number($('live-lr').value);
   if (!(rate > 0)) return;
