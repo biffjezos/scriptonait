@@ -1512,18 +1512,48 @@ function historyAsMarkdown() {
   return out.join('\n');
 }
 
+/// Put the text where it can be copied, by whatever means works.
+///
+/// `navigator.clipboard.writeText` needs a secure context, a focused
+/// document and an unexpired user gesture, and it fails by doing
+/// nothing — which is what happened: a button that appears to work and
+/// leaves an empty clipboard is worse than one that plainly cannot.
+///
+/// So the text always lands in a visible box first, selected and ready
+/// for Ctrl+C. The clipboard write is then attempted as a convenience
+/// on top of that, and its failure costs nothing because the text is
+/// already on screen.
 async function copyToClipboard(text, label) {
+  const box = $('history-output');
+  const note = $('history-copied');
+  box.value = text;
+  box.hidden = false;
+  box.focus();
+  box.select();
+
+  let copied = false;
   try {
-    await navigator.clipboard.writeText(text);
-    const note = $('history-copied');
-    note.textContent = `Copied ${label}.`;
-    note.hidden = false;
-    setTimeout(() => { note.hidden = true; }, 2500);
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      await navigator.clipboard.writeText(text);
+      copied = true;
+    }
   } catch (error) {
-    // Clipboard access can be refused; the console is always there.
-    console.info('[scriptonait] clipboard refused, here it is instead:\n', text);
-    showError('The browser would not give the page the clipboard — it is in the console instead.');
+    console.info(`[scriptonait] the clipboard refused (${error && error.message}); ` +
+      'the text is in the box on the page');
   }
+  if (!copied) {
+    // The older path, which works in places the async one does not.
+    try {
+      copied = document.execCommand('copy');
+    } catch (error) {
+      copied = false;
+    }
+  }
+  note.textContent = copied
+    ? `Copied ${label} — and it is in the box below if you want to check.`
+    : `${label} is in the box below, selected. Press Ctrl+C (or Cmd+C).`;
+  note.hidden = false;
+  setTimeout(() => { note.hidden = true; }, 8000);
 }
 
 // A run that ends before you asked it to has to say so, loudly. It used
@@ -1560,11 +1590,27 @@ onStream('train-record', async (record) => {
   }
 });
 
+/// Build the text, then hand it over. Wrapped because a throw inside
+/// the builder used to take the click with it and leave no trace: the
+/// button did nothing, said nothing, and looked broken for a reason
+/// nobody could see.
+function copyHistory(build, label) {
+  let text;
+  try {
+    text = build();
+  } catch (error) {
+    console.error('[scriptonait] could not build the history text', error);
+    showError(`the history could not be assembled: ${(error && error.message) || error}`);
+    return;
+  }
+  copyToClipboard(text, label).catch((error) => showError(error));
+}
+
 $('history-copy-btn').addEventListener('click', () =>
-  copyToClipboard(historyAsMarkdown(), 'as Markdown'));
+  copyHistory(historyAsMarkdown, 'as Markdown'));
 
 $('history-json-btn').addEventListener('click', () =>
-  copyToClipboard(JSON.stringify(history, null, 2), 'as JSON'));
+  copyHistory(() => JSON.stringify(history, null, 2), 'as JSON'));
 
 $('history-clear-btn').addEventListener('click', async () => {
   history.length = 0;

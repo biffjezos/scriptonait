@@ -734,3 +734,16 @@ select {
 #autosave-status {
   flex: 1 1 20rem;
 }
+
+/* Where the history text lands so it can always be copied by hand. A
+   clipboard write can be refused silently; a visible, selected box
+   cannot. */
+.history-output {
+  width: 100%;
+  margin: 0.5rem 0;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.78rem;
+  line-height: 1.35;
+  white-space: pre;
+  overflow: auto;
+}
