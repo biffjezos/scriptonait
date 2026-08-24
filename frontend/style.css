@@ -747,3 +747,12 @@ select {
   white-space: pre;
   overflow: auto;
 }
+
+/* A row recorded by a run whose weights were not kept: it describes a
+   model that no longer exists, and reading it as the present is how a
+   run appears to go backwards. */
+.history-table tbody tr.orphan {
+  opacity: 0.45;
+  text-decoration: line-through;
+  text-decoration-thickness: 1px;
+}

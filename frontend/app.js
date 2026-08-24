@@ -1342,6 +1342,12 @@ const history = [];
 /// kept in one place so the table, the Markdown and the JSON cannot
 /// drift into disagreeing about what a run recorded.
 const HISTORY_COLUMNS = [
+  // Which run a row came from. Without it the table silently splices
+  // together timelines that never followed one another: a model
+  // recovered from a save is *behind* rows already recorded by a run
+  // that got further and was then lost, so the table shows a future
+  // that no longer exists next to a present that is behind it.
+  ['run', (r) => r.runId, (v) => String(v).replace(/^run-/, '')],
   ['step', (r) => r.step, (v) => v.toLocaleString()],
   ['tokens', (r) => r.tokensSeen, (v) => formatCount(v)],
   ['passes', (r) => r.epochs, (v) => v.toFixed(2)],
@@ -1379,12 +1385,31 @@ function renderHistory() {
       `${samples().length} sample${samples().length === 1 ? '' : 's'}`
     : '· nothing recorded yet';
 
+  // A model can be behind its own history: recovered from a save, it
+  // resumes at a step some recorded rows are already past. Those rows
+  // describe weights that no longer exist, and reading them as the
+  // present is how a run looks like it went backwards.
+  const furthest = rows.reduce((max, r) => Math.max(max, r.step || 0), 0);
+  const rewound = model && furthest > model.step + 1;
+  $('history-rewind').textContent = rewound
+    ? `This model is at step ${model.step.toLocaleString()}, but rows below go up to ` +
+      `${furthest.toLocaleString()} — those came from a run whose weights were not kept ` +
+      '(a reload, or a crash before the next save). They describe a model that no longer ' +
+      'exists; the rows for the current run are the ones at or below ' +
+      `${model.step.toLocaleString()}.`
+    : '';
+  $('history-rewind').hidden = !rewound;
+
   const head = `<thead><tr>${HISTORY_COLUMNS.map(([label]) => `<th>${label}</th>`).join('')}` +
     '</tr></thead>';
   // Newest last, so the table reads in the direction the run ran and the
   // bottom row is the present.
   const body = rows
-    .map((row) => `<tr>${HISTORY_COLUMNS.map((col) => `<td>${historyCell(row, col)}</td>`).join('')}</tr>`)
+    .map((row) => {
+      const orphan = model && row.step > model.step + 1;
+      return `<tr${orphan ? ' class="orphan"' : ''}>` +
+        `${HISTORY_COLUMNS.map((col) => `<td>${historyCell(row, col)}</td>`).join('')}</tr>`;
+    })
     .join('');
   table.innerHTML = `${head}<tbody>${body}</tbody>`;
   // Keep the newest row in view, unless the user has scrolled up to look
@@ -1928,7 +1953,9 @@ $('train-btn').addEventListener('click', async () => {
       sampleWords: 40,
     }, [], 0);
 
-    if (result.stopReason === 'no-gpu') {
+    if (result.stopReason === 'already-training') {
+      showError('A training run is already going. Press Stop first if you want to change it.');
+    } else if (result.stopReason === 'no-gpu') {
       showError(
         'Training runs on your GPU, and this browser did not give the page one. ' +
           'Try a browser with WebGPU (Chrome or Edge 113+, Safari 18+), or enable it in ' +
