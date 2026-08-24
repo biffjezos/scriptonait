@@ -690,6 +690,39 @@ impl WasmLLM {
         seed: f64,
         on_token: &js_sys::Function,
     ) -> GenerationResult {
+        // Generation owns the GPU for as long as it runs, and it pulls
+        // the trained weights back across the bus first. Two of those at
+        // once — or one alongside a save, which is what happened —
+        // put two futures through `sync_from_gpu_inner` together and
+        // exhausted the wasm heap between them. `busy` exists to stop
+        // exactly that; generation was simply never asking it.
+        if self.acquire().is_err() {
+            return GenerationResult {
+                text: String::new(),
+                word_count: 0,
+                tokens_generated: 0,
+                stop_reason: "busy".to_string(),
+            };
+        }
+        let result = self.generate_inner(prompt, extra_context, temperature, top_k, top_p, min_p,
+            repetition_penalty, seed, on_token).await;
+        self.release();
+        result
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn generate_inner(
+        &self,
+        prompt: String,
+        extra_context: String,
+        temperature: f32,
+        top_k: u32,
+        top_p: f32,
+        min_p: f32,
+        repetition_penalty: f32,
+        seed: f64,
+        on_token: &js_sys::Function,
+    ) -> GenerationResult {
         let request = self.build_request(&prompt, &extra_context);
         let sampling = SamplingConfig {
             temperature,
@@ -1465,16 +1498,37 @@ impl WasmLLM {
     /// Async because the trained weights live on the GPU: this is one of
     /// the two places that pulls them back across the bus.
     pub async fn export_checkpoint(&self) -> Result<Vec<u8>, JsValue> {
+        // Guarded like every other operation that owns the GPU. It was
+        // not, and a generation started while a save was in flight put
+        // two futures through `sync_from_gpu_inner` at once — which is
+        // how a save and a generate between them exhausted the wasm heap
+        // and aborted the module, taking an overnight run with it.
+        self.acquire()?;
+        let result = self.export_checkpoint_inner().await;
+        self.release();
+        result
+    }
+
+    async fn export_checkpoint_inner(&self) -> Result<Vec<u8>, JsValue> {
         self.sync_from_gpu_inner().await?;
         let inner = self.0.borrow();
-        let checkpoint = Checkpoint {
-            config: inner.config,
-            weights: inner.weights.clone(),
-            tokenizer: inner.corpus.tokenizer().clone(),
-            step: inner.step,
-            tokens_seen: inner.tokens_seen,
-        };
-        Ok(checkpoint.to_bytes_with(WeightDtype::Bf16))
+        // Serialized from borrowed parts, straight into the output at
+        // bf16. Building a `Checkpoint` to serialize would clone the
+        // weights — 153 MB for a 38M-parameter model — and the old
+        // serializer then held an f32 buffer and a bf16 buffer at the
+        // same time on top of that. Four copies of a model, in a heap
+        // that also holds the live weights and the copy just pulled off
+        // the GPU, is how an export ends in `rust_oom`; and an
+        // allocation failure in wasm aborts the module rather than
+        // returning an error anybody can catch.
+        Ok(llm_core::checkpoint::write_checkpoint(
+            &inner.config,
+            &inner.weights,
+            inner.corpus.tokenizer(),
+            inner.step,
+            inner.tokens_seen,
+            WeightDtype::Bf16,
+        ))
     }
 
     /// Replace this model's weights, shape and tokenizer from a

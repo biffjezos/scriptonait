@@ -1059,6 +1059,9 @@ onStream('train-progress', (progress) => {
     `step ${progress.step.toLocaleString()} · loss ${progress.smoothedLoss.toFixed(3)}${held} · ` +
     `${progress.tokensPerSecond.toFixed(0)} tokens/s · ${formatDuration(progress.elapsedSeconds)} elapsed${on}`;
   setTitleProgress('Fine-tuning', progress.fractionDone);
+  // Written down on a step boundary, without waiting for the run to
+  // end. The run ending is exactly what a crash prevents.
+  autosave(progress.step);
   lossHistory.push(progress.smoothedLoss);
   if (
     typeof progress.validationLoss === 'number' &&
@@ -2035,6 +2038,106 @@ async function saveModel() {
     );
   }
 }
+
+// --- Auto-save ---------------------------------------------------------
+//
+// A model is hours of somebody's GPU. Until now the only thing that
+// saved it was the end of a run, so a crash — or a closed laptop, or a
+// browser deciding to reclaim a background tab — took all of it.
+//
+// Two layers, because they fail differently. The browser copy is
+// automatic and costs nothing to keep, but lives in storage a browser
+// may clear and a page may exhaust. A file on disk survives everything,
+// and needs the File System Access API, which not every browser has.
+// Where it is missing the browser copy still runs and the page says so
+// rather than pretending.
+
+/// How often, in steps, an unattended run writes itself down. Every
+/// thousand steps is a few minutes of work at risk instead of a night's.
+const AUTOSAVE_EVERY_STEPS = 1000;
+
+/// The file the run writes itself to, once somebody has chosen one. Held
+/// only for this session — a handle can be stored, but re-permissioning
+/// it needs a click anyway, so asking once per session is honest about
+/// what is actually happening.
+let autosaveHandle = null;
+let lastAutosaveStep = 0;
+let autosaveInFlight = false;
+
+function autosaveSupported() {
+  return typeof window.showSaveFilePicker === 'function';
+}
+
+/// Write the current model to the chosen file, replacing what is there.
+async function writeModelToFile(bytes) {
+  const writable = await autosaveHandle.createWritable();
+  try {
+    await writable.write(bytes);
+  } finally {
+    await writable.close();
+  }
+}
+
+/// Save without interrupting anything, on a step boundary.
+///
+/// Skipped rather than queued when one is already in flight: an export
+/// pulls the weights off the GPU, and stacking two of those is the exact
+/// thing that exhausted the heap and lost a model in the first place.
+async function autosave(step, { force = false } = {}) {
+  if (autosaveInFlight) return;
+  if (!force && step - lastAutosaveStep < AUTOSAVE_EVERY_STEPS) return;
+  autosaveInFlight = true;
+  lastAutosaveStep = step;
+  try {
+    const started = performance.now();
+    const { bytes } = await call('export-checkpoint', {}, [], 0);
+    await db.putModel({ bytes, step, params: model ? model.params : 0, optimizer: null });
+    let wroteFile = false;
+    if (autosaveHandle) {
+      await writeModelToFile(bytes);
+      wroteFile = true;
+    }
+    console.info(
+      `[scriptonait] auto-saved at step ${step.toLocaleString()} ` +
+        `(${formatCount(bytes.byteLength)} bytes${wroteFile ? ', to your file' : ''}) in ` +
+        `${(performance.now() - started).toFixed(0)} ms`,
+    );
+    $('autosave-status').textContent =
+      `Last auto-save: step ${step.toLocaleString()}` +
+      (wroteFile ? ' — to your file and to this browser.' : ' — to this browser.');
+  } catch (error) {
+    console.warn('[scriptonait] auto-save failed', error);
+    $('autosave-status').textContent =
+      `Auto-save failed at step ${step.toLocaleString()}: ${(error && error.message) || error}`;
+  } finally {
+    autosaveInFlight = false;
+  }
+}
+
+$('autosave-file-btn').addEventListener('click', async () => {
+  if (!autosaveSupported()) {
+    showError(
+      'This browser has no File System Access API, so the page cannot write to a file on its ' +
+        'own. Chrome and Edge have it. The browser copy still saves automatically, and ' +
+        '"Save this model to a file" works anywhere.',
+    );
+    return;
+  }
+  try {
+    autosaveHandle = await window.showSaveFilePicker({
+      suggestedName: 'scriptonait.ckpt',
+      types: [{ description: 'scriptonait checkpoint', accept: { 'application/octet-stream': ['.ckpt'] } }],
+    });
+    $('autosave-status').textContent =
+      `Auto-saving to ${autosaveHandle.name} every ${AUTOSAVE_EVERY_STEPS.toLocaleString()} steps.`;
+    // Write immediately, so the file exists and the permission is proven
+    // now rather than in six hours when it matters.
+    if (model) await autosave(model.step, { force: true });
+  } catch (error) {
+    // A cancelled picker is not an error.
+    if (error && error.name !== 'AbortError') showError(error);
+  }
+});
 
 /// Load the model saved by an earlier visit, if there is one.
 async function restoreModel() {

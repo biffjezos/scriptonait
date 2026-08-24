@@ -139,6 +139,15 @@
         </div>
       </details>
 
+      <div class="row" id="autosave-row">
+        <button id="autosave-file-btn" type="button" class="secondary">Auto-save to a file…</button>
+        <span id="autosave-status" class="hint">
+          The model is written to this browser every 1,000 steps during a run. Pick a file and
+          it is written there too — which is the copy that survives cleared storage, a full
+          disk quota, and this page crashing.
+        </span>
+      </div>
+
       <div class="row" id="live-controls" hidden>
         <label>Peak learning rate, live
           <input type="number" id="live-lr" min="0" max="0.01" step="0.00001" />

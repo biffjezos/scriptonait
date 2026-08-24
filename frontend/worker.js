@@ -315,6 +315,11 @@ async function generate({ prompt, extraContext, temperature, topK, topP, minP, r
   );
 
   const elapsed = (performance.now() - startedAt) / 1000;
+  if (result.stop_reason === 'busy') {
+    throw new Error(
+      'the GPU is busy with a save or another generation — wait a moment and try again',
+    );
+  }
   return {
     text: result.text,
     wordCount: result.word_count,

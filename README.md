@@ -90,6 +90,11 @@ device the page says so and does not train.
 - The trained model and its optimizer state are saved to the browser
   after every run and restored on the next visit, so a reload costs
   nothing and training resumes with its momentum intact.
+- Auto-save, in two layers, because a model is hours of your GPU and the
+  end of a run is exactly what a crash prevents. The browser copy is
+  written every thousand steps during a run. Pick a file and it is
+  written there too — the copy that survives cleared storage, a full
+  quota, and the page itself failing.
 
 **Writing**
 
