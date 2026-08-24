@@ -575,6 +575,18 @@ select {
   line-height: 1.4;
 }
 
+/* What the shape in the fields would cost, before it is built. Choosing
+   a model shape is choosing hours and gigabytes, and neither is
+   guessable from "12 layers, 516 hidden". */
+.shape-estimate {
+  margin-top: 0.4rem;
+  line-height: 1.5;
+}
+
+.shape-estimate.invalid {
+  color: var(--accent, #e0af68);
+}
+
 /* The training plan: phase, numbers, and what to do about them. It sits
    above the progress bar because it is the part worth reading. */
 .plan {
@@ -633,4 +645,92 @@ select {
   align-items: center;
   gap: 0.75rem;
   margin-top: 0.5rem;
+}
+
+/* --- Run history ------------------------------------------------------
+   A training run is hours of numbers that scroll past once. This is
+   where they stop scrolling past. */
+
+.history-table-wrap {
+  max-height: 22rem;
+  overflow: auto;
+  border: 1px solid var(--line, rgba(128, 128, 128, 0.3));
+  border-radius: 6px;
+  margin: 0.5rem 0;
+}
+
+.history-table {
+  border-collapse: collapse;
+  width: 100%;
+  font-size: 0.82rem;
+  font-variant-numeric: tabular-nums;
+}
+
+.history-table th,
+.history-table td {
+  padding: 0.25rem 0.6rem;
+  text-align: right;
+  white-space: nowrap;
+  border-bottom: 1px solid var(--line, rgba(128, 128, 128, 0.15));
+}
+
+.history-table th {
+  position: sticky;
+  top: 0;
+  background: var(--panel, #1a1b26);
+  text-align: right;
+  font-weight: 600;
+  z-index: 1;
+}
+
+.history-table th:first-child,
+.history-table td:first-child {
+  text-align: left;
+}
+
+.history-table tbody tr:hover {
+  background: rgba(128, 128, 128, 0.08);
+}
+
+/* Events sit between the measurements in time, and are the only record
+   of what changed halfway through a curve. */
+.history-events {
+  margin: 0.5rem 0;
+  font-size: 0.85rem;
+  line-height: 1.5;
+  max-height: 12rem;
+  overflow: auto;
+}
+
+.history-events div {
+  padding: 0.15rem 0;
+}
+
+.history-events .step {
+  display: inline-block;
+  min-width: 6rem;
+  opacity: 0.6;
+  font-variant-numeric: tabular-nums;
+}
+
+.sample-history {
+  margin-top: 0.75rem;
+}
+
+#live-controls {
+  align-items: center;
+  gap: 0.75rem;
+  margin: 0.5rem 0;
+}
+
+/* Auto-save. A model is hours of somebody's GPU, and until this existed
+   the only thing that wrote it down was the end of a run. */
+#autosave-row {
+  align-items: center;
+  gap: 0.75rem;
+  margin: 0.5rem 0;
+}
+
+#autosave-status {
+  flex: 1 1 20rem;
 }

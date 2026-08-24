@@ -348,9 +348,88 @@ function renderModelShape(info) {
   $('shape-hint').textContent = info
     ? "This model's shape. Fixed — training continues the model you have."
     : 'New model shape:';
+  refreshShapeEstimate();
+}
+
+/// What the shape in the fields would cost, priced before anything is
+/// built from it.
+///
+/// This exists because choosing a model shape is choosing a number of
+/// hours and a quantity of GPU memory, and neither is guessable from
+/// "12 layers, 516 hidden". The arithmetic is in `describe_shape` on the
+/// wasm side — the same `ModelConfig` the model is actually built from,
+/// so the estimate cannot drift from the thing it estimates.
+///
+/// Recomputed on every keystroke and needs no model, which is the whole
+/// point: the moment somebody wants this answer is the moment before
+/// there is a model to ask.
+let shapeEstimateToken = 0;
+
+function formatBytes(bytes) {
+  if (!bytes) return '—';
+  if (bytes >= 1e9) return `${(bytes / 1e9).toFixed(2)} GB`;
+  return `${Math.round(bytes / 1e6)} MB`;
+}
+
+async function refreshShapeEstimate() {
+  const box = $('shape-estimate');
+  if (!box) return;
+  // With a model loaded the fields state its shape and cannot be
+  // changed, so there is nothing to price.
+  if (model) {
+    box.textContent = '';
+    return;
+  }
+  const token = ++shapeEstimateToken;
+  let estimate;
+  try {
+    estimate = await call('describe-shape', {
+      layers: Number($('cfg-layers').value) || 0,
+      hidden: Number($('cfg-hidden').value) || 0,
+      heads: Number($('cfg-heads').value) || 0,
+      kvHeads: Number($('cfg-kv-heads').value) || 0,
+      contextLen: Number($('cfg-context').value) || 0,
+      window: Number($('cfg-window').value) || 0,
+      corpusChars: sources.reduce((sum, s) => sum + (s.rawText || '').length, 0),
+    });
+  } catch (error) {
+    box.textContent = '';
+    return;
+  }
+  // Keystrokes race: only the newest answer may write.
+  if (token !== shapeEstimateToken) return;
+
+  if (!estimate.valid) {
+    box.textContent = `This shape will not build: ${estimate.problem}`;
+    box.className = 'hint shape-estimate invalid';
+    return;
+  }
+
+  const parts = [
+    `${formatCount(estimate.params)} parameters`,
+    `${formatBytes(estimate.trainingBytes)} of GPU memory to train ` +
+      `(limit ${formatBytes(estimate.memoryLimitBytes)})`,
+    `${formatBytes(estimate.inferenceBytes)} to generate`,
+    `${estimate.headDim}-wide heads`,
+    `${formatCount(estimate.ffnDim)} MLP width`,
+    `${formatCount(estimate.vocabSize)}-token vocabulary from the text you have`,
+  ];
+  // Only worth saying when it is true, and worth saying plainly when it
+  // is: a shape off the 64-grid pays this on every step, forever.
+  if (estimate.tileEfficiency > 1.02) {
+    parts.push(
+      `about ${Math.round((estimate.tileEfficiency - 1) * 100)}% of every step wasted — the ` +
+        'matmul kernels work in 64x64 blocks, and hidden size and context are the two ' +
+        'dimensions that have to be multiples of 64 (they multiply, so being off on both ' +
+        'costs both)',
+    );
+  }
+  box.textContent = parts.join(' · ');
+  box.className = 'hint shape-estimate';
 }
 
 function renderModel(info) {
+
   model = info;
   $('generate-btn').disabled = !info;
   $('train-btn').disabled = !info;
@@ -733,6 +812,7 @@ $('remove-all-btn').addEventListener('click', async () => {
     }
   }
   await refreshStoryState();
+  await refreshPlan();
 });
 
 async function removeSource(id) {
@@ -742,6 +822,7 @@ async function removeSource(id) {
   try {
     renderModel(await call('remove-source', { id }));
     await refreshStoryState();
+    await refreshPlan();
   } catch (error) {
     /* no model loaded: it was only ever in the list */
   }
@@ -776,7 +857,14 @@ function updateSourceSummary(list, note = '') {
     return;
   }
   const chars = list.reduce((sum, s) => sum + (s.rawText || '').length, 0);
-  const seen = model ? '' : ' — no model loaded, so nothing is using them yet';
+  // Sources live in two places: this list, which is the browser's, and
+  // the model's corpus, which is the wasm side's. Without a model the
+  // second one does not exist, so a file added now is in the list and
+  // nowhere else until a model is made — and any number computed from
+  // the corpus is about a corpus that no longer matches this list.
+  const seen = model
+    ? ''
+    : ' — no model yet, so none of this is in a corpus: make or open one and it is all handed over';
   const saved = persistenceWorks ? '' : ' · not saved (storage unavailable)';
   stats.textContent =
     `${list.length} source${list.length === 1 ? '' : 's'}, ` +
@@ -861,6 +949,13 @@ async function addSources(entries) {
   await Promise.allSettled(syncing);
   renderSources();
   await refreshStoryState();
+  // The corpus just changed, so every number the plan is built from
+  // did too. Without this the plan keeps reporting the corpus it was
+  // last computed against.
+  await refreshPlan();
+  // And the vocabulary a new model would be built with scales with how
+  // much text there is, so the shape estimate moved too.
+  refreshShapeEstimate();
   if (failures.length) {
     showError(
       `${failures.length} of ${entries.length} couldn't be added: ${failures.slice(0, 3).join(', ')}` +
@@ -964,6 +1059,9 @@ onStream('train-progress', (progress) => {
     `step ${progress.step.toLocaleString()} · loss ${progress.smoothedLoss.toFixed(3)}${held} · ` +
     `${progress.tokensPerSecond.toFixed(0)} tokens/s · ${formatDuration(progress.elapsedSeconds)} elapsed${on}`;
   setTitleProgress('Fine-tuning', progress.fractionDone);
+  // Written down on a step boundary, without waiting for the run to
+  // end. The run ending is exactly what a crash prevents.
+  autosave(progress.step);
   lossHistory.push(progress.smoothedLoss);
   if (
     typeof progress.validationLoss === 'number' &&
@@ -1044,8 +1142,17 @@ $('restore-best-btn').addEventListener('click', async () => {
 let lastPhaseKey = null;
 
 function renderPlan(plan) {
-  if (!plan || !plan.phase) return;
   const box = $('train-plan');
+  // No model means no corpus on the wasm side, so there is nothing to
+  // compute a plan from — and the numbers on screen are from whatever
+  // was there last. Stale numbers next to a list that has changed under
+  // them is exactly how the page stops being believed: 66 sources and
+  // 17.67M characters above, a token count from a 30-source corpus
+  // below, and no way to tell which is current.
+  if (!model || !plan || !plan.phase) {
+    box.hidden = true;
+    return;
+  }
   $('plan-phase-title').textContent = plan.phase.title;
   $('plan-phase-detail').textContent = plan.phase.detail;
 
@@ -1084,6 +1191,18 @@ function renderPlan(plan) {
   if (n.corpusChars > 0) corpus.push(`${formatCount(n.corpusChars)} characters`);
   corpus.push(`${formatCount(n.trainingTokens)} tokens at this vocabulary`);
   corpus.push(`${formatCount(n.params)} parameters`);
+
+  // The list and the corpus are two different things, and they can
+  // disagree: a source added while no model existed is in the list and
+  // not in the corpus. Saying so beats letting somebody compare the two
+  // lines and conclude the page is making numbers up.
+  const listedChars = sources.reduce((sum, s) => sum + (s.rawText || '').length, 0);
+  if (n.corpusChars > 0 && Math.abs(listedChars - n.corpusChars) > n.corpusChars * 0.05) {
+    corpus.push(
+      `the list above holds ${formatCount(listedChars)} characters — press Train to hand the ` +
+        'difference over',
+    );
+  }
 
   $('plan-numbers').textContent = `Trained: ${progress.join(' · ')}`;
   $('plan-corpus').textContent = `Corpus: ${corpus.join(' · ')}`;
@@ -1157,6 +1276,288 @@ onStream('train-sample', ({ step, loss, text, quality }) => {
   box.replaceChildren(block);
 });
 
+
+// --- Run history -------------------------------------------------------
+//
+// Everything else on this page shows the present moment. A training run
+// is six hours long, and the question worth asking is almost always
+// "what did it do between then and now" — which, until this existed, was
+// answerable only from whatever console lines had not scrolled away.
+//
+// Two kinds of record share one timeline: measurements (a row of numbers
+// every hundred steps) and events (a run starting, a rate being cut, a
+// sample being generated). They are kept together because a loss curve
+// with an unexplained bend in it is worse than no curve, and the bend is
+// always an event.
+//
+// It is all copyable, in Markdown for reading and JSON for machines. The
+// JSON is also the shape an MCP server would serve if the app is ever
+// wired up to one — the format is the interface, so building it now
+// costs nothing later.
+
+const history = [];
+
+/// Columns, in order. Each is a label, a reader, and how to render it —
+/// kept in one place so the table, the Markdown and the JSON cannot
+/// drift into disagreeing about what a run recorded.
+const HISTORY_COLUMNS = [
+  ['step', (r) => r.step, (v) => v.toLocaleString()],
+  ['tokens', (r) => r.tokensSeen, (v) => formatCount(v)],
+  ['passes', (r) => r.epochs, (v) => v.toFixed(2)],
+  ['loss', (r) => r.loss, (v) => v.toFixed(3)],
+  ['probe', (r) => r.probe, (v) => (v >= 0 ? v.toFixed(3) : '—')],
+  ['held-out', (r) => r.heldOut, (v) => v.toFixed(3)],
+  ['gap', (r) => r.gap, (v) => (v === null ? '—' : v.toFixed(3))],
+  ['bits/byte', (r) => r.bitsPerByte, (v) => (v > 0 ? v.toFixed(3) : '—')],
+  ['lr', (r) => r.lr, (v) => v.toExponential(2)],
+  ['x sched', (r) => r.plateauScale, (v) => v.toFixed(2)],
+  ['|grad|', (r) => r.gradNorm, (v) => v.toFixed(2)],
+  ['tok/s', (r) => r.tokensPerSecond, (v) => Math.round(v).toLocaleString()],
+  ['real words', (r) => (r.quality ? r.quality.knownWordRate : null),
+    (v) => (v === null ? '—' : `${Math.round(v * 100)}%`)],
+  ['repeats', (r) => (r.quality ? r.quality.repeated4gramRate : null),
+    (v) => (v === null ? '—' : `${Math.round(v * 100)}%`)],
+  ['phase', (r) => r.phase, (v) => v || '—'],
+];
+
+function historyCell(row, [, read, render]) {
+  const value = read(row);
+  if (value === undefined || value === null || Number.isNaN(value)) return '—';
+  return typeof value === 'number' || typeof value === 'string' ? render(value) : '—';
+}
+
+const measurements = () => history.filter((r) => r.kind === 'measurement');
+const samples = () => history.filter((r) => r.kind === 'sample');
+
+function renderHistory() {
+  const table = $('history-table');
+  if (!table) return;
+  const rows = measurements();
+  $('history-count').textContent = rows.length
+    ? `· ${rows.length} measurement${rows.length === 1 ? '' : 's'}, ` +
+      `${samples().length} sample${samples().length === 1 ? '' : 's'}`
+    : '· nothing recorded yet';
+
+  const head = `<thead><tr>${HISTORY_COLUMNS.map(([label]) => `<th>${label}</th>`).join('')}` +
+    '</tr></thead>';
+  // Newest last, so the table reads in the direction the run ran and the
+  // bottom row is the present.
+  const body = rows
+    .map((row) => `<tr>${HISTORY_COLUMNS.map((col) => `<td>${historyCell(row, col)}</td>`).join('')}</tr>`)
+    .join('');
+  table.innerHTML = `${head}<tbody>${body}</tbody>`;
+  // Keep the newest row in view, unless the user has scrolled up to look
+  // at something — in which case leave them where they are.
+  const wrap = table.parentElement;
+  if (wrap && wrap.scrollHeight - wrap.scrollTop - wrap.clientHeight < 60) {
+    wrap.scrollTop = wrap.scrollHeight;
+  }
+
+  const events = history.filter((r) => r.kind && r.kind !== 'measurement' && r.kind !== 'sample');
+  $('history-events').innerHTML = events
+    .slice(-40)
+    .map(
+      (e) =>
+        `<div><span class="step">step ${Number(e.step || 0).toLocaleString()}</span>${
+          escapeHtml(String(e.text || e.kind))
+        }</div>`,
+    )
+    .join('');
+
+  renderSampleHistory();
+}
+
+/// Which stored sample is on screen. -1 means "the newest", and it stays
+/// meaning that as new ones arrive, so a panel left alone keeps up while
+/// one somebody has paged back through does not jump.
+let sampleCursor = -1;
+
+function renderSampleHistory() {
+  const all = samples();
+  const box = $('sample-history');
+  if (all.length === 0) {
+    box.hidden = true;
+    return;
+  }
+  box.hidden = false;
+  const index = sampleCursor < 0 ? all.length - 1 : Math.min(sampleCursor, all.length - 1);
+  const sample = all[index];
+  const quality = sample.quality;
+  $('sample-position').textContent =
+    `${index + 1} of ${all.length} · step ${Number(sample.step).toLocaleString()}`;
+  $('sample-history-head').textContent = [
+    `step ${Number(sample.step).toLocaleString()}`,
+    typeof sample.loss === 'number' ? `loss ${sample.loss.toFixed(3)}` : null,
+    quality && quality.words ? `${Math.round(quality.knownWordRate * 100)}% real words` : null,
+    quality && quality.repeated4gramRate > 0.05
+      ? `${Math.round(quality.repeated4gramRate * 100)}% repeated runs`
+      : null,
+  ].filter(Boolean).join(' · ');
+  $('sample-history-text').textContent = sample.text || '';
+  $('sample-prev').disabled = index === 0;
+  $('sample-next').disabled = index === all.length - 1;
+}
+
+/// The whole history as Markdown: a header of what was being trained and
+/// on what, then the table, then the events, then the samples.
+///
+/// Written to be pasted into a conversation. That is a real use — the
+/// person running this cannot read a loss curve as fast as they can ask
+/// somebody about it, and a screenshot of one line is not enough to
+/// answer with.
+function historyAsMarkdown() {
+  const rows = measurements();
+  const start = history.find((r) => r.kind === 'run-started');
+  const out = ['# scriptonait run history', ''];
+
+  if (start && start.model) {
+    const m = start.model;
+    const c = start.corpus || {};
+    const s = start.settings || {};
+    out.push('## Model', '');
+    out.push(`- ${formatCount(m.params)} parameters — ${m.layers} layers, ${m.hidden} hidden, ` +
+      `${m.heads} heads (${m.kvHeads} key/value), context ${m.contextLen}, window ${m.window}, ` +
+      `vocabulary ${m.vocabSize}`);
+    out.push(`- Corpus: ${c.sources} sources, ${formatCount(c.chars)} characters, ` +
+      `${formatCount(c.trainingTokens)} training tokens, ` +
+      `${formatCount(c.validationTokens)} held out`);
+    out.push(`- Run: ${s.plannedSteps} planned steps, batch ${s.batchSize}, ` +
+      `${s.tokensPerStep} tokens/step, peak rate ${s.peakLr}, warm-up ${s.warmupSteps}, ` +
+      `weight decay ${s.weightDecay}, grad clip ${s.gradClip}`);
+    out.push(`- Device: ${start.device}`);
+    out.push('');
+  }
+
+  if (rows.length) {
+    out.push('## Measurements', '');
+    out.push(`| ${HISTORY_COLUMNS.map(([label]) => label).join(' | ')} |`);
+    out.push(`|${HISTORY_COLUMNS.map(() => '---').join('|')}|`);
+    for (const row of rows) {
+      out.push(`| ${HISTORY_COLUMNS.map((col) => historyCell(row, col)).join(' | ')} |`);
+    }
+    out.push('');
+  }
+
+  const events = history.filter((r) => r.kind && r.kind !== 'measurement' && r.kind !== 'sample');
+  if (events.length) {
+    out.push('## Events', '');
+    for (const e of events) {
+      out.push(`- **step ${Number(e.step || 0).toLocaleString()}** — ${e.text || e.kind}`);
+    }
+    out.push('');
+  }
+
+  const all = samples();
+  if (all.length) {
+    out.push('## Samples', '');
+    // The first, a few through the middle, and the last: enough to see
+    // the trajectory without pasting fifty of them.
+    const wanted = all.length <= 6
+      ? all
+      : [0, 1, Math.floor(all.length / 3), Math.floor((2 * all.length) / 3),
+        all.length - 2, all.length - 1].map((i) => all[i]);
+    for (const sample of wanted) {
+      const q = sample.quality;
+      out.push(`### step ${Number(sample.step).toLocaleString()}` +
+        (typeof sample.loss === 'number' ? ` — loss ${sample.loss.toFixed(3)}` : '') +
+        (q && q.words ? `, ${Math.round(q.knownWordRate * 100)}% real words` : ''));
+      out.push('');
+      out.push('```');
+      out.push((sample.text || '').trim());
+      out.push('```');
+      out.push('');
+    }
+  }
+  return out.join('\n');
+}
+
+async function copyToClipboard(text, label) {
+  try {
+    await navigator.clipboard.writeText(text);
+    const note = $('history-copied');
+    note.textContent = `Copied ${label}.`;
+    note.hidden = false;
+    setTimeout(() => { note.hidden = true; }, 2500);
+  } catch (error) {
+    // Clipboard access can be refused; the console is always there.
+    console.info('[scriptonait] clipboard refused, here it is instead:\n', text);
+    showError('The browser would not give the page the clipboard — it is in the console instead.');
+  }
+}
+
+onStream('train-record', async (record) => {
+  // Seed the live control from what the run actually started with, so
+  // pressing Apply without editing it is a no-op rather than a surprise.
+  if (record.kind === 'run-started' && record.settings && record.settings.peakLr) {
+    $('live-lr').value = record.settings.peakLr;
+  }
+  // The message carries `type` as well, from `post`; drop it so a stored
+  // record is exactly what it claims to be.
+  const { type, ...row } = record;
+  history.push(row);
+  renderHistory();
+  try {
+    await db.appendHistory(row);
+  } catch (error) {
+    console.warn('[scriptonait] could not store a history record', error);
+  }
+});
+
+$('history-copy-btn').addEventListener('click', () =>
+  copyToClipboard(historyAsMarkdown(), 'as Markdown'));
+
+$('history-json-btn').addEventListener('click', () =>
+  copyToClipboard(JSON.stringify(history, null, 2), 'as JSON'));
+
+$('history-clear-btn').addEventListener('click', async () => {
+  history.length = 0;
+  sampleCursor = -1;
+  renderHistory();
+  try {
+    await db.clearHistory();
+  } catch (error) {
+    console.warn('[scriptonait] could not clear the history', error);
+  }
+});
+
+$('sample-prev').addEventListener('click', () => {
+  const all = samples();
+  const index = sampleCursor < 0 ? all.length - 1 : sampleCursor;
+  sampleCursor = Math.max(0, index - 1);
+  renderSampleHistory();
+});
+
+$('sample-next').addEventListener('click', () => {
+  const all = samples();
+  const index = sampleCursor < 0 ? all.length - 1 : sampleCursor;
+  // Stepping onto the newest goes back to following it, rather than
+  // pinning to whatever index the newest happens to be right now.
+  sampleCursor = index + 1 >= all.length - 1 ? -1 : index + 1;
+  renderSampleHistory();
+});
+
+$('reset-schedule-btn').addEventListener('click', async () => {
+  try {
+    const result = await call('reset-schedule');
+    console.info(
+      `[scriptonait] schedule restored from ${result.was.toFixed(2)}x to full strength; ` +
+        `rate in force ${result.lrNow.toExponential(2)}`,
+    );
+  } catch (error) {
+    showError(error);
+  }
+});
+
+$('live-lr-btn').addEventListener('click', async () => {
+  const rate = Number($('live-lr').value);
+  if (!(rate > 0)) return;
+  try {
+    const result = await call('set-learning-rate', { learningRate: rate });
+    console.info(`[scriptonait] peak learning rate is now ${result.peakLr}`);
+  } catch (error) {
+    showError(error);
+  }
+});
 
 // --- The machine profile -----------------------------------------------
 //
@@ -1342,6 +1743,7 @@ $('train-btn').addEventListener('click', async () => {
   clearError();
   training = true;
   lastPhaseKey = null;
+  $('live-controls').hidden = false;
   lossHistory.length = 0;
   validationHistory.length = 0;
   probeHistory.length = 0;
@@ -1449,12 +1851,18 @@ $('train-btn').addEventListener('click', async () => {
     training = false;
     $('train-btn').disabled = false;
     $('train-stop-btn').hidden = true;
+    $('live-controls').hidden = true;
     setTitleProgress(null);
     updateGuidance();
   }
 });
 
 $('train-batch').addEventListener('input', updateGuidance);
+// Every field that changes the price, priced as it is typed.
+for (const id of ['cfg-layers', 'cfg-hidden', 'cfg-heads', 'cfg-kv-heads', 'cfg-context',
+  'cfg-window']) {
+  $(id).addEventListener('input', () => refreshShapeEstimate());
+}
 
 $('train-stop-btn').addEventListener('click', () => {
   $('train-stop-btn').disabled = true;
@@ -1631,6 +2039,106 @@ async function saveModel() {
   }
 }
 
+// --- Auto-save ---------------------------------------------------------
+//
+// A model is hours of somebody's GPU. Until now the only thing that
+// saved it was the end of a run, so a crash — or a closed laptop, or a
+// browser deciding to reclaim a background tab — took all of it.
+//
+// Two layers, because they fail differently. The browser copy is
+// automatic and costs nothing to keep, but lives in storage a browser
+// may clear and a page may exhaust. A file on disk survives everything,
+// and needs the File System Access API, which not every browser has.
+// Where it is missing the browser copy still runs and the page says so
+// rather than pretending.
+
+/// How often, in steps, an unattended run writes itself down. Every
+/// thousand steps is a few minutes of work at risk instead of a night's.
+const AUTOSAVE_EVERY_STEPS = 1000;
+
+/// The file the run writes itself to, once somebody has chosen one. Held
+/// only for this session — a handle can be stored, but re-permissioning
+/// it needs a click anyway, so asking once per session is honest about
+/// what is actually happening.
+let autosaveHandle = null;
+let lastAutosaveStep = 0;
+let autosaveInFlight = false;
+
+function autosaveSupported() {
+  return typeof window.showSaveFilePicker === 'function';
+}
+
+/// Write the current model to the chosen file, replacing what is there.
+async function writeModelToFile(bytes) {
+  const writable = await autosaveHandle.createWritable();
+  try {
+    await writable.write(bytes);
+  } finally {
+    await writable.close();
+  }
+}
+
+/// Save without interrupting anything, on a step boundary.
+///
+/// Skipped rather than queued when one is already in flight: an export
+/// pulls the weights off the GPU, and stacking two of those is the exact
+/// thing that exhausted the heap and lost a model in the first place.
+async function autosave(step, { force = false } = {}) {
+  if (autosaveInFlight) return;
+  if (!force && step - lastAutosaveStep < AUTOSAVE_EVERY_STEPS) return;
+  autosaveInFlight = true;
+  lastAutosaveStep = step;
+  try {
+    const started = performance.now();
+    const { bytes } = await call('export-checkpoint', {}, [], 0);
+    await db.putModel({ bytes, step, params: model ? model.params : 0, optimizer: null });
+    let wroteFile = false;
+    if (autosaveHandle) {
+      await writeModelToFile(bytes);
+      wroteFile = true;
+    }
+    console.info(
+      `[scriptonait] auto-saved at step ${step.toLocaleString()} ` +
+        `(${formatCount(bytes.byteLength)} bytes${wroteFile ? ', to your file' : ''}) in ` +
+        `${(performance.now() - started).toFixed(0)} ms`,
+    );
+    $('autosave-status').textContent =
+      `Last auto-save: step ${step.toLocaleString()}` +
+      (wroteFile ? ' — to your file and to this browser.' : ' — to this browser.');
+  } catch (error) {
+    console.warn('[scriptonait] auto-save failed', error);
+    $('autosave-status').textContent =
+      `Auto-save failed at step ${step.toLocaleString()}: ${(error && error.message) || error}`;
+  } finally {
+    autosaveInFlight = false;
+  }
+}
+
+$('autosave-file-btn').addEventListener('click', async () => {
+  if (!autosaveSupported()) {
+    showError(
+      'This browser has no File System Access API, so the page cannot write to a file on its ' +
+        'own. Chrome and Edge have it. The browser copy still saves automatically, and ' +
+        '"Save this model to a file" works anywhere.',
+    );
+    return;
+  }
+  try {
+    autosaveHandle = await window.showSaveFilePicker({
+      suggestedName: 'scriptonait.ckpt',
+      types: [{ description: 'scriptonait checkpoint', accept: { 'application/octet-stream': ['.ckpt'] } }],
+    });
+    $('autosave-status').textContent =
+      `Auto-saving to ${autosaveHandle.name} every ${AUTOSAVE_EVERY_STEPS.toLocaleString()} steps.`;
+    // Write immediately, so the file exists and the permission is proven
+    // now rather than in six hours when it matters.
+    if (model) await autosave(model.step, { force: true });
+  } catch (error) {
+    // A cancelled picker is not an error.
+    if (error && error.name !== 'AbortError') showError(error);
+  }
+});
+
 /// Load the model saved by an earlier visit, if there is one.
 async function restoreModel() {
   let stored = null;
@@ -1690,4 +2198,16 @@ async function restoreModel() {
   // a corpus already restored from the last visit, the plan is readable
   // immediately and is the most useful thing on the page.
   await refreshPlan();
+  // And with no model, what the default shape in the fields would cost.
+  refreshShapeEstimate();
+
+  // What every previous run measured. This is why the history is in
+  // IndexedDB and not in a variable: the run worth understanding is
+  // usually the one from yesterday.
+  try {
+    history.push(...(await db.listHistory()));
+    renderHistory();
+  } catch (error) {
+    console.warn('[scriptonait] could not read the run history', error);
+  }
 })();

@@ -51,16 +51,41 @@ const BENCH_VERSION = 1;
 /// to the noise in a single measurement, short enough not to spend an
 /// afternoon on a rate that is too large.
 const PLATEAU_PATIENCE = 4;
+/// Tokens that must have gone through the model before the rate may be
+/// cut for a plateau.
+///
+/// A cut at 0.8 passes is a cut made on a curve that is still falling
+/// steeply, and halving the rate there costs the run real progress for
+/// a plateau that was never there. The same gate the corpus advice
+/// uses, for the same reason.
+const TOKENS_BEFORE_CUTTING_THE_RATE = 2e6;
 /// What a cut multiplies the rate by, and how far the cuts may go in
 /// total. Halving is the standard move; a run that has fallen to a
 /// twentieth of its schedule has a problem another cut will not fix.
 const PLATEAU_FACTOR = 0.5;
 const PLATEAU_FLOOR = 0.05;
-/// How much better a measurement has to be to count as better at all.
-/// Held-out loss wobbles by a few thousandths between measurements on a
-/// corpus this size; without a threshold the patience counter resets on
-/// noise and the rate is never cut.
+/// The smallest movement that counts as movement at all, when there is
+/// not enough curve yet to measure the noise from.
 const PLATEAU_MIN_DELTA = 0.005;
+
+/// How much the held-out curve moves on its own, measured from the
+/// curve rather than assumed.
+///
+/// Everything that asks "has this stopped improving" has to ask it the
+/// same way, or the page contradicts itself — which it did: the plateau
+/// detector cut the learning rate in half at step 3,800 while the phase
+/// beside it said "held-out loss still improving". Both were reading
+/// the same numbers through different rules, and one of them was a
+/// constant somebody picked.
+function heldOutNoise(series, window) {
+  const recent = series.slice(-window * 2);
+  if (recent.length < 4) return PLATEAU_MIN_DELTA;
+  const mean = recent.reduce((a, b) => a + b, 0) / recent.length;
+  const spread = Math.sqrt(
+    recent.reduce((a, b) => a + (b - mean) ** 2, 0) / (recent.length - 1),
+  );
+  return Math.max(spread, 0.002);
+}
 
 /// How many held-out windows the validation set holds, and how often it
 /// is measured.
@@ -290,6 +315,11 @@ async function generate({ prompt, extraContext, temperature, topK, topP, minP, r
   );
 
   const elapsed = (performance.now() - startedAt) / 1000;
+  if (result.stop_reason === 'busy') {
+    throw new Error(
+      'the GPU is busy with a save or another generation — wait a moment and try again',
+    );
+  }
   return {
     text: result.text,
     wordCount: result.word_count,
@@ -538,6 +568,34 @@ function planActions(plan, phase, { heldOut, trainingLoss, tokensSeen, tokensPer
         (eta ? ` — roughly ${eta} at the speed this machine is running` : '') +
         '. Nothing about the corpus can be judged before then.',
     });
+  }
+
+  // 1b. Is the run about to ask for more passes than repeated text is
+  //     worth? This has to be said before the run, not forty hours into
+  //     it: the existing epoch warning only fires once the passes have
+  //     actually been made, which is too late to be advice.
+  if (plan.plannedSteps > 0 && trainingTokens > 0 && tokensPerStep > 0) {
+    const planned = plan.plannedSteps * tokensPerStep;
+    const plannedEpochs = planned / trainingTokens;
+    if (plannedEpochs > USEFUL_EPOCHS * 1.2) {
+      const enough = Math.round((budget / tokensPerStep) / 100) * 100;
+      const hours = tokensPerSecond > 0 ? planned / tokensPerSecond / 3600 : null;
+      const enoughHours = tokensPerSecond > 0 ? budget / tokensPerSecond / 3600 : null;
+      actions.push({
+        key: 'run-too-long',
+        urgency: 'normal',
+        text:
+          `${plan.plannedSteps.toLocaleString()} steps at ${round(tokensPerStep)} tokens each is ` +
+          `${round(planned)} tokens — ${plannedEpochs.toFixed(1)} passes over your text` +
+          (hours ? `, about ${hours.toFixed(0)} hours at this speed` : '') +
+          `. Repeated text holds up to about ${USEFUL_EPOCHS} passes and gives back little ` +
+          `after, so roughly ${round(enough)} steps` +
+          (enoughHours ? ` (${enoughHours.toFixed(0)} hours)` : '') +
+          ' spends what this corpus is worth. The rest is time, not learning — and the ' +
+          'schedule decays over the length you set, so a shorter plan also means the rate ' +
+          'is actually falling while it matters.',
+      });
+    }
   }
 
   // 2. Only now: is there enough text for a model this size? Judged
@@ -927,14 +985,33 @@ function reportPlan(state) {
     for (const action of plan.actions) {
       log(`plan (${action.urgency}): ${action.text}`);
     }
+    if (state.lastPhase !== null) {
+      recordEvent(plan.numbers.step, 'phase', `${plan.phase.title}: ${plan.phase.detail}`);
+    }
   }
   post('train-plan', plan);
   return plan.phase.key;
 }
 
+/// The run currently in flight, so every record can say which run it
+/// belongs to. A model is trained across many runs with different
+/// settings, and "which run was that" is the first question anybody asks
+/// of a number six hours old.
+let runId = null;
+
+/// Something worth remembering that is not a measurement: a run
+/// starting, a rate being cut, a piece of advice. Recorded on the same
+/// timeline as the numbers so the two can be read together — a loss
+/// curve with no note of what changed halfway through is a curve nobody
+/// can explain.
+function recordEvent(step, kind, text, extra = {}) {
+  post('train-record', { runId, step, kind, text, at: Date.now(), ...extra });
+}
+
 async function train({ batchSize, learningRate, maxSteps, effort, sampleEvery, samplePrompt, sampleWords }) {
   stopRequested = false;
   training = true;
+  runId = `run-${Date.now().toString(36)}`;
   if (learningRate > 0) llm.set_learning_rate(learningRate);
   // The schedule has to know how long the run is, and where it starts:
   // it is shaped around this run, anchored to the step the model is
@@ -1005,6 +1082,7 @@ async function train({ batchSize, learningRate, maxSteps, effort, sampleEvery, s
   // held-out set is. The only training number held-out loss can honestly
   // be compared with.
   let trainingProbe = null;
+  let lastGradNorm = 0;
   // Held-out measurements since the last one that was actually better.
   let sinceImprovement = 0;
   let bestSeen = null;
@@ -1016,6 +1094,35 @@ async function train({ batchSize, learningRate, maxSteps, effort, sampleEvery, s
   lastPhase = reportPlan({
     heldOut, trainingLoss: null, stepsDone: 0, tokensPerStep, msPerStep: null, lastPhase: null,
   });
+
+  // The settings this run was started with, on the record. Without this
+  // a history is a list of numbers with no note of what produced them.
+  {
+    const plan = JSON.parse(llm.training_plan());
+    recordEvent(llm.step(), 'run-started',
+      `run started: ${plannedSteps.toLocaleString()} steps, batch ${batchSize}, ` +
+      `${tokensPerStep.toLocaleString()} tokens/step, peak rate ${plan.peakLr.toExponential(2)}, ` +
+      `warm-up ${plan.warmupSteps}, effort ${effort}`,
+      {
+        settings: {
+          plannedSteps, batchSize, tokensPerStep, effort,
+          peakLr: plan.peakLr, warmupSteps: plan.warmupSteps,
+          minLrRatio: plan.minLrRatio, weightDecay: plan.weightDecay,
+          gradClip: plan.gradClip, plateauScale: plan.plateauScale,
+        },
+        model: {
+          layers: info.layers, hidden: info.hidden, heads: info.heads,
+          kvHeads: info.kv_heads, contextLen: info.context_len, window: info.window,
+          vocabSize: info.vocab_size, params: info.params,
+        },
+        corpus: {
+          sources: plan.sources, chars: plan.corpusChars,
+          trainingTokens: plan.trainingTokens, validationTokens: plan.validationTokens,
+        },
+        device: llm.device_summary(),
+        dispatchesPerSubmit: llm.dispatches_per_submit(),
+      });
+  }
 
   while (!stopRequested && (maxSteps <= 0 || steps < maxSteps)) {
     const sliceStart = performance.now();
@@ -1036,6 +1143,7 @@ async function train({ batchSize, learningRate, maxSteps, effort, sampleEvery, s
       steps += 1;
       tokens += report.tokens;
       smoothedLoss = smoothedLoss === null ? report.loss : smoothedLoss * 0.9 + report.loss * 0.1;
+      lastGradNorm = report.grad_norm;
 
       // The first step pays for allocating every training buffer on the
       // device, so it is logged on its own rather than averaged in.
@@ -1113,9 +1221,19 @@ async function train({ batchSize, learningRate, maxSteps, effort, sampleEvery, s
           // loss stops improving, the usual cause is steps too large to
           // settle into the minimum the model is circling, and the
           // usual answer is to cut the rate and let it.
-          if (bestSeen === null || measured < bestSeen - PLATEAU_MIN_DELTA) {
+          // Judged against how much this curve moves anyway, not against
+          // a constant — and not at all until the model has had enough
+          // training for a plateau to be a real thing rather than the
+          // shape of a steep descent seen through noise.
+          const noise = heldOutNoise(heldOut, PLATEAU_PATIENCE);
+          const trained = JSON.parse(llm.training_plan()).tokensSeen;
+          if (bestSeen === null || measured < bestSeen - noise) {
             bestSeen = measured;
             sinceImprovement = 0;
+          } else if (trained < TOKENS_BEFORE_CUTTING_THE_RATE) {
+            // Counted, but not acted on: a run that crosses the
+            // threshold mid-plateau should not have to start over.
+            sinceImprovement += 1;
           } else {
             sinceImprovement += 1;
             if (sinceImprovement >= PLATEAU_PATIENCE) {
@@ -1135,6 +1253,10 @@ async function train({ batchSize, learningRate, maxSteps, effort, sampleEvery, s
                     `learning rate has been cut to ${after.toFixed(2)}x the schedule. If it ` +
                     'does not start improving again, the corpus is the limit, not the rate.',
                 });
+                recordEvent(llm.step(), 'rate-cut',
+                  `learning rate cut to ${after.toFixed(2)}x the schedule after ` +
+                  `${PLATEAU_PATIENCE} measurements with no improvement past ` +
+                  `${bestSeen.toFixed(4)} (noise floor ${noise.toFixed(4)})`);
               } else {
                 log(
                   `plateau: the learning rate is already at its floor (${after.toFixed(2)}x the ` +
@@ -1162,6 +1284,38 @@ async function train({ batchSize, learningRate, maxSteps, effort, sampleEvery, s
             quality: lastQuality,
             bitsPerByte: lastBitsPerByte,
           });
+          // One row per measurement, with everything that was true at
+          // that moment. This is the record a run can be read back
+          // from — and the reason it carries the settings as well as
+          // the results is that a curve without them cannot be
+          // explained after the fact.
+          {
+            const plan = JSON.parse(llm.training_plan());
+            post('train-record', {
+              runId,
+              kind: 'measurement',
+              at: Date.now(),
+              step: plan.step,
+              runStep: Math.max(0, plan.step - plan.startStep),
+              tokensSeen: plan.tokensSeen,
+              epochs: plan.trainingTokens > 0 ? plan.tokensSeen / plan.trainingTokens : 0,
+              loss: smoothedLoss,
+              probe: trainingProbe,
+              heldOut: measured,
+              gap,
+              bitsPerByte: bpb,
+              lr: plan.lrNow,
+              plateauScale: plan.plateauScale,
+              gradNorm: lastGradNorm,
+              tokensPerSecond: recentStepMs > 0 ? tokensPerStep / (recentStepMs / 1000) : 0,
+              msPerStep: recentStepMs,
+              elapsedSeconds: (performance.now() - startedAt) / 1000,
+              batchSize,
+              tokensPerStep,
+              phase: lastPhase,
+              quality: lastQuality,
+            });
+          }
           const advice = corpusAdvice(heldOut, trainingProbe, JSON.parse(llm.training_plan()).tokensSeen);
           if (advice && advice !== lastAdvice) {
             lastAdvice = advice;
@@ -1189,6 +1343,14 @@ async function train({ batchSize, learningRate, maxSteps, effort, sampleEvery, s
         const quality = JSON.parse(llm.evaluate(text, validationLoss === null ? -1 : validationLoss));
         lastQuality = quality;
         post('train-sample', { step: llm.step(), loss: smoothedLoss, text, quality });
+        // Kept, not just shown. A sample is the most legible record of
+        // what a model could do at a moment, and the current card
+        // overwrites the last one by design — so the history is the only
+        // place the earlier ones survive.
+        post('train-record', {
+          runId, kind: 'sample', at: Date.now(), step: llm.step(),
+          text, quality, loss: smoothedLoss, prompt: samplePrompt,
+        });
         log(
           `sample at step ${llm.step().toLocaleString()}: ` +
             `${(quality.knownWordRate * 100).toFixed(0)}% of its words are in your corpus, ` +
@@ -1226,6 +1388,10 @@ async function train({ batchSize, learningRate, maxSteps, effort, sampleEvery, s
       `loss ${smoothedLoss === null ? '—' : smoothedLoss.toFixed(4)}, ` +
       `reason ${stopRequested ? 'stopped' : 'done'}`,
   );
+  recordEvent(llm.step(), 'run-ended',
+    `run ${stopRequested ? 'stopped' : 'finished'} after ${steps.toLocaleString()} steps in ` +
+    `${elapsedSeconds.toFixed(0)}s, ${(tokens / Math.max(elapsedSeconds, 1e-6)).toFixed(0)} ` +
+    `tok/s overall, loss ${smoothedLoss === null ? '—' : smoothedLoss.toFixed(4)}`);
   return {
     steps,
     loss: smoothedLoss,
@@ -1350,6 +1516,16 @@ const handlers = {
   async 'parse-prompt'({ prompt }) {
     await ensureWasm();
     return describePrompt(text(prompt, 'the prompt'));
+  },
+
+  /// What a shape would cost, before anything is built from it. Needs no
+  /// model — that is the point, since this is what somebody is looking
+  /// at while they choose the numbers.
+  async 'describe-shape'({ layers, hidden, heads, kvHeads, contextLen, window: win, corpusChars }) {
+    await ensureWasm();
+    return JSON.parse(
+      wasm.describe_shape(layers, hidden, heads, kvHeads, contextLen, win, corpusChars || 0),
+    );
   },
 
   /// Which loaded sources are copies of another. Reported, never
@@ -1541,6 +1717,50 @@ const handlers = {
     }
   },
 
+  /// Change the peak learning rate while a run is in flight.
+  ///
+  /// The schedule keeps its shape — this moves the peak the cosine
+  /// decays from, so a rate raised at step 2,000 still decays over the
+  /// rest of the run rather than sitting flat. Recorded, because a loss
+  /// curve with an unexplained bend in it is worse than no curve.
+  async 'set-learning-rate'({ learningRate }) {
+    const before = JSON.parse(llm.training_plan()).peakLr;
+    if (!(learningRate > 0)) return { peakLr: before, changed: false };
+    llm.set_learning_rate(learningRate);
+    const plan = JSON.parse(llm.training_plan());
+    log(
+      `peak learning rate changed from ${before.toExponential(2)} to ` +
+        `${plan.peakLr.toExponential(2)}; the rate in force is now ${plan.lrNow.toExponential(2)}`,
+    );
+    recordEvent(plan.step, 'rate-changed',
+      `peak learning rate changed by hand from ${before.toExponential(2)} to ` +
+      `${plan.peakLr.toExponential(2)} (in force: ${plan.lrNow.toExponential(2)})`);
+    return { peakLr: plan.peakLr, lrNow: plan.lrNow, changed: true };
+  },
+
+  /// Put the schedule back to full strength after a plateau cut.
+  ///
+  /// A cut is a guess made from a curve, and a guess can be wrong — the
+  /// detector that made it has been wrong, on a noisy measurement, at
+  /// four-fifths of a pass. Until now the only way to undo one was to
+  /// add or remove a source, which resets it as a side effect. That is
+  /// not a control, it is a trick.
+  async 'reset-schedule'() {
+    const before = llm.plateau_scale();
+    llm.reset_plateau_scale();
+    const plan = JSON.parse(llm.training_plan());
+    log(
+      `schedule restored to full strength (was ${before.toFixed(2)}x); the rate in force is ` +
+        `now ${plan.lrNow.toExponential(2)}`,
+    );
+    if (before < 1) {
+      recordEvent(plan.step, 'schedule-restored',
+        `plateau cut undone by hand: ${before.toFixed(2)}x back to 1.00x, rate in force now ` +
+        `${plan.lrNow.toExponential(2)}`);
+    }
+    return { plateauScale: plan.plateauScale, lrNow: plan.lrNow, was: before };
+  },
+
   async stop() {
     stopRequested = true;
     return { stopping: true };
@@ -1559,7 +1779,7 @@ self.onmessage = async (event) => {
     return;
   }
   // Everything except `stop` needs a model; saying so beats a wasm panic.
-  if (!llm && !['load-model', 'create-model', 'import-checkpoint', 'parse-prompt', 'stop'].includes(type)) {
+  if (!llm && !['load-model', 'create-model', 'import-checkpoint', 'parse-prompt', 'describe-shape', 'stop'].includes(type)) {
     fail(
       rid,
       new Error(

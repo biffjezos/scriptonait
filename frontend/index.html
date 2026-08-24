@@ -102,6 +102,64 @@
       <canvas id="loss-chart" width="640" height="140" hidden></canvas>
       <div id="train-samples" class="train-samples"></div>
 
+      <!-- Everything the run has measured, kept. The page's other panels
+           show the present moment; a run is hours long and the question
+           is almost always what it did between then and now. -->
+      <details class="advanced" id="history-panel">
+        <summary>Run history <span id="history-count" class="hint"></span></summary>
+
+        <div class="row">
+          <button id="history-copy-btn" type="button" class="secondary">Copy as Markdown</button>
+          <button id="history-json-btn" type="button" class="secondary">Copy as JSON</button>
+          <button id="history-clear-btn" type="button" class="secondary">Clear history</button>
+          <span id="history-copied" class="hint" hidden>Copied.</span>
+        </div>
+        <p class="hint">
+          Every measurement this model has taken, across every run, with the settings that
+          produced it. Copy it into a conversation with an AI and it has the whole run rather
+          than one line of it.
+        </p>
+
+        <div class="history-table-wrap">
+          <table class="history-table" id="history-table"></table>
+        </div>
+
+        <div id="history-events" class="history-events"></div>
+
+        <div id="sample-history" class="sample-history" hidden>
+          <div class="row">
+            <button id="sample-prev" type="button" class="secondary">Earlier</button>
+            <span id="sample-position" class="stats"></span>
+            <button id="sample-next" type="button" class="secondary">Later</button>
+          </div>
+          <div class="train-sample">
+            <div class="train-sample-head" id="sample-history-head"></div>
+            <pre id="sample-history-text"></pre>
+          </div>
+        </div>
+      </details>
+
+      <div class="row" id="autosave-row">
+        <button id="autosave-file-btn" type="button" class="secondary">Auto-save to a file…</button>
+        <span id="autosave-status" class="hint">
+          The model is written to this browser every 1,000 steps during a run. Pick a file and
+          it is written there too — which is the copy that survives cleared storage, a full
+          disk quota, and this page crashing.
+        </span>
+      </div>
+
+      <div class="row" id="live-controls" hidden>
+        <label>Peak learning rate, live
+          <input type="number" id="live-lr" min="0" max="0.01" step="0.00001" />
+        </label>
+        <button id="live-lr-btn" type="button" class="secondary">Apply now</button>
+        <button id="reset-schedule-btn" type="button" class="secondary">Undo plateau cut</button>
+        <span class="hint">
+          Changes the peak the schedule decays from, so the run keeps its shape. Recorded in
+          the history.
+        </span>
+      </div>
+
       <details class="advanced">
         <summary>Training settings</summary>
         <div class="settings-grid">
@@ -141,6 +199,7 @@
           memory.
         </p>
         <p class="hint" id="shape-hint">New model shape:</p>
+        <p class="hint shape-estimate" id="shape-estimate"></p>
         <div class="settings-grid">
           <label>Layers <input type="number" id="cfg-layers" value="4" min="1" max="12" /></label>
           <label>Hidden size <input type="number" id="cfg-hidden" value="192" min="16" max="768" step="16" /></label>

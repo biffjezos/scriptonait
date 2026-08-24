@@ -690,6 +690,39 @@ impl WasmLLM {
         seed: f64,
         on_token: &js_sys::Function,
     ) -> GenerationResult {
+        // Generation owns the GPU for as long as it runs, and it pulls
+        // the trained weights back across the bus first. Two of those at
+        // once — or one alongside a save, which is what happened —
+        // put two futures through `sync_from_gpu_inner` together and
+        // exhausted the wasm heap between them. `busy` exists to stop
+        // exactly that; generation was simply never asking it.
+        if self.acquire().is_err() {
+            return GenerationResult {
+                text: String::new(),
+                word_count: 0,
+                tokens_generated: 0,
+                stop_reason: "busy".to_string(),
+            };
+        }
+        let result = self.generate_inner(prompt, extra_context, temperature, top_k, top_p, min_p,
+            repetition_penalty, seed, on_token).await;
+        self.release();
+        result
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn generate_inner(
+        &self,
+        prompt: String,
+        extra_context: String,
+        temperature: f32,
+        top_k: u32,
+        top_p: f32,
+        min_p: f32,
+        repetition_penalty: f32,
+        seed: f64,
+        on_token: &js_sys::Function,
+    ) -> GenerationResult {
         let request = self.build_request(&prompt, &extra_context);
         let sampling = SamplingConfig {
             temperature,
@@ -1465,16 +1498,37 @@ impl WasmLLM {
     /// Async because the trained weights live on the GPU: this is one of
     /// the two places that pulls them back across the bus.
     pub async fn export_checkpoint(&self) -> Result<Vec<u8>, JsValue> {
+        // Guarded like every other operation that owns the GPU. It was
+        // not, and a generation started while a save was in flight put
+        // two futures through `sync_from_gpu_inner` at once — which is
+        // how a save and a generate between them exhausted the wasm heap
+        // and aborted the module, taking an overnight run with it.
+        self.acquire()?;
+        let result = self.export_checkpoint_inner().await;
+        self.release();
+        result
+    }
+
+    async fn export_checkpoint_inner(&self) -> Result<Vec<u8>, JsValue> {
         self.sync_from_gpu_inner().await?;
         let inner = self.0.borrow();
-        let checkpoint = Checkpoint {
-            config: inner.config,
-            weights: inner.weights.clone(),
-            tokenizer: inner.corpus.tokenizer().clone(),
-            step: inner.step,
-            tokens_seen: inner.tokens_seen,
-        };
-        Ok(checkpoint.to_bytes_with(WeightDtype::Bf16))
+        // Serialized from borrowed parts, straight into the output at
+        // bf16. Building a `Checkpoint` to serialize would clone the
+        // weights — 153 MB for a 38M-parameter model — and the old
+        // serializer then held an f32 buffer and a bf16 buffer at the
+        // same time on top of that. Four copies of a model, in a heap
+        // that also holds the live weights and the copy just pulled off
+        // the GPU, is how an export ends in `rust_oom`; and an
+        // allocation failure in wasm aborts the module rather than
+        // returning an error anybody can catch.
+        Ok(llm_core::checkpoint::write_checkpoint(
+            &inner.config,
+            &inner.weights,
+            inner.corpus.tokenizer(),
+            inner.step,
+            inner.tokens_seen,
+            WeightDtype::Bf16,
+        ))
     }
 
     /// Replace this model's weights, shape and tokenizer from a
@@ -1494,6 +1548,92 @@ impl WasmLLM {
         inner.gpu = None;
         Ok(())
     }
+}
+
+/// Price a model shape before anything is built from it.
+///
+/// Deliberately a free function rather than a method: the whole point is
+/// to answer "what would this cost" while no model exists, which is
+/// exactly when somebody is choosing the numbers. Returns JSON.
+///
+/// `corpus_chars` is how much text is loaded, which decides the
+/// vocabulary the model would be built with — and the vocabulary sets
+/// the embedding table, which at these sizes is a quarter of the
+/// parameters. Passing 0 falls back to the ceiling the page uses.
+#[wasm_bindgen]
+#[allow(clippy::too_many_arguments)]
+pub fn describe_shape(
+    layers: u32,
+    hidden: u32,
+    heads: u32,
+    kv_heads: u32,
+    context_len: u32,
+    window: u32,
+    corpus_chars: f64,
+) -> String {
+    const MAX_VOCAB: usize = 8192;
+    let vocab = if corpus_chars > 0.0 {
+        llm_core::corpus::suggested_vocab_size(corpus_chars as usize).min(MAX_VOCAB)
+    } else {
+        MAX_VOCAB
+    };
+    let config = ModelConfig {
+        num_layers: layers as usize,
+        hidden_dim: hidden as usize,
+        num_heads: heads.max(1) as usize,
+        num_kv_heads: kv_heads.max(1) as usize,
+        context_len: context_len as usize,
+        local_window: window as usize,
+        vocab_size: vocab,
+        ..ModelConfig::default()
+    };
+    // Everything below has to survive an invalid shape: the fields are
+    // being typed into, so most keystrokes produce one, and an estimator
+    // that throws on the way to a valid number is an estimator nobody
+    // can watch while they type.
+    let problem = match config.validate() {
+        Ok(()) => String::new(),
+        Err(err) => err.to_string(),
+    };
+    let divides = config.num_heads > 0
+        && config.hidden_dim % config.num_heads == 0
+        && config.num_kv_heads > 0
+        && config.num_heads % config.num_kv_heads == 0;
+    let (params, training_bytes, inference_bytes, efficiency, head_dim, kv_dim, ffn_dim) =
+        if divides && config.hidden_dim > 0 && config.context_len > 0 {
+            (
+                config.param_count(),
+                config.memory_bytes(true),
+                config.memory_bytes(false),
+                config.tile_efficiency(),
+                config.head_dim(),
+                config.kv_dim(),
+                config.ffn_dim(),
+            )
+        } else {
+            (0, 0, 0, 1.0, 0, 0, 0)
+        };
+    format!(
+        "{{\"valid\":{},\"problem\":{:?},\"params\":{},\"vocabSize\":{},\"headDim\":{},\
+         \"kvDim\":{},\"ffnDim\":{},\"trainingBytes\":{},\"inferenceBytes\":{},\
+         \"memoryLimitBytes\":{},\"tileEfficiency\":{:.4},\"band\":{}}}",
+        problem.is_empty(),
+        problem,
+        params,
+        vocab,
+        head_dim,
+        kv_dim,
+        ffn_dim,
+        training_bytes,
+        inference_bytes,
+        llm_core::config::MAX_TRAINING_BYTES,
+        efficiency,
+        if config.context_len > 0 {
+            llm_core::ops::band_width(config.context_len, config.effective_window())
+        } else {
+            0
+        },
+    )
 }
 
 /// Parse a prompt without a model, so the UI can echo back what it
