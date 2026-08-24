@@ -2117,7 +2117,28 @@ async function autosave(step, { force = false } = {}) {
   try {
     const started = performance.now();
     const { bytes } = await call('export-checkpoint', {}, [], 0);
-    await db.putModel({ bytes, step, params: model ? model.params : 0, optimizer: null });
+    // Keep whatever optimizer state is already stored rather than
+    // writing null over it.
+    //
+    // Exporting the moments here is not an option: they are twice the
+    // size of the model, and pulling that across every thousand steps is
+    // the memory pressure that lost a run in the first place. But
+    // nulling them means this safety net quietly destroys the momentum
+    // in the saved copy — so a crash-and-recover would resume with Adam
+    // reset, which is most of what the saved copy was for.
+    //
+    // Slightly stale moments are fine. They are running averages of
+    // gradient statistics and do not reference particular weights, so
+    // moments from a thousand steps ago paired with current weights cost
+    // almost nothing. Zero costs a visible bump and a few hundred steps.
+    let optimizer = null;
+    try {
+      const stored = await db.getModel();
+      optimizer = (stored && stored.optimizer) || null;
+    } catch (error) {
+      /* no stored copy yet: there is nothing to preserve */
+    }
+    await db.putModel({ bytes, step, params: model ? model.params : 0, optimizer });
     let wroteFile = false;
     if (autosaveHandle) {
       await writeModelToFile(bytes);
