@@ -1748,6 +1748,19 @@ const handlers = {
   },
 
   async train(payload) {
+    // One run at a time, checked here rather than only on the page.
+    //
+    // The page has its own flag, but it is a page: it reloads, it gets
+    // clicked twice, its flag can be cleared a moment before the run
+    // actually ends. Two loops then share one model — both calling
+    // train_step, both advancing the same step counter, both writing
+    // history under different run ids — which is how a history ends up
+    // with two "run started" events at the same step and a progress
+    // line that disagrees with the table above it.
+    if (training) {
+      log('refused to start a second training run: one is already in flight');
+      return { steps: 0, stopReason: 'already-training', elapsedSeconds: 0 };
+    }
     // Training is GPU work. Without a device there is nothing to fall
     // back to, so say which of the two reasons stopped it.
     if (!llm.has_gpu()) {
