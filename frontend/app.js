@@ -2223,6 +2223,25 @@ $('new-project-btn').addEventListener('click', async () => {
 $('export-btn').addEventListener('click', async () => {
   const { bytes } = await call('export-checkpoint');
   const blob = new Blob([bytes], { type: 'application/octet-stream' });
+  if (typeof window.showSaveFilePicker === 'function') {
+    try {
+      const handle = await window.showSaveFilePicker({
+        suggestedName: 'scriptonait.ckpt',
+        types: [{ description: 'scriptonait checkpoint', accept: { 'application/octet-stream': ['.ckpt'] } }],
+      });
+      const writable = await handle.createWritable();
+      try {
+        await writable.write(blob);
+      } finally {
+        await writable.close();
+      }
+      return;
+    } catch (error) {
+      if (error && error.name === 'AbortError') return;
+      showError(error);
+      return;
+    }
+  }
   const url = URL.createObjectURL(blob);
   const link = document.createElement('a');
   link.href = url;
