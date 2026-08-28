@@ -2279,6 +2279,25 @@ $('export-project-btn').addEventListener('click', async () => {
         `checkpoint ${checkpointBytes ? `${checkpointBytes.byteLength} bytes` : 'none (no model)'}, ` +
         `${blob.size} bytes total`,
     );
+    if (typeof window.showSaveFilePicker === 'function') {
+      try {
+        const handle = await window.showSaveFilePicker({
+          suggestedName: 'scriptonait.snp',
+          types: [{ description: 'scriptonait project', accept: { 'application/octet-stream': ['.snp'] } }],
+        });
+        const writable = await handle.createWritable();
+        try {
+          await writable.write(blob);
+        } finally {
+          await writable.close();
+        }
+        return;
+      } catch (error) {
+        // A cancelled picker is not an error.
+        if (error && error.name === 'AbortError') return;
+        throw error;
+      }
+    }
     const url = URL.createObjectURL(blob);
     const link = document.createElement('a');
     link.href = url;
