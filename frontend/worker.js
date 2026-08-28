@@ -994,11 +994,12 @@ async function train({
   training = true;
   runId = `run-${Date.now().toString(36)}`;
   if (learningRate > 0) llm.set_learning_rate(learningRate);
-  // The schedule has to know how long the run is, and where it starts:
-  // it is shaped around this run, anchored to the step the model is
-  // already at. Set it before anything reads a learning rate.
-  const plannedSteps = maxSteps > 0 ? maxSteps : 2000;
-  llm.set_planned_steps(plannedSteps);
+  // Steps is the whole project's planned length, not just this sitting —
+  // set_project_plan is idempotent and a no-op at 0, so leaving Steps at
+  // 0 (train until Stop) neither resets an existing plan nor blocks one:
+  // a model that has never had a plan set falls back to TrainConfig's own
+  // default (10,000) until Steps is actually typed in.
+  llm.set_project_plan(maxSteps);
 
   const info = llm.info();
   if (batchSize <= 1) {

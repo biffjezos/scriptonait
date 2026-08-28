@@ -84,6 +84,15 @@ impl Default for TrainConfig {
 }
 
 impl TrainConfig {
+    /// Warmup length for a plan of `total_steps`: 2% of the plan, clamped
+    /// between 10 and 200 steps and never more than half the plan itself.
+    /// Shared by every place that sets or restores `total_steps`, so a
+    /// freshly-planned run and one restored from a checkpoint's
+    /// `planned_steps` land on the identical warmup length.
+    pub fn warmup_for(total_steps: u64) -> u64 {
+        (total_steps / 50).clamp(10, 200).min(total_steps.max(1) / 2)
+    }
+
     /// Learning rate for `step` (0-based): linear warmup, then cosine
     /// decay to `min_lr_ratio * lr`.
     /// `step` is the model's lifetime step; the schedule is shaped
@@ -562,5 +571,14 @@ mod tests {
     fn the_schedule_is_untouched_by_default() {
         assert_eq!(TrainConfig::default().plateau_scale, 1.0);
         assert_eq!(TrainConfig::default().start_step, 0);
+    }
+
+    #[test]
+    fn warmup_for_is_two_percent_clamped_between_ten_and_two_hundred() {
+        assert_eq!(TrainConfig::warmup_for(0), 0, "a zero-length plan has no room for warmup");
+        assert_eq!(TrainConfig::warmup_for(100), 10, "2% of 100 is 2, clamped up to the floor");
+        assert_eq!(TrainConfig::warmup_for(5_000), 100, "2% of 5,000");
+        assert_eq!(TrainConfig::warmup_for(23_000), 200, "2% of 23,000 is 460, clamped to the ceiling");
+        assert_eq!(TrainConfig::warmup_for(15), 7, "never more than half a very short plan");
     }
 }

@@ -17,6 +17,8 @@
 //!   u32     use_ple (0/1)
 //!   u64     training step the weights are from
 //!   u64     tokens this model has been trained on, cumulative (v3+)
+//!   u32     planned total steps for the schedule, 0 = none set (v4+)
+//!   f32     plateau-cut multiplier on the learning rate, 1.0 = none (v4+)
 //!   u32     weight dtype: 0 = f32, 1 = bf16
 //!   u32     tokenizer length, then that many bytes (see tokenizer.rs)
 //!   u32     weight length in bytes, then the weights
@@ -44,10 +46,13 @@ use crate::model::ModelWeights;
 use crate::tokenizer::Tokenizer;
 
 const MAGIC: &[u8; 4] = b"SCCK";
-/// Version 3 added the cumulative token count. Version 2 files still
-/// load; their token count is unknown rather than zero, and the page
-/// says so instead of reporting a number it does not have.
-const VERSION: u32 = 3;
+/// Version 4 added the schedule's planned-step target and the plateau-cut
+/// multiplier, so a resumed run continues the same absolute schedule
+/// instead of starting a fresh one anchored to whatever step it happened
+/// to resume at. Version 3 added the cumulative token count. Files as old
+/// as version 2 still load; fields newer than the file's version read as
+/// their "not set" default rather than a wrong number.
+const VERSION: u32 = 4;
 const MIN_READABLE_VERSION: u32 = 2;
 
 /// How the weights are stored in a checkpoint file.
@@ -112,6 +117,17 @@ pub struct Checkpoint {
     /// the number that actually says how trained a model is, so it is
     /// counted as it happens and carried with the weights.
     pub tokens_seen: u64,
+    /// The schedule's planned total steps, 0 when none has ever been set
+    /// (files older than v4, or a model nobody has given a plan to yet).
+    ///
+    /// Carried here rather than left in memory so a resumed run continues
+    /// the same absolute schedule — warmup already done, decay already
+    /// under way — instead of restarting one anchored to whatever step it
+    /// happens to resume at.
+    pub planned_steps: u32,
+    /// The plateau-cut multiplier on the learning rate, 1.0 (untouched)
+    /// on files older than v4. See `train::TrainConfig::plateau_scale`.
+    pub plateau_scale: f32,
 }
 
 /// Write a checkpoint from borrowed parts, at the requested width.
@@ -126,12 +142,15 @@ pub struct Checkpoint {
 /// module and takes the model with it.
 ///
 /// This holds one copy: the output.
+#[allow(clippy::too_many_arguments)]
 pub fn write_checkpoint(
     config: &ModelConfig,
     weights: &ModelWeights,
     tokenizer: &Tokenizer,
     step: u64,
     tokens_seen: u64,
+    planned_steps: u32,
+    plateau_scale: f32,
     dtype: WeightDtype,
 ) -> Vec<u8> {
     let tokenizer_bytes = tokenizer.to_bytes();
@@ -155,6 +174,8 @@ pub fn write_checkpoint(
     out.extend_from_slice(&u32::from(config.use_ple).to_le_bytes());
     out.extend_from_slice(&step.to_le_bytes());
     out.extend_from_slice(&tokens_seen.to_le_bytes());
+    out.extend_from_slice(&planned_steps.to_le_bytes());
+    out.extend_from_slice(&plateau_scale.to_le_bytes());
     out.extend_from_slice(&dtype.tag().to_le_bytes());
     out.extend_from_slice(&(tokenizer_bytes.len() as u32).to_le_bytes());
     out.extend_from_slice(&tokenizer_bytes);
@@ -178,6 +199,8 @@ impl Checkpoint {
             &self.tokenizer,
             self.step,
             self.tokens_seen,
+            self.planned_steps,
+            self.plateau_scale,
             dtype,
         )
     }
@@ -209,6 +232,11 @@ impl Checkpoint {
         // Absent before version 3. Zero reads as "not recorded" rather
         // than as "trained on nothing", and the page distinguishes them.
         let tokens_seen = if version >= 3 { r.u64()? } else { 0 };
+        // Absent before version 4. 0 planned_steps and a 1.0 plateau_scale
+        // are both "not set" — the schedule falls back to whatever the
+        // caller's own default is, same as if nothing had ever set them.
+        let (planned_steps, plateau_scale) =
+            if version >= 4 { (r.u32()?, r.f32()?) } else { (0, 1.0) };
         let dtype = WeightDtype::from_tag(r.u32()?)?;
 
         let tokenizer_len = r.u32()? as usize;
@@ -241,7 +269,7 @@ impl Checkpoint {
                 ModelWeights::from_bytes(&widened, &config)?
             }
         };
-        Ok(Checkpoint { config, weights, tokenizer, step, tokens_seen })
+        Ok(Checkpoint { config, weights, tokenizer, step, tokens_seen, planned_steps, plateau_scale })
     }
 }
 
@@ -295,7 +323,15 @@ mod tests {
             use_ple: false,
         };
         let weights = ModelWeights::init(&config, 5);
-        Checkpoint { config, weights, tokenizer, step: 4242, tokens_seen: 9_000_000 }
+        Checkpoint {
+            config,
+            weights,
+            tokenizer,
+            step: 4242,
+            tokens_seen: 9_000_000,
+            planned_steps: 23_000,
+            plateau_scale: 0.5,
+        }
     }
 
     #[test]
@@ -305,6 +341,8 @@ mod tests {
         assert_eq!(restored.config, original.config);
         assert_eq!(restored.step, original.step);
         assert_eq!(restored.tokens_seen, original.tokens_seen);
+        assert_eq!(restored.planned_steps, original.planned_steps);
+        assert_eq!(restored.plateau_scale, original.plateau_scale);
         assert_eq!(restored.weights.to_bytes(), original.weights.to_bytes());
         assert_eq!(restored.tokenizer.to_bytes(), original.tokenizer.to_bytes());
     }
@@ -314,14 +352,34 @@ mod tests {
     #[test]
     fn a_version_2_checkpoint_still_loads() {
         let mut bytes = sample().to_bytes();
-        // Rewrite the version and cut the u64 that version 2 did not
-        // have, which sits directly after the step.
+        // Rewrite the version and cut everything from tokens_seen up to
+        // (not including) the dtype tag, which version 2 did not have:
+        // tokens_seen (u64) + planned_steps (u32) + plateau_scale (f32).
         bytes[4..8].copy_from_slice(&2u32.to_le_bytes());
         let step_at = 8 + 7 * 4 + 4 + 4;
-        bytes.drain(step_at + 8..step_at + 16);
+        bytes.drain(step_at + 8..step_at + 8 + 8 + 4 + 4);
         let restored = Checkpoint::from_bytes(&bytes).expect("version 2 should still load");
         assert_eq!(restored.step, 4242);
         assert_eq!(restored.tokens_seen, 0);
+        assert_eq!(restored.planned_steps, 0);
+        assert_eq!(restored.plateau_scale, 1.0);
+    }
+
+    /// A file written before the schedule fields existed still loads, with
+    /// its token count intact and the schedule fields at their defaults.
+    #[test]
+    fn a_version_3_checkpoint_still_loads() {
+        let mut bytes = sample().to_bytes();
+        bytes[4..8].copy_from_slice(&3u32.to_le_bytes());
+        // Cut planned_steps (u32) + plateau_scale (f32), which sit right
+        // after tokens_seen.
+        let tokens_seen_at = 8 + 7 * 4 + 4 + 4 + 8;
+        bytes.drain(tokens_seen_at + 8..tokens_seen_at + 8 + 4 + 4);
+        let restored = Checkpoint::from_bytes(&bytes).expect("version 3 should still load");
+        assert_eq!(restored.step, 4242);
+        assert_eq!(restored.tokens_seen, 9_000_000);
+        assert_eq!(restored.planned_steps, 0);
+        assert_eq!(restored.plateau_scale, 1.0);
     }
 
     #[test]

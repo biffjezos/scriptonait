@@ -1180,13 +1180,14 @@ function renderPlan(plan) {
   // because the token count changes when the vocabulary is relearned
   // and the character count does not - and a number that moves for
   // reasons the user did not cause is a number they stop believing.
-  const progress = [`step ${n.step.toLocaleString()}`];
-  // Step counts in two frames: the model's lifetime, and this run. The
-  // schedule works in the second, so a run's progress has to be shown
-  // in it — "step 4,977 of 500 planned" is what happens otherwise.
-  if (n.plannedSteps > n.runStep) {
-    progress.push(`${n.runStep.toLocaleString()} of ${n.plannedSteps.toLocaleString()} this run`);
-  }
+  // The schedule is anchored to the model's lifetime step, not to when
+  // this run happened to start, so there is only one frame to show it
+  // in: step N of the plan.
+  const progress = [
+    n.plannedSteps > n.step
+      ? `step ${n.step.toLocaleString()} of ${n.plannedSteps.toLocaleString()} planned`
+      : `step ${n.step.toLocaleString()}`,
+  ];
   progress.push(
     n.tokensSeen > 0
       ? `${formatCount(n.tokensSeen)} tokens trained on`
@@ -1198,7 +1199,7 @@ function renderPlan(plan) {
     progress.push(`${Math.round(n.quality.knownWordRate * 100)}% real words`);
   }
   if (n.etaSeconds !== null && n.etaSeconds > 0) {
-    progress.push(`${formatDuration(n.etaSeconds)} left in this run`);
+    progress.push(`${formatDuration(n.etaSeconds)} left in the plan`);
   }
 
   const corpus = [];
@@ -1779,13 +1780,16 @@ function chosenEffort() {
   return value === 'auto' ? 1 : Number(value);
 }
 
-/// Auto disables Steps/Batch/Effort/Learning-rate and lets the existing
-/// auto-pick logic choose them; Manual hands the fields back and, per
-/// the Train button handler, refuses to start at learning rate 0 — in
-/// Manual mode 0 means "no rate set", not "pick one".
+/// Auto disables Batch/Effort/Learning-rate and lets the existing
+/// auto-pick logic choose them; Manual hands them back and, per the Train
+/// button handler, refuses to start at learning rate 0 — in Manual mode 0
+/// means "no rate set", not "pick one". Steps stays editable in both
+/// modes: it's the project's planned length, not a choice about how
+/// training happens, so it means the same thing whichever mode picks the
+/// rest.
 function applyTrainMode() {
   const manual = $('train-mode').value === 'manual';
-  for (const id of ['train-steps', 'train-batch', 'train-effort', 'train-lr']) {
+  for (const id of ['train-batch', 'train-effort', 'train-lr']) {
     $(id).disabled = !manual;
   }
   // Batch and Effort each have their own "pick one" sentinel (0, "auto")

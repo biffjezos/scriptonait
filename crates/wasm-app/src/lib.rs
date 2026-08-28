@@ -398,13 +398,28 @@ impl WasmLLM {
             gpu: None,
             // Fine-tuning a trained model wants a small, flat learning
             // rate: the point is to bend it toward your text, not to
-            // re-run a pretraining schedule over it.
-            train: TrainConfig {
-                lr: 5e-5,
-                warmup_steps: 20,
-                total_steps: 2000,
-                min_lr_ratio: 1.0,
-                ..TrainConfig::default()
+            // re-run a pretraining schedule over it. The plan and the
+            // plateau cut, though, are the checkpoint's own — restoring
+            // them (rather than the flat defaults below) is what makes a
+            // reload continue the same absolute schedule instead of
+            // starting a fresh 2,000-step one every time the page loads.
+            train: if checkpoint.planned_steps > 0 {
+                TrainConfig {
+                    lr: 5e-5,
+                    total_steps: checkpoint.planned_steps as u64,
+                    warmup_steps: TrainConfig::warmup_for(checkpoint.planned_steps as u64),
+                    min_lr_ratio: 1.0,
+                    plateau_scale: checkpoint.plateau_scale,
+                    ..TrainConfig::default()
+                }
+            } else {
+                TrainConfig {
+                    lr: 5e-5,
+                    warmup_steps: 20,
+                    total_steps: 2000,
+                    min_lr_ratio: 1.0,
+                    ..TrainConfig::default()
+                }
             },
             pretrained: true,
         }))))
@@ -1410,33 +1425,40 @@ impl WasmLLM {
         result.map_err(js_err)
     }
 
-    /// Tell the schedule how long this run is planned to be.
+    /// Tell the schedule how long the whole project is planned to run —
+    /// not just this sitting.
     ///
-    /// The warmup and the cosine decay are both shaped by it. Without
-    /// this the defaults assume a 10,000-step run with a 200-step
-    /// warmup, so a 231-step look at whether the thing learns at all
-    /// spends 200 of those steps at a fraction of the learning rate and
-    /// looks like it is doing nothing. Warmup is 2% of the run here,
-    /// between 10 and 200 steps.
-    pub fn set_planned_steps(&self, steps: u32) {
+    /// The warmup and the cosine decay are both shaped by it, and both are
+    /// anchored to the model's lifetime step (`start_step` stays 0): a
+    /// project planned for 23,000 steps, stopped at 5,000 and resumed,
+    /// picks the schedule back up at "5,000 of 23,000" — warmup already
+    /// behind it, decay already under way — rather than restarting a
+    /// fresh run's worth of warmup on whatever step it happens to resume
+    /// at. That was this method's previous behavior
+    /// (`start_step = inner.step` on every call); it's a deliberate
+    /// reversal, not a bug fix — see the checkpoint's `planned_steps`
+    /// field for how this now survives a reload.
+    ///
+    /// Idempotent: a call that doesn't change the plan is a no-op, so
+    /// pressing Train again with the same Steps value neither resets the
+    /// schedule nor re-triggers warmup. `steps == 0` means "leave the plan
+    /// as it is" — it's the frontend's separate "train until Stop" loop
+    /// sentinel, not a schedule length.
+    pub fn set_project_plan(&self, steps: u32) {
         let inner = &mut *self.0.borrow_mut();
         if steps == 0 {
             return;
         }
         let steps = steps as u64;
-        // Anchored to where the model actually is. Without this the
-        // cosine is handed a lifetime step against a run-length total,
-        // its progress clamps to 1.0 on every run after the first, and
-        // the whole run trains at the floor rate — a tenth of the peak
-        // it was meant to reach — with nothing saying so.
-        inner.train.start_step = inner.step;
+        if inner.train.total_steps == steps && inner.train.start_step == 0 {
+            return;
+        }
+        inner.train.start_step = 0;
         inner.train.total_steps = steps;
-        // A resumed run warms up again, briefly. The optimizer's moments
-        // survive a reload so this is not the cold start a new model
-        // needs, but jumping straight to the peak rate on weights that
-        // have been sitting still is how a resume undoes an hour of the
-        // run before it.
-        inner.train.warmup_steps = (steps / 50).clamp(10, 200).min(steps.max(1) / 2);
+        // Recomputed only when the plan actually changes (a fresh model,
+        // or the plan deliberately extended/shortened) — not on every
+        // Train press.
+        inner.train.warmup_steps = TrainConfig::warmup_for(steps);
     }
 
     /// Where in the current run a given step falls, 0 to 1.
@@ -1519,6 +1541,8 @@ impl WasmLLM {
             inner.corpus.tokenizer(),
             inner.step,
             inner.tokens_seen,
+            inner.train.total_steps as u32,
+            inner.train.plateau_scale,
             WeightDtype::Bf16,
         ))
     }
@@ -1535,6 +1559,16 @@ impl WasmLLM {
         inner.tokens_seen = checkpoint.tokens_seen;
         inner.corpus.set_tokenizer(checkpoint.tokenizer);
         inner.pretrained = true;
+        // Restore the schedule this checkpoint was carrying, the same way
+        // `from_checkpoint` does — a plan of 0 means the file predates
+        // planned_steps, so today's schedule (if any) is left alone rather
+        // than being clobbered with "no plan".
+        if checkpoint.planned_steps > 0 {
+            inner.train.start_step = 0;
+            inner.train.total_steps = checkpoint.planned_steps as u64;
+            inner.train.warmup_steps = TrainConfig::warmup_for(checkpoint.planned_steps as u64);
+            inner.train.plateau_scale = checkpoint.plateau_scale;
+        }
         // Both the uploaded generation weights and any resident training
         // state belong to the model that was just replaced.
         inner.gpu = None;
