@@ -1403,12 +1403,20 @@ async function train({
     if (sampleEvery > 0 && llm.step() >= nextSampleAt) {
       nextSampleAt = llm.step() + sampleEvery;
       if (inferenceDevice === 'cpu') {
-        // Race-free by design (see WasmLLM::generate): runs alongside
-        // training instead of pausing it, so this is fired and not
-        // awaited — the training loop moves straight on to the next
-        // slice while it runs in the background.
-        runTrainingSample(samplePrompt, sampleMaxTokens, sampling).catch((error) => {
-          log(`sample failed: ${(error && error.message) || error}`);
+        // CPU generation never pulls weights off the GPU on its own (see
+        // WasmLLM::generate) - that's what makes it race-free, but left
+        // alone it means a training sample would read whatever was last
+        // synced, which for most of a run is nothing: the CPU side sits
+        // at its initial random weights the entire time, and a sample
+        // "shows progress" that never moves no matter how far training
+        // gets. A quick sync first, best effort - if training is mid-step
+        // (rare, between slices) this is simply skipped for this one
+        // sample rather than waiting for it - then the generation itself
+        // still runs unawaited, so it never pauses training.
+        llm.sync_from_gpu().catch(() => {}).finally(() => {
+          runTrainingSample(samplePrompt, sampleMaxTokens, sampling).catch((error) => {
+            log(`sample failed: ${(error && error.message) || error}`);
+          });
         });
       } else {
         // GPU sampling runs on the same device training does, so it has
