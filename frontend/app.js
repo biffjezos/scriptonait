@@ -9,6 +9,7 @@
 // and — if you ask for it — a notification when it finishes.
 
 import * as db from './db.js';
+import * as project from './project.js';
 
 const worker = new Worker('./worker.js', { type: 'module' });
 
@@ -112,6 +113,30 @@ window.addEventListener('unhandledrejection', (event) => {
 
 const $ = (id) => document.getElementById(id);
 
+// --- Notifications -------------------------------------------------------
+//
+// One bar, at the top of the page, for every transient notice: errors,
+// confirmations, training events. Persistent data that belongs to a
+// specific tab (the plan, the best-model line, the machine profile)
+// stays inline in that tab instead of passing through here — this bar is
+// for things that happened once and should be acknowledged and
+// forgotten.
+
+let noticeTimeout = null;
+
+/// `level` is 'error' | 'info' | 'success'. Errors stay until replaced or
+/// dismissed; info/success clear themselves after a few seconds.
+function notice(text, level = 'error') {
+  const bar = $('notification-bar');
+  bar.textContent = text;
+  bar.className = `notification-bar ${level}`;
+  bar.hidden = false;
+  if (noticeTimeout) clearTimeout(noticeTimeout);
+  if (level !== 'error') {
+    noticeTimeout = setTimeout(() => { bar.hidden = true; }, 5000);
+  }
+}
+
 /// Show a failure, with enough of the stack to act on.
 ///
 /// An error message on its own is often useless — "Cannot read
@@ -119,18 +144,31 @@ const $ = (id) => document.getElementById(id);
 /// call produced it. The first frame does, so it goes on screen, and the
 /// whole thing goes to the console.
 function showError(error) {
-  const banner = $('error-banner');
   const message = typeof error === 'string' ? error : error.message;
   const frame = typeof error === 'object' && error && error.stack
     ? String(error.stack).split('\n').slice(1).find((line) => line.trim()) || ''
     : '';
-  banner.textContent = frame ? `${message}  (${frame.trim()})` : message;
-  banner.hidden = false;
+  notice(frame ? `${message}  (${frame.trim()})` : message, 'error');
   if (typeof error === 'object') console.error('scriptonait:', error);
 }
 
 function clearError() {
-  $('error-banner').hidden = true;
+  $('notification-bar').hidden = true;
+}
+
+// --- Tabs ----------------------------------------------------------------
+
+function switchTab(name) {
+  for (const button of document.querySelectorAll('#tabs .tab-button')) {
+    button.classList.toggle('active', button.dataset.tab === name);
+  }
+  for (const panel of document.querySelectorAll('.tab-panel')) {
+    panel.hidden = panel.id !== `tab-${name}`;
+  }
+}
+
+for (const button of document.querySelectorAll('#tabs .tab-button')) {
+  button.addEventListener('click', () => switchTab(button.dataset.tab));
 }
 
 function formatCount(n) {
@@ -255,10 +293,6 @@ function updateGuidance() {
     `gradients add up. ${batch}${where} x ${context} = ` +
     `${(batch * context).toLocaleString()} tokens per step.`;
 
-  $('train-btn').textContent = model
-    ? (model.pretrained ? 'Keep training on my writing' : 'Keep training this model')
-    : 'Train a model on my writing';
-
   const explains = $('train-explains');
   explains.textContent = !canTrain
     ? 'Training needs WebGPU. This browser did not give the page a GPU.'
@@ -273,17 +307,17 @@ function updateGuidance() {
   } else if (generating) {
     step.textContent = 'Writing…';
   } else if (!model && sources.length === 0) {
-    step.textContent = 'Step 1: add your writing.';
+    step.textContent = 'Add your writing in Corpus.';
   } else if (!model && !enoughText) {
     step.textContent = `Only ${formatCount(words)} characters. Add more, then train.`;
   } else if (!model) {
-    step.textContent = 'Step 2: train.';
+    step.textContent = 'Ready to train.';
   } else if (!canTrain) {
     step.textContent = 'No WebGPU here, so this model can write but not train.';
   } else if (model.step < 500) {
-    step.textContent = 'Barely trained. Keep training, or try step 3.';
+    step.textContent = 'Barely trained. Keep training, or generate in Inference.';
   } else {
-    step.textContent = 'Ready. Step 3: type a prompt.';
+    step.textContent = 'Ready. Type a prompt in Inference.';
   }
 
   renderMachineProfile();
@@ -319,6 +353,22 @@ async function syncAllSources() {
   await refreshPlan();
 }
 
+/// Pull each source's current sample count from the wasm corpus and
+/// write it back to SOURCES_STORE, so "which sources has training
+/// actually drawn from" survives a reload. Best effort — storage or
+/// worker trouble here must not interrupt anything this isn't for.
+async function flushSourceSampleCounts() {
+  if (!model) return;
+  try {
+    const { sources: stats } = await call('corpus-source-stats');
+    for (const { id, sampled } of stats) {
+      db.updateSourceStats(id, { timesSampled: sampled }).catch(() => {});
+    }
+  } catch (error) {
+    /* best effort */
+  }
+}
+
 /// Say when the same text is loaded twice.
 ///
 /// A duplicate is trained on twice, which weights that script double and
@@ -334,8 +384,7 @@ async function reportDuplicates() {
       .slice(0, 3);
     showError(
       `${ids.length} source${ids.length === 1 ? ' is a copy' : 's are copies'} of another ` +
-        `(${titles.join(', ')}${ids.length > 3 ? ', …' : ''}). Training on a script twice ` +
-        'weights it double — remove the copies in step 1.',
+        `(${titles.join(', ')}${ids.length > 3 ? ', …' : ''}). Remove the copies in Corpus.`,
     );
   } catch (error) {
     console.warn('[scriptonait] duplicate check failed:', error);
@@ -620,8 +669,6 @@ $('generate-btn').addEventListener('click', async () => {
       minP: Number($('opt-min-p').value),
       repetitionPenalty: Number($('opt-repetition').value),
       seed: Number($('opt-seed').value) || Math.floor(Math.random() * 1e9),
-      useStoryState: $('use-story-state').checked,
-      useRetrieval: $('use-retrieval').checked,
     }, [], 0);
     setProgress('generate-progress-bar', 1);
     const why = {
@@ -829,7 +876,6 @@ $('remove-all-btn').addEventListener('click', async () => {
       /* no model loaded: it was only ever in the list */
     }
   }
-  await refreshStoryState();
   await refreshPlan();
 });
 
@@ -839,8 +885,7 @@ async function removeSource(id) {
   await persist('deleting a source', () => db.deleteSource(id));
   try {
     renderModel(await call('remove-source', { id }));
-    await refreshStoryState();
-    await refreshPlan();
+      await refreshPlan();
   } catch (error) {
     /* no model loaded: it was only ever in the list */
   }
@@ -875,18 +920,10 @@ function updateSourceSummary(list, note = '') {
     return;
   }
   const chars = list.reduce((sum, s) => sum + (s.rawText || '').length, 0);
-  // Sources live in two places: this list, which is the browser's, and
-  // the model's corpus, which is the wasm side's. Without a model the
-  // second one does not exist, so a file added now is in the list and
-  // nowhere else until a model is made — and any number computed from
-  // the corpus is about a corpus that no longer matches this list.
-  const seen = model
-    ? ''
-    : ' — no model yet, so none of this is in a corpus: make or open one and it is all handed over';
-  const saved = persistenceWorks ? '' : ' · not saved (storage unavailable)';
+  const saved = persistenceWorks ? '' : ' · not saved';
   stats.textContent =
     `${list.length} source${list.length === 1 ? '' : 's'}, ` +
-    `${formatCount(chars)} characters${seen}${saved}${note ? ` · ${note}` : ''}`;
+    `${formatCount(chars)} characters${saved}${note ? ` · ${note}` : ''}`;
 }
 
 /// Hand one source to the model. Best effort: with no model loaded this
@@ -910,6 +947,13 @@ async function syncSource(source) {
       isHtml: source.kind === 'url',
     });
     if (result && result.model) renderModel(result.model);
+    // The corpus this source just joined is a fresh one — its own count
+    // of how many training windows have come from this source starts at
+    // 0 regardless of what happened before a reload. Hand back whatever
+    // was persisted last time, if anything.
+    if (source.timesSampled) {
+      call('set-source-sample-count', { id: source.id, count: source.timesSampled }).catch(() => {});
+    }
     return true;
   } catch (error) {
     return false;
@@ -966,7 +1010,6 @@ async function addSources(entries) {
   // caught up — and only for that, never for storage.
   await Promise.allSettled(syncing);
   renderSources();
-  await refreshStoryState();
   // The corpus just changed, so every number the plan is built from
   // did too. Without this the plan keeps reporting the corpus it was
   // last computed against.
@@ -986,33 +1029,6 @@ async function addSources(entries) {
 // Across a few hundred sources these run to thousands of entries, and a
 // paragraph of comma-separated names tells nobody anything. Show the
 // first handful and count the rest.
-const MAX_NAMES_SHOWN = 25;
-
-function nameList(names) {
-  const shown = names.slice(0, MAX_NAMES_SHOWN);
-  const hidden = names.length - shown.length;
-  return escapeHtml(shown.join(', ')) + (hidden > 0 ? ` <span class="hint">+${hidden.toLocaleString()} more</span>` : '');
-}
-
-async function refreshStoryState() {
-  const box = $('story-state');
-  try {
-    const state = await call('story-state');
-    if (!state.characters.length && !state.locations.length) {
-      box.hidden = true;
-      return;
-    }
-    const parts = [];
-    if (state.characters.length) parts.push(`<strong>Characters:</strong> ${nameList(state.characters)}`);
-    if (state.locations.length) parts.push(`<strong>Locations:</strong> ${nameList(state.locations)}`);
-    if (state.sceneCount) parts.push(`<strong>Scenes:</strong> ${state.sceneCount}`);
-    box.innerHTML = `${parts.join('<br />')}<p class="hint">Found by looking at line shapes, not by understanding the text — unusual formatting can fool it.</p>`;
-    box.hidden = false;
-  } catch (error) {
-    box.hidden = true;
-  }
-}
-
 $('add-paste-btn').addEventListener('click', async () => {
   const text = $('paste-input').value.trim();
   if (!text) return;
@@ -1030,20 +1046,6 @@ $('file-input').addEventListener('change', async (event) => {
   await addSources(
     files.map((file) => ({ title: file.name, kind: 'file', read: () => file.text() })),
   );
-});
-
-$('add-url-btn').addEventListener('click', async () => {
-  const url = $('url-input').value.trim();
-  if (!url) return;
-  try {
-    const response = await fetch(url);
-    if (!response.ok) throw new Error(`the server answered ${response.status}`);
-    const text = await response.text();
-    await addSources([{ title: url, kind: 'url', read: () => text, sourceUrl: url }]);
-    $('url-input').value = '';
-  } catch (error) {
-    showError(`couldn't fetch that URL (${error.message}). Most sites block cross-origin fetches — paste the text instead.`);
-  }
 });
 
 // --- Fine-tuning -------------------------------------------------------
@@ -1153,20 +1155,15 @@ $('restore-best-btn').addEventListener('click', async () => {
   // takes a few hundred steps to get the momentum back.
   const behind = model ? model.step - best.step : 0;
   if (!confirm(
-    `Go back to the model from step ${best.step.toLocaleString()}?\n\n` +
-      (behind > 0 ? `That discards the last ${behind.toLocaleString()} steps. ` : '') +
-      'The snapshot holds the weights but not the optimizer state, so training resumes with ' +
-      "Adam's momentum reset — the loss will step up and take a few hundred steps to come " +
-      'back down.\n\nWorth it when a run has genuinely gone past its best. Early in a run, ' +
-      'when both curves are still falling steeply, a "best" a few hundred steps back is ' +
-      'usually just the measurement wobbling.',
+    `Go back to the model from step ${best.step.toLocaleString()}?` +
+      (behind > 0 ? ` This discards the last ${behind.toLocaleString()} steps` : ' This') +
+      ' and resets the optimizer state.',
   )) {
     return;
   }
   setModelStatus('loading', 'Restoring the best model…');
   renderModel(await call('load-model', { bytes: best.bytes }, [], 0));
   await syncAllSources();
-  await refreshStoryState();
   await saveModel();
   console.info('[scriptonait] restored the best model');
 });
@@ -1192,6 +1189,7 @@ function renderPlan(plan) {
   // below, and no way to tell which is current.
   if (!model || !plan || !plan.phase) {
     box.hidden = true;
+    $('overview-plan').hidden = true;
     return;
   }
   $('plan-phase-title').textContent = plan.phase.title;
@@ -1207,13 +1205,14 @@ function renderPlan(plan) {
   // because the token count changes when the vocabulary is relearned
   // and the character count does not - and a number that moves for
   // reasons the user did not cause is a number they stop believing.
-  const progress = [`step ${n.step.toLocaleString()}`];
-  // Step counts in two frames: the model's lifetime, and this run. The
-  // schedule works in the second, so a run's progress has to be shown
-  // in it — "step 4,977 of 500 planned" is what happens otherwise.
-  if (n.plannedSteps > n.runStep) {
-    progress.push(`${n.runStep.toLocaleString()} of ${n.plannedSteps.toLocaleString()} this run`);
-  }
+  // The schedule is anchored to the model's lifetime step, not to when
+  // this run happened to start, so there is only one frame to show it
+  // in: step N of the plan.
+  const progress = [
+    n.plannedSteps > n.step
+      ? `step ${n.step.toLocaleString()} of ${n.plannedSteps.toLocaleString()} planned`
+      : `step ${n.step.toLocaleString()}`,
+  ];
   progress.push(
     n.tokensSeen > 0
       ? `${formatCount(n.tokensSeen)} tokens trained on`
@@ -1225,7 +1224,7 @@ function renderPlan(plan) {
     progress.push(`${Math.round(n.quality.knownWordRate * 100)}% real words`);
   }
   if (n.etaSeconds !== null && n.etaSeconds > 0) {
-    progress.push(`${formatDuration(n.etaSeconds)} left in this run`);
+    progress.push(`${formatDuration(n.etaSeconds)} left in the plan`);
   }
 
   const corpus = [];
@@ -1247,6 +1246,8 @@ function renderPlan(plan) {
 
   $('plan-numbers').textContent = `Trained: ${progress.join(' · ')}`;
   $('plan-corpus').textContent = `Corpus: ${corpus.join(' · ')}`;
+  $('overview-plan').hidden = false;
+  $('overview-plan').textContent = `${plan.phase.title} — ${progress.join(' · ')}`;
 
   const list = $('plan-actions');
   list.replaceChildren();
@@ -1281,6 +1282,39 @@ async function refreshPlan() {
   } catch (error) {
     console.warn('[scriptonait] could not build the training plan', error);
   }
+  refreshCorpusStats();
+}
+
+/// Per-source token counts and how many times each has actually been
+/// sampled, on the Overview tab — updates on the same events refreshPlan
+/// does (a source added or removed, a model loaded or created), so it
+/// never shows a source list that's drifted from what's on screen above.
+async function refreshCorpusStats() {
+  const panel = $('overview-corpus-panel');
+  if (!model) {
+    panel.hidden = true;
+    return;
+  }
+  try {
+    const { sources: stats } = await call('corpus-source-stats');
+    const titleFor = (id) => (sources.find((s) => s.id === id) || {}).title || id;
+    const totalSampled = stats.reduce((sum, s) => sum + s.sampled, 0) || 1;
+    const body = $('overview-corpus-body');
+    body.replaceChildren();
+    for (const s of [...stats].sort((a, b) => b.sampled - a.sampled)) {
+      const row = document.createElement('tr');
+      const share = Math.round((s.sampled / totalSampled) * 100);
+      row.innerHTML =
+        `<td>${escapeHtml(titleFor(s.id))}</td><td>${formatCount(s.trainTokens)}</td>` +
+        `<td>${formatCount(s.heldOutTokens)}</td><td>${s.sampled.toLocaleString()}${
+          s.sampled > 0 ? ` (${share}%)` : ''
+        }</td>`;
+      body.append(row);
+    }
+    panel.hidden = stats.length === 0;
+  } catch (error) {
+    console.warn('[scriptonait] could not read corpus stats', error);
+  }
 }
 
 onStream('train-advice', ({ advice, step }) => {
@@ -1291,31 +1325,10 @@ onStream('train-advice', ({ advice, step }) => {
   notify('Your model has stopped improving', advice);
 });
 
-onStream('train-sample', ({ step, loss, text, quality }) => {
-  const box = $('train-samples');
-  let block = box.firstElementChild;
-  if (!block || box.children.length !== 1) {
-    block = document.createElement('div');
-    block.className = 'train-sample';
-    const head = document.createElement('div');
-    head.className = 'train-sample-head';
-    block.append(head, document.createElement('pre'));
-  }
-  // The header carries the measurement, because the sample is where a
-  // person decides whether this is working, and "is it words" is not
-  // something you can eyeball reliably at 40 words a time.
-  const head = [`step ${step.toLocaleString()}`];
-  if (typeof loss === 'number') head.push(`loss ${loss.toFixed(3)}`);
-  if (quality && quality.words > 0) {
-    head.push(`${Math.round(quality.knownWordRate * 100)}% real words`);
-    if (quality.repeated4gramRate > 0.05) {
-      head.push(`${Math.round(quality.repeated4gramRate * 100)}% repeated runs`);
-    }
-  }
-  block.firstElementChild.textContent = head.join(' \u00b7 ');
-  block.lastElementChild.textContent = text;
-  box.replaceChildren(block);
-});
+// The single overwriting sample card is gone \u2014 the Samples panel (backed
+// by train-record events, see renderSampleHistory) is the only place a
+// training sample shows up now, and it keeps every one rather than just
+// the latest.
 
 
 // --- Run history -------------------------------------------------------
@@ -1384,21 +1397,6 @@ function renderHistory() {
     ? `· ${rows.length} measurement${rows.length === 1 ? '' : 's'}, ` +
       `${samples().length} sample${samples().length === 1 ? '' : 's'}`
     : '· nothing recorded yet';
-
-  // A model can be behind its own history: recovered from a save, it
-  // resumes at a step some recorded rows are already past. Those rows
-  // describe weights that no longer exist, and reading them as the
-  // present is how a run looks like it went backwards.
-  const furthest = rows.reduce((max, r) => Math.max(max, r.step || 0), 0);
-  const rewound = model && furthest > model.step + 1;
-  $('history-rewind').textContent = rewound
-    ? `This model is at step ${model.step.toLocaleString()}, but rows below go up to ` +
-      `${furthest.toLocaleString()} — those came from a run whose weights were not kept ` +
-      '(a reload, or a crash before the next save). They describe a model that no longer ' +
-      'exists; the rows for the current run are the ones at or below ' +
-      `${model.step.toLocaleString()}.`
-    : '';
-  $('history-rewind').hidden = !rewound;
 
   const head = `<thead><tr>${HISTORY_COLUMNS.map(([label]) => `<th>${label}</th>`).join('')}` +
     '</tr></thead>';
@@ -1550,7 +1548,6 @@ function historyAsMarkdown() {
 /// already on screen.
 async function copyToClipboard(text, label) {
   const box = $('history-output');
-  const note = $('history-copied');
   box.value = text;
   box.hidden = false;
   box.focus();
@@ -1574,11 +1571,10 @@ async function copyToClipboard(text, label) {
       copied = false;
     }
   }
-  note.textContent = copied
-    ? `Copied ${label} — and it is in the box below if you want to check.`
-    : `${label} is in the box below, selected. Press Ctrl+C (or Cmd+C).`;
-  note.hidden = false;
-  setTimeout(() => { note.hidden = true; }, 8000);
+  notice(
+    copied ? `Copied ${label}.` : `${label} is in the box below, selected — press Ctrl+C.`,
+    copied ? 'success' : 'info',
+  );
 }
 
 // A run that ends before you asked it to has to say so, loudly. It used
@@ -1727,18 +1723,19 @@ function profileShapeMatches(profile) {
 
 function renderMachineProfile() {
   const text = $('machine-profile-text');
-  const forget = $('bench-forget-btn');
   if (!text) return;
+  if (!benchmarkAutoEnabled) {
+    text.textContent = 'Auto-benchmark is off. Batch size falls back to what is typed, or 1.';
+    return;
+  }
   if (benchmarking) {
     text.textContent = 'Measuring this machine…';
-    forget.hidden = true;
     return;
   }
   if (!machineProfile) {
     text.textContent = gpuReport
       ? 'Machine profile: not measured yet. The first training run measures it once.'
       : 'Machine profile: needs a GPU.';
-    forget.hidden = true;
     return;
   }
   const p = machineProfile;
@@ -1748,7 +1745,6 @@ function renderMachineProfile() {
     `batch ${p.batchSize}, ${Math.round(p.msPerStep)} ms per step ` +
     `(${Math.round(p.tokensPerSecond)} tokens/s)` +
     (stale ? '. Measured on a differently shaped model — measure again for its batch size.' : '.');
-  forget.hidden = false;
 }
 
 /// Read the stored profile for whatever adapter the browser handed over,
@@ -1787,7 +1783,6 @@ async function runBenchmark() {
   // that would land in the middle of an actual run.
   if (benchmarking) return machineProfile;
   benchmarking = true;
-  $('bench-btn').disabled = true;
   renderMachineProfile();
   try {
     const result = await call('benchmark', {}, [], 0);
@@ -1800,7 +1795,6 @@ async function runBenchmark() {
     return machineProfile;
   } finally {
     benchmarking = false;
-    $('bench-btn').disabled = false;
     renderMachineProfile();
     updateGuidance();
   }
@@ -1846,6 +1840,51 @@ function chosenEffort() {
   return value === 'auto' ? 1 : Number(value);
 }
 
+/// Auto disables Batch/Effort/Learning-rate and lets the existing
+/// auto-pick logic choose them; Manual hands them back and, per the Train
+/// button handler, refuses to start at learning rate 0 — in Manual mode 0
+/// means "no rate set", not "pick one". Steps stays editable in both
+/// modes: it's the project's planned length, not a choice about how
+/// training happens, so it means the same thing whichever mode picks the
+/// rest.
+function applyTrainMode() {
+  const manual = $('train-mode').value === 'manual';
+  for (const id of ['train-batch', 'train-effort', 'train-lr']) {
+    $(id).disabled = !manual;
+  }
+  // Batch and Effort each have their own "pick one" sentinel (0, "auto")
+  // that the auto-pick logic already reads correctly — but only if a
+  // leftover typed value from a previous Manual session isn't still
+  // sitting in the field. Steps and Learning rate need no such reset:
+  // Steps 0 means "until stopped" in both modes, and the Train button
+  // reads Learning rate only when Manual is selected.
+  if (!manual) {
+    $('train-batch').value = '0';
+    $('train-effort').value = 'auto';
+  }
+  updateGuidance();
+}
+$('train-mode').addEventListener('change', applyTrainMode);
+applyTrainMode();
+
+/// Everything on this tab that used to reset to the markup's hardcoded
+/// defaults on every reload. Written through on change, loaded back at
+/// startup (see `start()`) — the same immediately-applied pattern the
+/// other Settings-tab controls already use.
+async function persistTrainingPlanSettings() {
+  await db.putTrainingPlanSettings({
+    mode: $('train-mode').value,
+    plannedSteps: Number($('train-steps').value) || 0,
+    effort: $('train-effort').value,
+    sampleToggle: $('sample-toggle').checked,
+    sampleEvery: Number($('sample-every').value) || 0,
+    samplePrompt: $('sample-prompt').value,
+  });
+}
+for (const id of ['train-mode', 'train-steps', 'train-effort', 'sample-toggle', 'sample-every', 'sample-prompt']) {
+  $(id).addEventListener('change', persistTrainingPlanSettings);
+}
+
 onStream('bench-progress', ({ stage, dispatchesPerSubmit }) => {
   if (!benchmarking || stage !== 'chunk') return;
   $('machine-profile-text').textContent =
@@ -1853,22 +1892,44 @@ onStream('bench-progress', ({ stage, dispatchesPerSubmit }) => {
     'fastest so far; now finding the batch size…';
 });
 
-$('bench-btn').addEventListener('click', () => {
-  clearError();
-  runBenchmark().catch(showError);
-});
+/// Whether the first training run on a new shape auto-measures the
+/// machine. On by default; loaded from settings at startup.
+let benchmarkAutoEnabled = true;
 
-$('bench-forget-btn').addEventListener('click', async () => {
-  if (!gpuReport) return;
-  await db.deleteMachineProfile(gpuReport);
-  machineProfile = null;
+$('benchmark-enabled').addEventListener('change', async (event) => {
+  const wasEnabled = benchmarkAutoEnabled;
+  benchmarkAutoEnabled = event.target.value !== 'off';
+  await db.putBenchmarkConfig({ autoEnabled: benchmarkAutoEnabled });
+  // Turning it off and back on is the only way to clear a bad stored
+  // profile now that there is no dedicated button for it: the toggle
+  // itself is the escape hatch.
+  if (benchmarkAutoEnabled && !wasEnabled && gpuReport) {
+    await db.deleteMachineProfile(gpuReport);
+    machineProfile = null;
+    notice('Machine profile cleared — the next training run measures it again.', 'info');
+  }
   renderMachineProfile();
   updateGuidance();
+});
+
+/// Loaded from Settings at startup, and kept live from there. Training
+/// stays GPU-only for now (the CPU option is disabled in the markup),
+/// so only the inference side has anything to wire.
+let inferenceDevicePref = 'gpu';
+
+$('inference-device').addEventListener('change', async (event) => {
+  inferenceDevicePref = event.target.value === 'cpu' ? 'cpu' : 'gpu';
+  await db.putDevicePreference({ trainingDevice: 'gpu', inferenceDevice: inferenceDevicePref });
+  await call('set-inference-device', { device: inferenceDevicePref });
 });
 
 $('train-btn').addEventListener('click', async () => {
   if (training) return;
   clearError();
+  if ($('train-mode').value === 'manual' && !(Number($('train-lr').value) > 0)) {
+    notice('Set a learning rate before training in Manual mode.', 'error');
+    return;
+  }
   training = true;
   lastPhaseKey = null;
   $('live-controls').hidden = false;
@@ -1881,7 +1942,6 @@ $('train-btn').addEventListener('click', async () => {
   $('train-status').hidden = false;
   $('loss-chart').hidden = false;
   $('train-stats').textContent = 'Starting…';
-  $('train-samples').replaceChildren();
   $('train-advice').hidden = true;
 
   try {
@@ -1916,7 +1976,7 @@ $('train-btn').addEventListener('click', async () => {
     // settings that follow are read off that measurement, so it has to
     // happen first — and it only ever happens once per adapter and
     // model shape, because the answer is stored.
-    if (!machineProfile || !profileShapeMatches(machineProfile)) {
+    if (benchmarkAutoEnabled && (!machineProfile || !profileShapeMatches(machineProfile))) {
       $('train-stats').textContent =
         'Measuring this machine — timing a few steps to pick the settings…';
       await runBenchmark().catch((error) => {
@@ -1928,13 +1988,15 @@ $('train-btn').addEventListener('click', async () => {
     }
 
     const fromScratch = model && !model.pretrained;
+    const manualMode = $('train-mode').value === 'manual';
     const chosenRate = Number($('train-lr').value);
     const batchSize = chosenBatchSize();
     const result = await call('train', {
       batchSize,
-      // 0 means "pick one": a new model needs a rate large enough to
-      // learn a language from nothing; a working one needs a small
-      // enough rate not to forget it.
+      // Manual mode uses the typed rate as-is (checked above). Auto
+      // picks one: a new model needs a rate large enough to learn a
+      // language from nothing; a working one needs a small enough rate
+      // not to forget it.
       //
       // 6e-4 is what nanoGPT uses for a 768-wide GPT-2, and a narrower
       // model tolerates more rather than less, so it is a conservative
@@ -1944,13 +2006,24 @@ $('train-btn').addEventListener('click', async () => {
       // there are three separate things that catch a rate that turns
       // out to be too high; there is nothing that catches one that is
       // too low except hours of your time.
-      learningRate: chosenRate > 0 ? chosenRate : (fromScratch ? 6e-4 : 5e-5),
+      learningRate: manualMode ? chosenRate : (fromScratch ? 6e-4 : 5e-5),
       maxSteps: Number($('train-steps').value),
       effort: chosenEffort(),
       // 0 turns sampling off; anything else is a step interval.
       sampleEvery: $('sample-toggle').checked ? Number($('sample-every').value) : 0,
       samplePrompt: $('sample-prompt').value.trim() || 'Write a 40 word scene.',
       sampleWords: 40,
+      // Training samples are generated with the Inference tab's own
+      // settings, not a second hidden set — the same fields Generate
+      // reads.
+      sampling: {
+        temperature: Number($('opt-temperature').value),
+        topK: Number($('opt-top-k').value),
+        topP: Number($('opt-top-p').value),
+        minP: Number($('opt-min-p').value),
+        repetitionPenalty: Number($('opt-repetition').value),
+      },
+      autosaveFrequencySteps,
     }, [], 0);
 
     if (result.stopReason === 'already-training') {
@@ -1962,7 +2035,7 @@ $('train-btn').addEventListener('click', async () => {
           "your browser's flags.",
       );
     } else if (result.stopReason === 'no-data') {
-      showError('Not enough text to train on. Add more in step 1.');
+      showError('Not enough text to train on. Add more in Corpus.');
     } else {
       setProgress('train-progress-bar', 1);
       const loss = typeof result.loss === 'number' ? result.loss.toFixed(3) : '—';
@@ -2089,9 +2162,89 @@ $('import-input').addEventListener('change', async (event) => {
     const buffer = await file.arrayBuffer();
     renderModel(await call('import-checkpoint', { bytes: buffer }, [buffer]));
     await syncAllSources();
-    await refreshStoryState();
-  } catch (error) {
+    } catch (error) {
     showError(`that file didn't load: ${error.message}`);
+    setModelStatus('absent', 'No model loaded.');
+  }
+  event.target.value = '';
+});
+
+$('export-project-btn').addEventListener('click', async () => {
+  clearError();
+  try {
+    const checkpointBytes = model ? (await call('export-checkpoint')).bytes : null;
+    const optimizerBytes = model
+      ? await call('export-optimizer').then((r) => r.bytes).catch(() => null)
+      : null;
+    const blob = project.buildProjectFile({
+      checkpointBytes,
+      optimizerBytes,
+      sources: await db.listSources(),
+      history: await db.listHistory(),
+      settings: {
+        autosaveConfig: await db.getAutosaveConfig(),
+        devicePreference: await db.getDevicePreference(),
+        benchmarkConfig: await db.getBenchmarkConfig(),
+        trainingPlan: await db.getTrainingPlanSettings(),
+      },
+    });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = 'scriptonait.snp';
+    link.click();
+    URL.revokeObjectURL(url);
+  } catch (error) {
+    showError(error);
+  }
+});
+
+$('import-project-input').addEventListener('change', async (event) => {
+  const file = event.target.files[0];
+  if (!file) return;
+  if (!confirm(`Import "${file.name}"? This replaces the current model, corpus, history and settings.`)) {
+    event.target.value = '';
+    return;
+  }
+  clearError();
+  setModelStatus('loading', `Loading ${file.name}…`);
+  try {
+    const buffer = await file.arrayBuffer();
+    const { header, checkpointBytes, optimizerBytes } = project.parseProjectFile(buffer);
+
+    await db.replaceAllSources(header.sources || []);
+    await db.replaceAllHistory(header.history || []);
+    const settings = header.settings || {};
+    if (settings.autosaveConfig) await db.putAutosaveConfig(settings.autosaveConfig);
+    if (settings.devicePreference) await db.putDevicePreference(settings.devicePreference);
+    if (settings.benchmarkConfig) await db.putBenchmarkConfig(settings.benchmarkConfig);
+    if (settings.trainingPlan) await db.putTrainingPlanSettings(settings.trainingPlan);
+
+    if (checkpointBytes) {
+      renderModel(await call('import-checkpoint', { bytes: checkpointBytes }, [checkpointBytes]));
+      if (optimizerBytes) {
+        await call('import-optimizer', { bytes: optimizerBytes }, [optimizerBytes]).catch(() => {});
+      }
+    } else {
+      setModelStatus('absent', 'No model yet.');
+    }
+
+    // A full replace, not a merge: refreshSources only ever adds sources
+    // it doesn't already know about, so the in-memory list has to be
+    // cleared first or a source dropped by the import would linger.
+    // syncAllSources hands each one to the model and restores its
+    // persisted sample count (syncSource does that per source already).
+    sources = [];
+    history.length = 0;
+    await refreshSources();
+    await syncAllSources();
+    history.push(...(await db.listHistory()));
+    renderHistory();
+    await applyLoadedSettings();
+    updateGuidance();
+    notice(`Imported ${file.name}.`, 'success');
+  } catch (error) {
+    showError(`that project file didn't load: ${(error && error.message) || error}`);
     setModelStatus('absent', 'No model loaded.');
   }
   event.target.value = '';
@@ -2164,7 +2317,7 @@ async function saveModel() {
     console.warn('[scriptonait] could not save the model:', error);
     showError(
       `the model could not be saved (${(error && error.message) || error}). ` +
-        'It is still loaded — use "Save this model to a file" to keep it.',
+        'It is still loaded — use Save on Overview to keep it.',
     );
   }
 }
@@ -2182,9 +2335,11 @@ async function saveModel() {
 // Where it is missing the browser copy still runs and the page says so
 // rather than pretending.
 
-/// How often, in steps, an unattended run writes itself down. Every
-/// thousand steps is a few minutes of work at risk instead of a night's.
-const AUTOSAVE_EVERY_STEPS = 1000;
+/// Loaded from Settings at startup, and kept live from there — every
+/// field writes through to db.js immediately on change.
+let autosaveEnabled = true;
+let autosaveFrequencySteps = 1000;
+let autosaveMode = 'overwrite';
 
 /// The file the run writes itself to, once somebody has chosen one. Held
 /// only for this session — a handle can be stored, but re-permissioning
@@ -2214,8 +2369,9 @@ async function writeModelToFile(bytes) {
 /// pulls the weights off the GPU, and stacking two of those is the exact
 /// thing that exhausted the heap and lost a model in the first place.
 async function autosave(step, { force = false, bytes: given = null } = {}) {
+  if (!autosaveEnabled && !force) return;
   if (autosaveInFlight) return;
-  if (!force && !given && step - lastAutosaveStep < AUTOSAVE_EVERY_STEPS) return;
+  if (!force && !given && step - lastAutosaveStep < autosaveFrequencySteps) return;
   autosaveInFlight = true;
   lastAutosaveStep = step;
   try {
@@ -2245,7 +2401,18 @@ async function autosave(step, { force = false, bytes: given = null } = {}) {
     } catch (error) {
       /* no stored copy yet: there is nothing to preserve */
     }
-    await db.putModel({ bytes, step, params: model ? model.params : 0, optimizer });
+    const params = model ? model.params : 0;
+    // "Add" keeps a rolling set of recent snapshots instead of
+    // overwriting the one current-model slot. The file-on-disk leg
+    // always overwrites the chosen file regardless of mode — the File
+    // System Access API cannot silently create a new file without a
+    // picker prompt on every save, which would defeat "no button
+    // needed".
+    if (autosaveMode === 'add') {
+      await db.putAutosaveSnapshot({ bytes, step, params, optimizer });
+    } else {
+      await db.putModel({ bytes, step, params, optimizer });
+    }
     let wroteFile = false;
     if (autosaveHandle) {
       await writeModelToFile(bytes);
@@ -2257,23 +2424,58 @@ async function autosave(step, { force = false, bytes: given = null } = {}) {
         `${(performance.now() - started).toFixed(0)} ms`,
     );
     $('autosave-status').textContent =
-      `Last auto-save: step ${step.toLocaleString()}` +
-      (wroteFile ? ' — to your file and to this browser.' : ' — to this browser.');
+      `Last save: step ${step.toLocaleString()}` +
+      (wroteFile ? ` — ${autosaveHandle.name} and this browser.` : ' — this browser.');
+    flushSourceSampleCounts();
   } catch (error) {
     console.warn('[scriptonait] auto-save failed', error);
-    $('autosave-status').textContent =
-      `Auto-save failed at step ${step.toLocaleString()}: ${(error && error.message) || error}`;
+    $('autosave-status').textContent = `Save failed at step ${step.toLocaleString()}: ${(error && error.message) || error}`;
   } finally {
     autosaveInFlight = false;
   }
 }
 
+// --- Crash resilience ---------------------------------------------------
+//
+// The step-interval autosave above only catches steps at its own
+// cadence — a run stopped 400 steps after its last save loses those 400
+// if the tab dies before the next one. That's exactly what happened
+// switching to another site while training: the tab went to the
+// background and the browser reclaimed it before the next interval hit.
+// Saving whenever the tab is hidden or about to unload closes most of
+// that window; it can't do anything for a hard OS-level kill (nothing
+// downstream of that can, mid-write or not), but it turns "however many
+// steps since the last thousand-step checkpoint" into "however many
+// steps since you last switched away."
+
+let lastCrashSaveAt = 0;
+
+function saveBeforeTabDisappears() {
+  const now = performance.now();
+  // A tab can fire visibilitychange repeatedly in quick succession
+  // (switching tabs back and forth); this isn't a save worth repeating
+  // more than about once per ten seconds.
+  if (now - lastCrashSaveAt < 10_000) return;
+  if (!autosaveEnabled || !model || autosaveInFlight) return;
+  lastCrashSaveAt = now;
+  // `force` only bypasses autosave()'s step-count throttle, not its
+  // enabled check — already made above — so this still honors the
+  // Settings-tab toggle.
+  autosave(model.step, { force: true });
+  flushSourceSampleCounts();
+}
+
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'hidden') saveBeforeTabDisappears();
+});
+window.addEventListener('pagehide', saveBeforeTabDisappears);
+
 $('autosave-file-btn').addEventListener('click', async () => {
   if (!autosaveSupported()) {
-    showError(
-      'This browser has no File System Access API, so the page cannot write to a file on its ' +
-        'own. Chrome and Edge have it. The browser copy still saves automatically, and ' +
-        '"Save this model to a file" works anywhere.',
+    notice(
+      'This browser cannot write to a file on its own (Chrome and Edge can). The browser ' +
+        'copy still saves; "Save" on the Overview tab works anywhere.',
+      'error',
     );
     return;
   }
@@ -2282,8 +2484,7 @@ $('autosave-file-btn').addEventListener('click', async () => {
       suggestedName: 'scriptonait.ckpt',
       types: [{ description: 'scriptonait checkpoint', accept: { 'application/octet-stream': ['.ckpt'] } }],
     });
-    $('autosave-status').textContent =
-      `Auto-saving to ${autosaveHandle.name} every ${AUTOSAVE_EVERY_STEPS.toLocaleString()} steps.`;
+    $('autosave-status').textContent = `File: ${autosaveHandle.name}.`;
     // Write immediately, so the file exists and the permission is proven
     // now rather than in six hours when it matters.
     if (model) await autosave(model.step, { force: true });
@@ -2291,6 +2492,27 @@ $('autosave-file-btn').addEventListener('click', async () => {
     // A cancelled picker is not an error.
     if (error && error.name !== 'AbortError') showError(error);
   }
+});
+
+$('autosave-enabled').addEventListener('change', async (event) => {
+  autosaveEnabled = event.target.value !== 'off';
+  await db.putAutosaveConfig({
+    enabled: autosaveEnabled, frequencySteps: autosaveFrequencySteps, mode: autosaveMode,
+  });
+});
+
+$('autosave-frequency').addEventListener('change', async (event) => {
+  autosaveFrequencySteps = Math.max(1, Number(event.target.value) || 1000);
+  await db.putAutosaveConfig({
+    enabled: autosaveEnabled, frequencySteps: autosaveFrequencySteps, mode: autosaveMode,
+  });
+});
+
+$('autosave-mode').addEventListener('change', async (event) => {
+  autosaveMode = event.target.value === 'add' ? 'add' : 'overwrite';
+  await db.putAutosaveConfig({
+    enabled: autosaveEnabled, frequencySteps: autosaveFrequencySteps, mode: autosaveMode,
+  });
 });
 
 /// Load the model saved by an earlier visit, if there is one.
@@ -2307,8 +2529,7 @@ async function restoreModel() {
   try {
     renderModel(await call('load-model', { bytes: stored.bytes }, [], 0));
     await syncAllSources();
-    await refreshStoryState();
-    if (stored.optimizer) {
+      if (stored.optimizer) {
       // Momentum, so training continues where it left off instead of
       // restarting Adam from nothing.
       try {
@@ -2326,7 +2547,65 @@ async function restoreModel() {
 
 // --- Start -------------------------------------------------------------
 
+/// Pull every Settings-tab and Training-tab record back from db.js and
+/// apply it to both the module state and the control showing it — every
+/// field involved writes through to db.js on change, so this is the one
+/// place that has to do the reverse. Called at startup, and again after
+/// a project import replaces what's stored (see the Import Project
+/// handler) so the two paths can't drift apart.
+async function applyLoadedSettings() {
+  try {
+    const autosaveConfig = await db.getAutosaveConfig();
+    if (autosaveConfig) {
+      autosaveEnabled = autosaveConfig.enabled !== false;
+      autosaveFrequencySteps = autosaveConfig.frequencySteps > 0 ? autosaveConfig.frequencySteps : 1000;
+      autosaveMode = autosaveConfig.mode === 'add' ? 'add' : 'overwrite';
+      $('autosave-enabled').value = autosaveEnabled ? 'on' : 'off';
+      $('autosave-frequency').value = String(autosaveFrequencySteps);
+      $('autosave-mode').value = autosaveMode;
+    }
+  } catch (error) {
+    console.warn('[scriptonait] could not read auto-save settings', error);
+  }
+  try {
+    const devicePref = await db.getDevicePreference();
+    if (devicePref) {
+      inferenceDevicePref = devicePref.inferenceDevice === 'cpu' ? 'cpu' : 'gpu';
+      $('inference-device').value = inferenceDevicePref;
+      await call('set-inference-device', { device: inferenceDevicePref });
+    }
+  } catch (error) {
+    console.warn('[scriptonait] could not read device settings', error);
+  }
+  try {
+    const benchmarkConfig = await db.getBenchmarkConfig();
+    if (benchmarkConfig) {
+      benchmarkAutoEnabled = benchmarkConfig.autoEnabled !== false;
+      $('benchmark-enabled').value = benchmarkAutoEnabled ? 'on' : 'off';
+    }
+  } catch (error) {
+    console.warn('[scriptonait] could not read benchmark settings', error);
+  }
+  try {
+    const planSettings = await db.getTrainingPlanSettings();
+    if (planSettings) {
+      $('train-mode').value = planSettings.mode === 'manual' ? 'manual' : 'auto';
+      if (planSettings.plannedSteps > 0) $('train-steps').value = String(planSettings.plannedSteps);
+      if (planSettings.effort) $('train-effort').value = planSettings.effort;
+      $('sample-toggle').checked = !!planSettings.sampleToggle;
+      if (planSettings.sampleEvery > 0) $('sample-every').value = String(planSettings.sampleEvery);
+      if (planSettings.samplePrompt) $('sample-prompt').value = planSettings.samplePrompt;
+      applyTrainMode();
+    }
+  } catch (error) {
+    console.warn('[scriptonait] could not read training-plan settings', error);
+  }
+}
+
 (async function start() {
+  // Settings, before anything reads them.
+  await applyLoadedSettings();
+
   // Guidance first, before anything that can be slow. Reading saved
   // sources waits on IndexedDB, and until it answers the page would
   // otherwise sit there saying nothing at all — which is the state this

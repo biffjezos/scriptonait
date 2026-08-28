@@ -39,6 +39,13 @@ let training = false;
 // mid-step.
 let stopRequested = false;
 
+/// Which device user-initiated generation prefers, set from the Settings
+/// tab and applied to the next Generate call — never retried or polled
+/// when it can't be honored (see `llm.generate`'s own `prefer_gpu`
+/// argument). 'cpu' is the only choice that is guaranteed to work while
+/// training holds the GPU; 'gpu' can be refused if training is running.
+let inferenceDevice = 'gpu';
+
 const PROGRESS_INTERVAL_MS = 250;
 
 /// Bumped whenever the benchmark measures something different, so a
@@ -60,8 +67,9 @@ const PLATEAU_PATIENCE = 4;
 /// uses, for the same reason.
 const TOKENS_BEFORE_CUTTING_THE_RATE = 2e6;
 
-/// How often an unattended run writes itself down. A few minutes of
-/// work at risk instead of a night's.
+/// Default cadence for an unattended run to write itself down, used only
+/// until the page sends its own Settings-tab frequency in the train
+/// payload — a few minutes of work at risk instead of a night's.
 const AUTOSAVE_EVERY_STEPS = 1000;
 /// What a cut multiplies the rate by, and how far the cuts may go in
 /// total. Halving is the standard move; a run that has fallen to a
@@ -298,6 +306,7 @@ async function generate({ prompt, extraContext, temperature, topK, topP, minP, r
     minP || 0,
     repetitionPenalty,
     seed,
+    inferenceDevice !== 'cpu',
     (piece, words) => {
       tokens += 1;
       // Text goes back immediately — that's what makes the page feel
@@ -321,9 +330,11 @@ async function generate({ prompt, extraContext, temperature, topK, topP, minP, r
 
   const elapsed = (performance.now() - startedAt) / 1000;
   if (result.stop_reason === 'busy') {
-    throw new Error(
-      'the GPU is busy with a save or another generation — wait a moment and try again',
-    );
+    // A single refusal, not a retry: the GPU is doing something else
+    // (training, a save, another generation) right now. Nothing here
+    // waits or polls for it to finish — switch Inference to CPU, or try
+    // again once whatever's running has finished.
+    throw new Error('the GPU is busy (training or another save) — switch to CPU, or try again once it finishes');
   }
   return {
     text: result.text,
@@ -350,20 +361,24 @@ async function generate({ prompt, extraContext, temperature, topK, topP, minP, r
 /// `generate` pulls the freshly trained weights off the GPU first, so a
 /// sample shows the model as it is at this step rather than as it was
 /// when training started.
-async function trainingSample(prompt, words) {
+/// `sampling` is the Inference tab's own settings
+/// ({temperature,topK,topP,minP,repetitionPenalty}) — the same values
+/// Generate uses, not a second hidden set tucked away in here.
+async function trainingSample(prompt, words, sampling) {
+  const s = sampling || { temperature: 0.9, topK: 40, topP: 0.95, minP: 0.05, repetitionPenalty: 1.1 };
   const result = await llm.generate(
     prompt,
     '',
-    0.9,
-    40,
-    0.95,
-    // A training sample is the one place min-p earns its keep without
-    // being asked for: an early model's distribution is nearly flat, so
-    // this keeps the field wide, and a later one's is peaked, so it
-    // stops the sample wandering into the tail.
-    0.05,
-    1.1,
+    s.temperature,
+    s.topK,
+    s.topP,
+    s.minP,
+    s.repetitionPenalty,
     Math.floor(Math.random() * 1e9),
+    // Always the GPU: this runs from inside the training loop itself, on
+    // the weights the run just produced, not concurrently with anything
+    // that would make CPU inference's race-free guarantee matter.
+    true,
     (_piece, produced) => produced < words,
   );
   return result.text;
@@ -430,10 +445,8 @@ function trainingPhase(plan, { heldOut, trainingLoss }) {
       key: 'warm-up',
       title: 'Warm-up',
       detail:
-        `the learning rate is ramping from nearly zero to ${peakLr.toExponential(1)} over the ` +
-        `first ${warmupSteps.toLocaleString()} steps — it is at ${lrNow.toExponential(1)} now. ` +
-        'Loss moves slowly here on purpose: a full-size step this early puts the model ' +
-        'somewhere it spends thousands of steps climbing out of.',
+        `Rate ${lrNow.toExponential(1)} of ${peakLr.toExponential(1)} peak, step ` +
+        `${step.toLocaleString()} of ${warmupSteps.toLocaleString()}.`,
     };
   }
 
@@ -467,10 +480,7 @@ function trainingPhase(plan, { heldOut, trainingLoss }) {
     return {
       key: 'overfitting',
       title: 'Overfitting',
-      detail:
-        'held-out loss is rising while training loss falls. From here the model is learning ' +
-        'your text rather than learning from it, and every further step makes it worse at ' +
-        'writing anything new. The best model of this run is already saved.',
+      detail: 'Held-out loss rising while training loss falls. Best model so far is saved.',
     };
   }
   if (trend !== null && trend < noise) {
@@ -478,9 +488,8 @@ function trainingPhase(plan, { heldOut, trainingLoss }) {
       key: 'plateau',
       title: 'Plateau',
       detail:
-        'held-out loss has stopped improving' +
-        (gap === null ? '' : `, and sits ${gap.toFixed(2)} above training loss`) +
-        '. More steps at this setting will not move it; something has to change.',
+        'Held-out loss has stopped improving' +
+        (gap === null ? '' : `, ${gap.toFixed(2)} above training loss`) + '.',
     };
   }
   // Past the end of the plan the cosine has nothing left to decay: the
@@ -493,11 +502,8 @@ function trainingPhase(plan, { heldOut, trainingLoss }) {
       key: 'past-plan',
       title: 'Past the planned run',
       detail:
-        `this model has done ${step.toLocaleString()} steps against a plan of ` +
-        `${plannedSteps.toLocaleString()}, so the schedule has run out and the rate is parked ` +
-        `on its floor, ${lrNow.toExponential(1)}. Training continues at that constant rate. ` +
-        'Setting Steps to the length you actually intend gives the cosine a shape to follow ' +
-        'again, and a warm-up-then-decay run reaches a lower loss than a flat one.',
+        `Step ${step.toLocaleString()} of a planned ${plannedSteps.toLocaleString()}. Rate ` +
+        `parked at its floor, ${lrNow.toExponential(1)}. Set Steps to the length you intend.`,
     };
   }
   // The cosine tail: the last stretch of a planned run, where the rate
@@ -507,23 +513,18 @@ function trainingPhase(plan, { heldOut, trainingLoss }) {
       key: 'cooling',
       title: 'Cooling down',
       detail:
-        `the cosine schedule has taken the rate from ${peakLr.toExponential(1)} down to ` +
-        `${lrNow.toExponential(1)}, approaching its floor of ` +
-        `${(peakLr * minLrRatio).toExponential(1)} at step ${plannedSteps.toLocaleString()}. ` +
-        'This is where a run consolidates: small improvements, and the least noisy weights ' +
-        'it will have.',
+        `Rate ${lrNow.toExponential(1)} of ${peakLr.toExponential(1)} peak, approaching floor ` +
+        `${(peakLr * minLrRatio).toExponential(1)} at step ${plannedSteps.toLocaleString()}.`,
     };
   }
   return {
     key: 'learning',
     title: 'Learning',
     detail:
-      `${step.toLocaleString()} of ${plannedSteps.toLocaleString()} steps into this run, past ` +
-      `warm-up, rate ${lrNow.toExponential(1)} of a ${peakLr.toExponential(1)} peak` +
-      (plan.plateauScale < 1
-        ? ` (cut to ${plan.plateauScale.toFixed(2)}x the schedule after a plateau)`
-        : '') +
-      ', held-out loss still improving.',
+      `Step ${step.toLocaleString()} of ${plannedSteps.toLocaleString()}, rate ` +
+      `${lrNow.toExponential(1)} of ${peakLr.toExponential(1)} peak` +
+      (plan.plateauScale < 1 ? ` (cut to ${plan.plateauScale.toFixed(2)}x)` : '') +
+      '. Held-out loss improving.',
   };
 }
 
@@ -566,12 +567,8 @@ function planActions(plan, phase, { heldOut, trainingLoss, tokensSeen, tokensPer
       key: 'keep-training',
       urgency: 'high',
       text:
-        `This model has seen ${round(tokensSeen)} tokens — ${epochs.toFixed(2)} passes over ` +
-        'your text. That is early: a model this size needs tens of millions of tokens through ' +
-        `it before it writes sentences rather than words. Keep training to about ` +
-        `${round(target)} tokens seen` +
-        (eta ? ` — roughly ${eta} at the speed this machine is running` : '') +
-        '. Nothing about the corpus can be judged before then.',
+        `${round(tokensSeen)} tokens seen (${epochs.toFixed(2)} passes). Keep training to about ` +
+        `${round(target)} tokens seen${eta ? ` (~${eta})` : ''}. Corpus can't be judged before then.`,
     });
   }
 
@@ -590,15 +587,10 @@ function planActions(plan, phase, { heldOut, trainingLoss, tokensSeen, tokensPer
         key: 'run-too-long',
         urgency: 'normal',
         text:
-          `${plan.plannedSteps.toLocaleString()} steps at ${round(tokensPerStep)} tokens each is ` +
-          `${round(planned)} tokens — ${plannedEpochs.toFixed(1)} passes over your text` +
-          (hours ? `, about ${hours.toFixed(0)} hours at this speed` : '') +
-          `. Repeated text holds up to about ${USEFUL_EPOCHS} passes and gives back little ` +
-          `after, so roughly ${round(enough)} steps` +
-          (enoughHours ? ` (${enoughHours.toFixed(0)} hours)` : '') +
-          ' spends what this corpus is worth. The rest is time, not learning — and the ' +
-          'schedule decays over the length you set, so a shorter plan also means the rate ' +
-          'is actually falling while it matters.',
+          `${plan.plannedSteps.toLocaleString()} steps planned = ${round(planned)} tokens, ` +
+          `${plannedEpochs.toFixed(1)} passes${hours ? `, ~${hours.toFixed(0)}h` : ''}. About ` +
+          `${round(enough)} steps${enoughHours ? ` (~${enoughHours.toFixed(0)}h)` : ''} covers ` +
+          'what this corpus is worth — set Steps to that.',
       });
     }
   }
@@ -622,14 +614,10 @@ function planActions(plan, phase, { heldOut, trainingLoss, tokensSeen, tokensPer
       key: 'corpus-size',
       urgency: phase.key === 'overfitting' ? 'high' : 'normal',
       text:
-        `${round(trainingTokens)} training tokens, worth about ${round(budget)} over the ` +
-        `${USEFUL_EPOCHS} passes that repeated text is still useful for. A ${round(params)}-` +
-        'parameter model is compute-optimally matched to about ' +
-        `${round(wanted)} (Hoffmann et al., 20 tokens per parameter) — a rule for splitting a ` +
-        'compute budget, not a threshold for whether it works. Below it the model reaches its ' +
-        'best sooner and overfits after. Either roughly ' +
-        `${round(moreSources)} more sources the size of yours, or a model nearer ` +
-        `${round(supported)} parameters, which would be worse at its best but would get there.`,
+        `${round(trainingTokens)} training tokens, worth about ${round(budget)} over ` +
+        `${USEFUL_EPOCHS} passes. A ${round(params)}-parameter model wants about ` +
+        `${round(wanted)}. Add about ${round(moreSources)} more sources this size, or use a ` +
+        `model nearer ${round(supported)} parameters.`,
     });
   }
 
@@ -638,8 +626,7 @@ function planActions(plan, phase, { heldOut, trainingLoss, tokensSeen, tokensPer
       key: 'no-validation',
       urgency: 'high',
       text:
-        'There is not enough text to hold any of it out, so nothing here can tell learning ' +
-        'from memorizing. Add sources until the corpus is comfortably past ' +
+        'Not enough text held out to measure overfitting. Add sources past about ' +
         `${round((contextLen * 20) / 0.05)} tokens.`,
     });
   }
@@ -660,9 +647,8 @@ function planActions(plan, phase, { heldOut, trainingLoss, tokensSeen, tokensPer
           key: 'corpus-mix',
           urgency: 'normal',
           text:
-            `${Math.round(share * 100)}% of your corpus is ${largest.label}. A model trained on ` +
-            'one shape of writing learns that shape and not the language underneath it. ' +
-            `Adding ${missing.slice(0, 2).join(' or ')} would widen what it can write.`,
+            `${Math.round(share * 100)}% of your corpus is ${largest.label}. Add ` +
+            `${missing.slice(0, 2).join(' or ')} to widen it.`,
         });
       }
     }
@@ -672,11 +658,7 @@ function planActions(plan, phase, { heldOut, trainingLoss, tokensSeen, tokensPer
     actions.push({
       key: 'set-a-plan',
       urgency: 'normal',
-      text:
-        'The run is past the number of steps its schedule was shaped for, so the learning rate ' +
-        'is flat at its floor. Set Steps to the length you actually intend — a run that warms ' +
-        'up and then decays over its own length reaches a lower loss than one held at a ' +
-        'constant small rate.',
+      text: 'Past the planned steps; rate is flat at its floor. Set Steps to the length you intend.',
     });
   }
 
@@ -684,9 +666,7 @@ function planActions(plan, phase, { heldOut, trainingLoss, tokensSeen, tokensPer
     actions.push({
       key: 'stop-here',
       urgency: 'high',
-      text:
-        'Stop this run and go back to the best model, or add text and keep training. ' +
-        'Continuing without either only makes it worse.',
+      text: 'Stop and restore the best model, or add text and keep training.',
     });
   }
   if (phase.key === 'plateau') {
@@ -697,10 +677,8 @@ function planActions(plan, phase, { heldOut, trainingLoss, tokensSeen, tokensPer
       key: 'plateau-what-next',
       urgency: 'normal',
       text: gap > 0.3
-        ? 'Held-out sits well above training loss, which is the signature of too little text ' +
-          'for this model, not of too few steps.'
-        : 'Both curves have flattened together, which is the signature of a model too small ' +
-          'for the text. A larger hidden size or another layer would do more than more steps.',
+        ? 'Held-out sits well above training loss — add more text.'
+        : 'Both curves have flattened — a larger hidden size or another layer would help more than more steps.',
     });
   }
 
@@ -709,9 +687,8 @@ function planActions(plan, phase, { heldOut, trainingLoss, tokensSeen, tokensPer
       key: 'plateau-floor',
       urgency: 'high',
       text:
-        `The learning rate has been cut to ${plan.plateauScale.toFixed(2)}x the schedule and ` +
-        'held-out loss still is not improving. Cutting it further is not the answer: at this ' +
-        'point the limit is the corpus or the shape of the model, not the rate.',
+        `Rate cut to ${plan.plateauScale.toFixed(2)}x and held-out loss still flat. The limit ` +
+        'is the corpus or model shape, not the rate.',
     });
   }
 
@@ -724,13 +701,11 @@ function planActions(plan, phase, { heldOut, trainingLoss, tokensSeen, tokensPer
         key: 'not-words-yet',
         urgency: 'normal',
         text:
-          `Only ${Math.round(q.knownWordRate * 100)}% of the words in the last sample appear ` +
-          'anywhere in your corpus — the model is still assembling letters rather than ' +
-          'recalling words' +
+          `${Math.round(q.knownWordRate * 100)}% of the last sample's words appear in your ` +
+          'corpus' +
           (q.unknownExamples && q.unknownExamples.length
             ? ` (${q.unknownExamples.slice(0, 4).join(', ')})`
-            : '') +
-          '. Expected this early; it is the first thing that should improve.',
+            : '') + '.',
       });
     }
     if (q.repeated4gramRate > 0.25) {
@@ -738,10 +713,8 @@ function planActions(plan, phase, { heldOut, trainingLoss, tokensSeen, tokensPer
         key: 'repeating',
         urgency: 'normal',
         text:
-          `${Math.round(q.repeated4gramRate * 100)}% of the four-word runs in the last sample ` +
-          'had already appeared in it. The model is cycling rather than continuing. Raise the ' +
-          'repetition penalty or min-p in the sampling settings before concluding anything ' +
-          'about the training.',
+          `${Math.round(q.repeated4gramRate * 100)}% of four-word runs in the last sample ` +
+          'repeat. Raise repetition penalty or min-p in Inference settings.',
       });
     }
   }
@@ -753,9 +726,8 @@ function planActions(plan, phase, { heldOut, trainingLoss, tokensSeen, tokensPer
       key: 'epochs',
       urgency: epochs >= USEFUL_EPOCHS * 4 ? 'high' : 'normal',
       text:
-        `This model has been over your text ${epochs.toFixed(1)} times. Repeated passes hold up ` +
-        `to about ${USEFUL_EPOCHS} (Muennighoff et al., 2023) and give back less after; past ` +
-        'that, more text does more than more steps.',
+        `${epochs.toFixed(1)} passes over your text (useful passes: about ${USEFUL_EPOCHS}). ` +
+        'More text would help more than more steps.',
     });
   }
 
@@ -1013,16 +985,21 @@ function recordEvent(step, kind, text, extra = {}) {
   post('train-record', { runId, step, kind, text, at: Date.now(), ...extra });
 }
 
-async function train({ batchSize, learningRate, maxSteps, effort, sampleEvery, samplePrompt, sampleWords }) {
+async function train({
+  batchSize, learningRate, maxSteps, effort, sampleEvery, samplePrompt, sampleWords, sampling,
+  autosaveFrequencySteps,
+}) {
+  const autosaveEvery = autosaveFrequencySteps > 0 ? autosaveFrequencySteps : AUTOSAVE_EVERY_STEPS;
   stopRequested = false;
   training = true;
   runId = `run-${Date.now().toString(36)}`;
   if (learningRate > 0) llm.set_learning_rate(learningRate);
-  // The schedule has to know how long the run is, and where it starts:
-  // it is shaped around this run, anchored to the step the model is
-  // already at. Set it before anything reads a learning rate.
-  const plannedSteps = maxSteps > 0 ? maxSteps : 2000;
-  llm.set_planned_steps(plannedSteps);
+  // Steps is the whole project's planned length, not just this sitting —
+  // set_project_plan is idempotent and a no-op at 0, so leaving Steps at
+  // 0 (train until Stop) neither resets an existing plan nor blocks one:
+  // a model that has never had a plan set falls back to TrainConfig's own
+  // default (10,000) until Steps is actually typed in.
+  llm.set_project_plan(maxSteps);
 
   const info = llm.info();
   if (batchSize <= 1) {
@@ -1071,7 +1048,7 @@ async function train({ batchSize, learningRate, maxSteps, effort, sampleEvery, s
   let nextValidateAt = llm.step() + validateEvery;
   // Counted from where this run starts, so a model at step 4,441 does
   // not save on its very first progress report.
-  let nextAutosaveAt = llm.step() + AUTOSAVE_EVERY_STEPS;
+  let nextAutosaveAt = llm.step() + autosaveEvery;
   let validationLoss = null;
   // Held-out losses in order, so the run can say when more text would
   // help more than more steps.
@@ -1274,9 +1251,8 @@ async function train({ batchSize, learningRate, maxSteps, effort, sampleEvery, s
                 post('train-advice', {
                   step: llm.step(),
                   advice:
-                    `held-out loss has not improved in ${PLATEAU_PATIENCE} measurements, so the ` +
-                    `learning rate has been cut to ${after.toFixed(2)}x the schedule. If it ` +
-                    'does not start improving again, the corpus is the limit, not the rate.',
+                    `Held-out loss flat for ${PLATEAU_PATIENCE} measurements. Rate cut to ` +
+                    `${after.toFixed(2)}x the schedule.`,
                 });
                 recordEvent(llm.step(), 'rate-cut',
                   `learning rate cut to ${after.toFixed(2)}x the schedule after ` +
@@ -1364,7 +1340,7 @@ async function train({ batchSize, learningRate, maxSteps, effort, sampleEvery, s
     // last produced, which looks exactly like a model that stopped
     // getting better.
     if (llm.step() >= nextAutosaveAt) {
-      nextAutosaveAt = llm.step() + AUTOSAVE_EVERY_STEPS;
+      nextAutosaveAt = llm.step() + autosaveEvery;
       const savedAt = performance.now();
       try {
         const bytes = await llm.export_checkpoint();
@@ -1389,17 +1365,14 @@ async function train({ batchSize, learningRate, maxSteps, effort, sampleEvery, s
       nextSampleAt = llm.step() + sampleEvery;
       const sampleStart = performance.now();
       try {
-        const text = await trainingSample(samplePrompt, sampleWords || 40);
+        const text = await trainingSample(samplePrompt, sampleWords || 40, sampling);
         // What the loss curve cannot say: is this English, and is it
         // still saying anything new. Measured against the user's own
         // corpus, so no word list has to ship with the page.
         const quality = JSON.parse(llm.evaluate(text, validationLoss === null ? -1 : validationLoss));
         lastQuality = quality;
-        post('train-sample', { step: llm.step(), loss: smoothedLoss, text, quality });
-        // Kept, not just shown. A sample is the most legible record of
-        // what a model could do at a moment, and the current card
-        // overwrites the last one by design — so the history is the only
-        // place the earlier ones survive.
+        // The Samples panel (backed by history) is the only place a
+        // sample is shown — every one kept, not just the latest.
         post('train-record', {
           runId, kind: 'sample', at: Date.now(), step: llm.step(),
           text, quality, loss: smoothedLoss, prompt: samplePrompt,
@@ -1417,11 +1390,6 @@ async function train({ batchSize, learningRate, maxSteps, effort, sampleEvery, s
         log(`sample generated in ${(performance.now() - sampleStart).toFixed(0)} ms`);
       } catch (error) {
         log(`sample failed: ${(error && error.message) || error}`);
-        post('train-sample', {
-          step: llm.step(),
-          loss: smoothedLoss,
-          text: `(sample failed: ${(error && error.message) || error})`,
-        });
       }
     }
 
@@ -1488,18 +1456,12 @@ function corpusAdvice(heldOut, trainingLoss, tokensSeen) {
   const noise = Math.max(spread(heldOut.slice(-WINDOW * 2)), 0.002);
 
   if (improvement < -noise) {
-    return (
-      'held-out loss is rising while training loss falls - the model has started memorizing your ' +
-      'text rather than learning from it. Add more source material, or stop here and keep the ' +
-      'model as it is.'
-    );
+    return 'Held-out loss rising while training loss falls. Add more text, or stop here.';
   }
   if (improvement < noise) {
     return gap > 0.3
-      ? 'held-out loss has flattened and sits well above training loss - this corpus has taught ' +
-        'what it can. More text will help more than more steps.'
-      : 'held-out loss has flattened. More text, a bigger model or a higher learning rate would ' +
-        'each do more than more steps at this setting.';
+      ? 'Held-out loss flat, well above training loss. More text would help more than more steps.'
+      : 'Held-out loss flat. More text, a bigger model, or a higher learning rate would help more than more steps.';
   }
   return null;
 }
@@ -1511,9 +1473,8 @@ function describeTrainingFailure(error) {
   const message = (error && error.message) || String(error);
   if (/device.*(lost|hung|removed|reset)|DXGI_ERROR|GPUDevice/i.test(message)) {
     return (
-      `the GPU device was reset mid-step (${message}). That is the driver's watchdog: ` +
-      'the work it was given took too long. Lower the batch size or the context length ' +
-      'and reload the page.'
+      `the GPU device was reset mid-step (${message}). Lower the batch size or the context ` +
+      'length and reload the page.'
     );
   }
   return message;
@@ -1587,6 +1548,22 @@ const handlers = {
     return { ids: llm.duplicate_sources() };
   },
 
+  /// Per-source token counts and how many training windows have actually
+  /// been drawn from each — for the Overview tab's corpus breakdown.
+  /// Read-only, no GPU touch.
+  async 'corpus-source-stats'() {
+    return { sources: JSON.parse(llm.corpus_source_stats()) };
+  },
+
+  /// Restore a source's sample count after a fresh page load re-upserts
+  /// it into a new corpus — the count is persisted per-source in
+  /// SOURCES_STORE and handed back in here, once per source, right after
+  /// `upsert-source` on the same source.
+  async 'set-source-sample-count'({ id, count }) {
+    llm.set_source_sample_count(id, count || 0);
+    return {};
+  },
+
   async 'upsert-source'(payload) {
     // More text is a different problem from the one the last plateau
     // was found on: whatever cut the rate then does not apply now.
@@ -1610,28 +1587,8 @@ const handlers = {
     return describeModel();
   },
 
-  async 'story-state'() {
-    return {
-      characters: llm.story_characters() || [],
-      locations: llm.story_locations() || [],
-      sceneCount: llm.story_scene_count() || 0,
-      preamble: llm.story_state_preamble() || '',
-    };
-  },
-
-  async 'retrieve'({ query, k }) {
-    return { chunks: llm.retrieve_context(text(query, 'the query'), k || 3) };
-  },
-
   async generate(payload) {
-    let extraContext = payload.extraContext || '';
-    if (payload.useStoryState) {
-      extraContext = [extraContext, llm.story_state_preamble()].filter(Boolean).join(' ');
-    }
-    if (payload.useRetrieval) {
-      const retrieved = llm.retrieve_context_text(payload.prompt, 2);
-      if (retrieved) extraContext = [extraContext, retrieved].filter(Boolean).join(' ');
-    }
+    const extraContext = payload.extraContext || '';
     const result = await generate({
       ...payload,
       prompt: text(payload.prompt, 'the prompt'),
@@ -1747,6 +1704,15 @@ const handlers = {
     return { dispatchesPerSubmit: applied };
   },
 
+  /// Which device the next Generate call prefers. Takes effect
+  /// immediately — the very next call to `generate`, nothing queued or
+  /// deferred.
+  async 'set-inference-device'({ device }) {
+    inferenceDevice = device === 'cpu' ? 'cpu' : 'gpu';
+    log(`inference device set to ${inferenceDevice}`);
+    return { device: inferenceDevice };
+  },
+
   async train(payload) {
     // One run at a time, checked here rather than only on the page.
     //
@@ -1845,7 +1811,7 @@ self.onmessage = async (event) => {
     return;
   }
   // Everything except `stop` needs a model; saying so beats a wasm panic.
-  if (!llm && !['load-model', 'create-model', 'import-checkpoint', 'parse-prompt', 'describe-shape', 'stop'].includes(type)) {
+  if (!llm && !['load-model', 'create-model', 'import-checkpoint', 'parse-prompt', 'describe-shape', 'set-inference-device', 'stop'].includes(type)) {
     fail(
       rid,
       new Error(

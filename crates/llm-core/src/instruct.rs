@@ -486,12 +486,10 @@ fn chunk_by_paragraph(text: &str, words_per_chunk: usize) -> Vec<String> {
     chunks
 }
 
-/// Which form a piece of *existing* text is, from its shape: scene
-/// headings and character cues mean screenplay. Uses the same heuristics
-/// the Sources panel already uses to list characters and locations.
+/// Which form a piece of *existing* text is, from its shape: any scene
+/// heading (`INT.`/`EXT.`/...) means screenplay.
 fn detect_form_from_text(text: &str) -> Form {
-    let state = screenplay::extract_story_state(text);
-    if state.scene_count > 0 || !state.characters.is_empty() {
+    if text.lines().any(screenplay::is_scene_heading) {
         Form::Screenplay
     } else {
         Form::Novel

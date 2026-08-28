@@ -1,0 +1,49 @@
+name: Build the native GPU smoke test (Windows)
+
+# crates/llm-gpu has, until now, only ever been compiled for wasm32 and run
+# through a browser's WebGPU implementation (see deploy.yml, and this
+# crate's own top-level doc comment). This workflow builds the same crate's
+# gpu_smoke_test example natively for Windows, on GitHub's hosted runner —
+# the one machine in this whole setup with both a real Rust toolchain and a
+# route to crates.io, since the development sandbox has neither.
+#
+# IMPORTANT: GitHub's hosted Windows runners have no real GPU. This job only
+# proves the native (Vulkan/DX12) code path *compiles* — it deliberately
+# does not run the binary. Running it, and finding out whether a real
+# adapter turns up, happens wherever the downloaded .exe is actually run:
+# on your own machine, against your own GPU.
+
+on:
+  push:
+  workflow_dispatch:
+
+concurrency:
+  group: native-probe
+  cancel-in-progress: true
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        # No explicit target: the runner's host default (x86_64-pc-windows-msvc)
+        # is exactly what's wanted here.
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates/llm-gpu
+
+      - name: Build the smoke test
+        run: cargo build --release --manifest-path crates/llm-gpu/Cargo.toml --example gpu_smoke_test
+
+      - name: Upload the binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: gpu_smoke_test-windows
+          path: crates/llm-gpu/target/release/examples/gpu_smoke_test.exe
+          if-no-files-found: error

@@ -122,8 +122,16 @@ function newId() {
 }
 
 // --- Sources -----------------------------------------------------------
-// A source: { id, title, kind: 'url'|'file'|'paste', rawText, sourceUrl,
-//             tags, createdAt, updatedAt }
+// A source: { id, title, kind: 'file'|'paste', rawText, sourceUrl, tags,
+//             createdAt, updatedAt, timesSampled }
+//
+// `timesSampled` is periodically pulled from the wasm corpus and written
+// back (see `updateSourceStats`); absent on a source added before it
+// existed, which callers treat the same as 0.
+//
+// `kind: 'url'` no longer gets created (URL fetch was removed), but a
+// record written by an older version can still carry it, and `sourceUrl`
+// stays in the shape so those records still load.
 //
 // Genre/tone tagging is gone: the model takes a real instruction (form,
 // length, subject, what to echo) parsed from the prompt itself, which is
@@ -167,6 +175,31 @@ export async function listSources() {
 
 export async function getSource(id) {
   return withStore(SOURCES_STORE, 'readonly', (store) => store.get(id));
+}
+
+/// Replace every stored source with `list`, id and all — a project
+/// import's job, not an edit to any one source. One request per record
+/// (see the module header on why `withStore` only ever issues one).
+export async function replaceAllSources(list) {
+  const existing = await listSources();
+  for (const record of existing) {
+    await withStore(SOURCES_STORE, 'readwrite', (store) => store.delete(record.id));
+  }
+  for (const record of list) {
+    await withStore(SOURCES_STORE, 'readwrite', (store) => store.put(record));
+  }
+}
+
+/// How many training windows have been drawn from this source, as of the
+/// last time it was pulled from the wasm corpus and written back —
+/// doesn't touch `updatedAt`, since this isn't an edit to the source
+/// itself. Missing on a source added before this field existed; callers
+/// treat that the same as 0.
+export async function updateSourceStats(id, { timesSampled }) {
+  const existing = await getSource(id);
+  if (!existing) return;
+  await withStore(SOURCES_STORE, 'readwrite', (store) =>
+    store.put({ ...existing, timesSampled }));
 }
 
 // --- The trained model -------------------------------------------------
@@ -216,6 +249,33 @@ export async function getBestModel() {
   return withStore(MODELS_STORE, 'readonly', (store) => store.get(BEST_MODEL));
 }
 
+/// Auto-save's "Add" mode: a rolling set of recent snapshots instead of
+/// the single current-model slot "Overwrite" uses.
+///
+/// A fixed, small number of ids (`autosave-0`..`autosave-2`), chosen by
+/// step number modulo that count. Deterministic and needs no rotation
+/// state of its own — the oldest of the three is always the one the next
+/// save's step number lands on again.
+const AUTOSAVE_SNAPSHOT_COUNT = 3;
+
+export async function putAutosaveSnapshot({ bytes, step, params, optimizer = null }) {
+  const id = `autosave-${step % AUTOSAVE_SNAPSHOT_COUNT}`;
+  const record = { id, bytes, step, params, optimizer, savedAt: Date.now() };
+  await withStore(MODELS_STORE, 'readwrite', (store) => store.put(record));
+  return record;
+}
+
+/// Every stored snapshot, oldest first.
+export async function listAutosaveSnapshots() {
+  const ids = Array.from({ length: AUTOSAVE_SNAPSHOT_COUNT }, (_, i) => `autosave-${i}`);
+  const found = [];
+  for (const id of ids) {
+    const record = await withStore(MODELS_STORE, 'readonly', (store) => store.get(id));
+    if (record) found.push(record);
+  }
+  return found.sort((a, b) => a.step - b.step);
+}
+
 // --- The machine profile -----------------------------------------------
 //
 // One record per adapter the browser has handed this page. Keyed by the
@@ -240,6 +300,72 @@ export async function getMachineProfile(device) {
 
 export async function deleteMachineProfile(device) {
   await withStore(SETTINGS_STORE, 'readwrite', (store) => store.delete(machineKey(device)));
+}
+
+// --- App settings --------------------------------------------------------
+//
+// Three fixed-id records in the same store the machine profile lives in.
+// Fixed id, not per-adapter, because these are the user's own choices
+// (whether to auto-save, which device to prefer) rather than something
+// measured about the hardware.
+
+const AUTOSAVE_CONFIG = 'autosave-config';
+const DEVICE_PREFERENCE = 'device-preference';
+const BENCHMARK_CONFIG = 'benchmark-config';
+const TRAINING_PLAN_SETTINGS = 'training-plan-settings';
+
+/// { enabled, frequencySteps, mode: 'overwrite'|'add' }
+export async function putAutosaveConfig(config) {
+  const record = { ...config, id: AUTOSAVE_CONFIG, savedAt: Date.now() };
+  await withStore(SETTINGS_STORE, 'readwrite', (store) => store.put(record));
+  return record;
+}
+
+export async function getAutosaveConfig() {
+  return withStore(SETTINGS_STORE, 'readonly', (store) => store.get(AUTOSAVE_CONFIG));
+}
+
+/// { trainingDevice: 'gpu', inferenceDevice: 'gpu'|'cpu' }. trainingDevice
+/// is always 'gpu' today (there is no CPU training path) but is stored
+/// as its own key, not hardcoded into the shape, so a future
+/// training-backend selector can use it without a rename.
+export async function putDevicePreference(preference) {
+  const record = { ...preference, id: DEVICE_PREFERENCE, savedAt: Date.now() };
+  await withStore(SETTINGS_STORE, 'readwrite', (store) => store.put(record));
+  return record;
+}
+
+export async function getDevicePreference() {
+  return withStore(SETTINGS_STORE, 'readonly', (store) => store.get(DEVICE_PREFERENCE));
+}
+
+/// { autoEnabled }
+export async function putBenchmarkConfig(config) {
+  const record = { ...config, id: BENCHMARK_CONFIG, savedAt: Date.now() };
+  await withStore(SETTINGS_STORE, 'readwrite', (store) => store.put(record));
+  return record;
+}
+
+export async function getBenchmarkConfig() {
+  return withStore(SETTINGS_STORE, 'readonly', (store) => store.get(BENCHMARK_CONFIG));
+}
+
+/// { mode: 'auto'|'manual', plannedSteps, effort, sampleEvery, samplePrompt,
+///   sampleWords }
+///
+/// The Training tab's own settings, previously DOM-only: they reset to
+/// the markup's hardcoded defaults on every reload, which is the gap
+/// meant here — in particular `plannedSteps`, which since the schedule
+/// rework is the project's planned length, not a per-run number, and is
+/// worth even less lost on a reload than the others.
+export async function putTrainingPlanSettings(settings) {
+  const record = { ...settings, id: TRAINING_PLAN_SETTINGS, savedAt: Date.now() };
+  await withStore(SETTINGS_STORE, 'readwrite', (store) => store.put(record));
+  return record;
+}
+
+export async function getTrainingPlanSettings() {
+  return withStore(SETTINGS_STORE, 'readonly', (store) => store.get(TRAINING_PLAN_SETTINGS));
 }
 
 // --- Run history -------------------------------------------------------
@@ -283,4 +409,14 @@ export async function listRunHistory(runId) {
 
 export async function clearHistory() {
   await withStore(HISTORY_STORE, 'readwrite', (store) => store.clear());
+}
+
+/// Replace the whole run history with `rows` — a project import's job.
+/// Rows keep the ids they were exported with, so ordering (run id, then
+/// zero-padded step) survives the round trip untouched.
+export async function replaceAllHistory(rows) {
+  await clearHistory();
+  for (const row of rows) {
+    await withStore(HISTORY_STORE, 'readwrite', (store) => store.put(row));
+  }
 }
