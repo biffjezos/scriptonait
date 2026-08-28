@@ -39,7 +39,19 @@
 
       <div id="model-details" class="model-details"></div>
       <div class="row">
+        <button id="new-project-btn" type="button" class="secondary">New Project</button>
         <button id="export-btn" type="button" class="secondary">Save</button>
+        <label class="file-btn">
+          Load Model
+          <input type="file" id="import-input" accept=".ckpt,.bin" hidden />
+        </label>
+      </div>
+      <div class="row">
+        <button id="export-project-btn" type="button" class="secondary">Export Project</button>
+        <label class="file-btn">
+          Import Project…
+          <input type="file" id="import-project-input" accept=".snp" hidden />
+        </label>
       </div>
 
       <p id="overview-plan" class="stats" hidden></p>
@@ -91,10 +103,6 @@
       <div class="row">
         <button id="train-btn" type="button" disabled>Train</button>
         <button id="train-stop-btn" type="button" class="secondary" hidden>Stop</button>
-        <label class="file-btn">
-          Load Model
-          <input type="file" id="import-input" accept=".ckpt,.bin" hidden />
-        </label>
       </div>
 
       <div class="row">
@@ -173,49 +181,6 @@
           <button id="reset-schedule-btn" type="button" class="secondary">Undo Plateau Cut</button>
         </div>
       </details>
-
-      <details class="advanced" id="training-settings-panel">
-        <summary>Training Settings</summary>
-
-        <label>Mode
-          <select id="train-mode">
-            <option value="auto" selected>Auto</option>
-            <option value="manual">Manual</option>
-          </select>
-        </label>
-
-        <div class="settings-grid">
-          <label>Effort
-            <select id="train-effort">
-              <option value="auto" selected>Auto — full speed, steps kept interruptible</option>
-              <option value="0.25">Gentle — leaves the machine usable</option>
-              <option value="0.5">Balanced</option>
-              <option value="1">Full speed — will make things sluggish</option>
-            </select>
-          </label>
-          <label>Planned steps
-            <input type="number" id="train-steps" value="0" min="0" max="1000000" />
-          </label>
-          <label>Batch size
-            <input type="number" id="train-batch" value="0" min="0" max="256" />
-          </label>
-          <label>Learning rate
-            <input type="number" id="train-lr" value="0" min="0" max="0.01" step="0.00001" />
-          </label>
-        </div>
-        <p class="hint" id="batch-hint"></p>
-
-        <p class="hint" id="shape-hint">New model shape:</p>
-        <p class="hint shape-estimate" id="shape-estimate"></p>
-        <div class="settings-grid">
-          <label>Layers <input type="number" id="cfg-layers" value="4" min="1" max="12" /></label>
-          <label>Hidden size <input type="number" id="cfg-hidden" value="192" min="16" max="768" step="16" /></label>
-          <label>Heads <input type="number" id="cfg-heads" value="6" min="1" max="16" /></label>
-          <label>KV heads <input type="number" id="cfg-kv-heads" value="2" min="1" max="16" /></label>
-          <label>Context <input type="number" id="cfg-context" value="512" min="32" max="2048" step="32" /></label>
-          <label>Attention window <input type="number" id="cfg-window" value="256" min="32" max="2048" step="32" /></label>
-        </div>
-      </details>
     </section>
 
     <section class="tab-panel" id="tab-inference" hidden>
@@ -270,6 +235,49 @@
     <section class="tab-panel" id="tab-settings" hidden>
       <h2>Settings</h2>
 
+      <details class="advanced" id="training-settings-panel" open>
+        <summary>Training Settings</summary>
+
+        <label>Mode
+          <select id="train-mode">
+            <option value="auto" selected>Auto</option>
+            <option value="manual">Manual</option>
+          </select>
+        </label>
+
+        <div class="settings-grid">
+          <label>Effort
+            <select id="train-effort">
+              <option value="auto" selected>Auto — full speed, steps kept interruptible</option>
+              <option value="0.25">Gentle — leaves the machine usable</option>
+              <option value="0.5">Balanced</option>
+              <option value="1">Full speed — will make things sluggish</option>
+            </select>
+          </label>
+          <label>Planned steps
+            <input type="number" id="train-steps" value="0" min="0" max="1000000" />
+          </label>
+          <label>Batch size
+            <input type="number" id="train-batch" value="0" min="0" max="256" />
+          </label>
+          <label>Learning rate
+            <input type="number" id="train-lr" value="0" min="0" max="0.01" step="0.00001" />
+          </label>
+        </div>
+        <p class="hint" id="batch-hint"></p>
+
+        <p class="hint" id="shape-hint">New model shape:</p>
+        <p class="hint shape-estimate" id="shape-estimate"></p>
+        <div class="settings-grid">
+          <label>Layers <input type="number" id="cfg-layers" value="4" min="1" max="12" /></label>
+          <label>Hidden size <input type="number" id="cfg-hidden" value="192" min="16" max="768" step="16" /></label>
+          <label>Heads <input type="number" id="cfg-heads" value="6" min="1" max="16" /></label>
+          <label>KV heads <input type="number" id="cfg-kv-heads" value="2" min="1" max="16" /></label>
+          <label>Context <input type="number" id="cfg-context" value="512" min="32" max="2048" step="32" /></label>
+          <label>Attention window <input type="number" id="cfg-window" value="256" min="32" max="2048" step="32" /></label>
+        </div>
+      </details>
+
       <details class="advanced" open>
         <summary>Auto-save</summary>
         <div class="settings-grid">
@@ -323,17 +331,6 @@
           </select>
         </label>
         <p id="machine-profile-text" class="hint">Machine profile: not measured yet.</p>
-      </details>
-
-      <details class="advanced" open>
-        <summary>Project File</summary>
-        <div class="row">
-          <button id="export-project-btn" type="button" class="secondary">Export Project</button>
-          <label class="file-btn">
-            Import Project…
-            <input type="file" id="import-project-input" accept=".snp" hidden />
-          </label>
-        </div>
       </details>
     </section>
   </main>

@@ -28,6 +28,14 @@
   box-sizing: border-box;
 }
 
+html {
+  /* Reserves the scrollbar's width always, whether or not the page is
+     currently tall enough to need one — without this, switching to a
+     tab whose content is short enough to lose the scrollbar shifts
+     every element sideways by however wide the scrollbar is. */
+  scrollbar-gutter: stable;
+}
+
 body {
   margin: 0;
   font-family: var(--sans);
@@ -236,6 +244,14 @@ button.secondary,
   border: 1px solid var(--accent);
   color: var(--accent);
   cursor: pointer;
+}
+
+/* `.input-group label` (one class + one element = higher specificity than
+   `.file-btn` alone) was overriding this to `display: block`, stretching
+   the Add Files button to the full width of its container. Two classes
+   beats one class + one element regardless of source order. */
+.input-group .file-btn {
+  display: inline-block;
 }
 
 .hint {

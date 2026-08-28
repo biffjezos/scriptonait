@@ -232,6 +232,15 @@ export async function deleteModel() {
   await withStore(MODELS_STORE, 'readwrite', (store) => store.delete(CURRENT_MODEL));
 }
 
+/// Every stored model record — current, best, and every auto-save
+/// snapshot. A New Project's job: leaving any of these behind means the
+/// next project's Overview offers to "Restore" a best model, or an
+/// auto-save mode picks up rotating snapshots, from a project that's
+/// gone.
+export async function clearModels() {
+  await withStore(MODELS_STORE, 'readwrite', (store) => store.clear());
+}
+
 export async function putBestModel({ bytes, step, params, validationLoss }) {
   const record = {
     id: BEST_MODEL,

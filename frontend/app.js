@@ -1865,7 +1865,12 @@ function applyTrainMode() {
   updateGuidance();
 }
 $('train-mode').addEventListener('change', applyTrainMode);
-applyTrainMode();
+// Not called eagerly here: it reaches into updateGuidance() ->
+// renderMachineProfile(), which reads module state (benchmarkAutoEnabled)
+// declared later in this file. Calling it at this point in top-level
+// module evaluation throws "Cannot access before initialization" on
+// every page load. start() calls it once, unconditionally, after every
+// module-level `let` above has run — see applyLoadedSettings().
 
 /// Everything on this tab that used to reset to the markup's hardcoded
 /// defaults on every reload. Written through on change, loaded back at
@@ -2142,6 +2147,31 @@ function drawLossChart() {
 
 // --- Saving and loading models ----------------------------------------
 
+/// Clears the model, corpus and history — everything Import Project
+/// replaces, just replaced with nothing instead of an imported project.
+/// Settings (auto-save, device, benchmark, training-plan) are left as
+/// they are: those are how you like the page to behave, not part of any
+/// one project.
+///
+/// Reloads the page rather than trying to reset the worker's in-memory
+/// model and corpus from here: there's no "unload" call today, and a
+/// fresh page load already does exactly this — starts with nothing,
+/// waits — for free.
+$('new-project-btn').addEventListener('click', async () => {
+  if (!confirm('Start a new project? This clears the current model, corpus and history.')) {
+    return;
+  }
+  try {
+    await db.replaceAllSources([]);
+    await db.replaceAllHistory([]);
+    await db.clearModels();
+  } catch (error) {
+    showError(error);
+    return;
+  }
+  window.location.reload();
+});
+
 $('export-btn').addEventListener('click', async () => {
   const { bytes } = await call('export-checkpoint');
   const blob = new Blob([bytes], { type: 'application/octet-stream' });
@@ -2226,7 +2256,15 @@ $('import-project-input').addEventListener('change', async (event) => {
         await call('import-optimizer', { bytes: optimizerBytes }, [optimizerBytes]).catch(() => {});
       }
     } else {
+      // No checkpoint in this project file: the old model belongs to
+      // the project just replaced, not this one — leaving it in
+      // IndexedDB would offer to "Restore" a best model, or resume an
+      // auto-save mode's rotating snapshots, from a project that's gone.
+      await db.clearModels();
+      model = null;
       setModelStatus('absent', 'No model yet.');
+      $('model-details').replaceChildren();
+      $('best-model').hidden = true;
     }
 
     // A full replace, not a merge: refreshSources only ever adds sources
@@ -2595,11 +2633,13 @@ async function applyLoadedSettings() {
       $('sample-toggle').checked = !!planSettings.sampleToggle;
       if (planSettings.sampleEvery > 0) $('sample-every').value = String(planSettings.sampleEvery);
       if (planSettings.samplePrompt) $('sample-prompt').value = planSettings.samplePrompt;
-      applyTrainMode();
     }
   } catch (error) {
     console.warn('[scriptonait] could not read training-plan settings', error);
   }
+  // Unconditional: the Batch/Effort/Learning-rate disabled state has to
+  // be set correctly on every load, not only when saved settings exist.
+  applyTrainMode();
 }
 
 (async function start() {
