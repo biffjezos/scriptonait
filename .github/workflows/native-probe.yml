@@ -14,7 +14,12 @@ name: Build the native GPU smoke test (Windows)
 # on your own machine, against your own GPU.
 
 on:
+  # Scoped to native-backend, where this crate's non-wasm work actually
+  # happens — a push to dev or any other branch doesn't touch llm-gpu's
+  # native path and has no reason to wait on a Windows build of it.
   push:
+    branches:
+      - native-backend
   workflow_dispatch:
 
 concurrency:
