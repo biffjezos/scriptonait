@@ -1376,6 +1376,36 @@ function historyCell(row, [, read, render]) {
 const measurements = () => history.filter((r) => r.kind === 'measurement');
 const samples = () => history.filter((r) => r.kind === 'sample');
 
+/// Rebuild the chart's three curves from persisted history, so a
+/// reload (or a project import) shows the run's actual shape instead of
+/// a blank chart that only starts filling in once training resumes —
+/// the numbers to draw it were sitting in storage the whole time, just
+/// never read back into the arrays drawLossChart reads from.
+///
+/// Measurements come far sparser than the live per-tick training curve
+/// did (once every `metricsEvery` steps, not every progress tick), so
+/// the restored curve is coarser than what live training draws — but
+/// it is the run's real shape, not a guess at one.
+function rebuildChartFromHistory() {
+  lossHistory.length = 0;
+  validationHistory.length = 0;
+  probeHistory.length = 0;
+  const rows = measurements()
+    .filter((r) => typeof r.loss === 'number')
+    .sort((a, b) => a.step - b.step);
+  for (const row of rows) {
+    lossHistory.push(row.loss);
+    if (typeof row.heldOut === 'number') {
+      validationHistory.push({ at: lossHistory.length - 1, loss: row.heldOut });
+    }
+    if (typeof row.probe === 'number' && row.probe >= 0) {
+      probeHistory.push({ at: lossHistory.length - 1, loss: row.probe });
+    }
+  }
+  if (lossHistory.length > 0) $('loss-chart').hidden = false;
+  drawLossChart();
+}
+
 function renderHistory() {
   const table = $('history-table');
   if (!table) return;
@@ -1870,13 +1900,12 @@ async function persistTrainingPlanSettings() {
     effort: $('train-effort').value,
     sampleToggle: $('sample-toggle').checked,
     sampleEvery: Number($('sample-every').value) || 0,
-    samplePrompt: $('sample-prompt').value,
     boundarySampleRate: Number($('opening-rate').value) / 100,
     metricsEvery: Number($('metrics-every').value) || 0,
   });
 }
 for (const id of [
-  'train-mode', 'train-steps', 'train-effort', 'sample-toggle', 'sample-every', 'sample-prompt',
+  'train-mode', 'train-steps', 'train-effort', 'sample-toggle', 'sample-every',
   'opening-rate', 'metrics-every',
 ]) {
   $(id).addEventListener('change', persistTrainingPlanSettings);
@@ -1936,9 +1965,6 @@ $('train-btn').addEventListener('click', async () => {
   training = true;
   lastPhaseKey = null;
   $('live-controls').hidden = false;
-  lossHistory.length = 0;
-  validationHistory.length = 0;
-  probeHistory.length = 0;
   $('train-btn').disabled = true;
   $('train-stop-btn').hidden = false;
   $('train-stop-btn').disabled = false;
@@ -2014,11 +2040,11 @@ $('train-btn').addEventListener('click', async () => {
       effort: chosenEffort(),
       // 0 turns sampling off; anything else is a step interval.
       sampleEvery: $('sample-toggle').checked ? Number($('sample-every').value) : 0,
-      samplePrompt: $('sample-prompt').value.trim() || 'Write a 40 word scene.',
-      sampleWords: 40,
       // Training samples are generated with the Inference tab's own
-      // settings, not a second hidden set — the same fields Generate
-      // reads.
+      // prompt, length and sampling settings, not a second hidden set —
+      // the same fields Generate reads.
+      samplePrompt: $('prompt-input').value.trim() || 'Write a 40 word scene.',
+      sampleMaxTokens: $('opt-length-mode').value === 'limit' ? Number($('opt-max-tokens').value) : 0,
       sampling: {
         temperature: Number($('opt-temperature').value),
         topK: Number($('opt-top-k').value),
@@ -2318,6 +2344,7 @@ $('import-project-input').addEventListener('change', async (event) => {
     await syncAllSources();
     history.push(...(await db.listHistory()));
     renderHistory();
+    rebuildChartFromHistory();
     await applyLoadedSettings();
     updateGuidance();
     notice(`Imported ${file.name}.`, 'success');
@@ -2432,10 +2459,27 @@ function autosaveSupported() {
 }
 
 /// Write the current model to the chosen file, replacing what is there.
-async function writeModelToFile(bytes) {
+/// The whole project — model, corpus, history, settings — not just the
+/// weights: a file that is the only copy left after a crash has to be
+/// enough on its own to get back to where things were, not just the
+/// trained parameters with everything else stranded in this browser's
+/// IndexedDB.
+async function writeProjectToFile(checkpointBytes, optimizerBytes) {
+  const blob = project.buildProjectFile({
+    checkpointBytes,
+    optimizerBytes,
+    sources,
+    history,
+    settings: {
+      autosaveConfig: await db.getAutosaveConfig(),
+      devicePreference: await db.getDevicePreference(),
+      benchmarkConfig: await db.getBenchmarkConfig(),
+      trainingPlan: await db.getTrainingPlanSettings(),
+    },
+  });
   const writable = await autosaveHandle.createWritable();
   try {
-    await writable.write(bytes);
+    await writable.write(blob);
   } finally {
     await writable.close();
   }
@@ -2518,7 +2562,7 @@ async function autosave(step, { force = false, bytes: given = null } = {}) {
     }
     let wroteFile = false;
     if (autosaveHandle) {
-      await writeModelToFile(bytes);
+      await writeProjectToFile(bytes, optimizer);
       wroteFile = true;
     }
     console.info(
@@ -2584,8 +2628,8 @@ $('autosave-file-btn').addEventListener('click', async () => {
   }
   try {
     autosaveHandle = await window.showSaveFilePicker({
-      suggestedName: 'scriptonait.ckpt',
-      types: [{ description: 'scriptonait checkpoint', accept: { 'application/octet-stream': ['.ckpt'] } }],
+      suggestedName: 'scriptonait.snp',
+      types: [{ description: 'scriptonait project', accept: { 'application/octet-stream': ['.snp'] } }],
     });
     $('autosave-status').textContent = `File: ${autosaveHandle.name}.`;
     // Write immediately, so the file exists and the permission is proven
@@ -2697,7 +2741,6 @@ async function applyLoadedSettings() {
       if (planSettings.effort) $('train-effort').value = planSettings.effort;
       $('sample-toggle').checked = !!planSettings.sampleToggle;
       if (planSettings.sampleEvery > 0) $('sample-every').value = String(planSettings.sampleEvery);
-      if (planSettings.samplePrompt) $('sample-prompt').value = planSettings.samplePrompt;
       if (typeof planSettings.boundarySampleRate === 'number') {
         $('opening-rate').value = String(Math.round(planSettings.boundarySampleRate * 100));
       }
@@ -2743,6 +2786,7 @@ async function applyLoadedSettings() {
   try {
     history.push(...(await db.listHistory()));
     renderHistory();
+    rebuildChartFromHistory();
   } catch (error) {
     console.warn('[scriptonait] could not read the run history', error);
   }

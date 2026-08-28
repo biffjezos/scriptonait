@@ -1,8 +1,9 @@
 // A whole-project file: model + corpus + history + settings in one
-// downloadable .snp, alongside — not instead of — the single-file .ckpt
-// export/import and the Settings-tab auto-save-to-file feature. Those
-// stay exactly as they are; this is the "move to another machine, or
-// take one explicit full backup" path neither of them covers.
+// downloadable .snp. Both the explicit "Export Project" button and the
+// Settings-tab auto-save-to-file feature write this same format, so a
+// file left behind by either one is enough on its own to get back to
+// where things were — not just the trained weights, stranded without
+// the corpus and settings that were only ever in this browser.
 //
 // Custom container, no zip dependency — the same hand-rolled framing
 // checkpoint.rs already uses, for the same reason: no build step, no new

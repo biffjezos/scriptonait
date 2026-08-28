@@ -340,8 +340,8 @@ export async function getBenchmarkConfig() {
   return withStore(SETTINGS_STORE, 'readonly', (store) => store.get(BENCHMARK_CONFIG));
 }
 
-/// { mode: 'auto'|'manual', plannedSteps, effort, sampleEvery, samplePrompt,
-///   sampleWords, boundarySampleRate, metricsEvery }
+/// { mode: 'auto'|'manual', plannedSteps, effort, sampleEvery,
+///   boundarySampleRate, metricsEvery }
 ///
 /// The Training tab's own settings, previously DOM-only: they reset to
 /// the markup's hardcoded defaults on every reload, which is the gap

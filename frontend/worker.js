@@ -369,10 +369,10 @@ async function generate({ prompt, extraContext, temperature, topK, topP, minP, r
 /// `generate` pulls the freshly trained weights off the GPU first, so a
 /// sample shows the model as it is at this step rather than as it was
 /// when training started.
-/// `sampling` is the Inference tab's own settings
-/// ({temperature,topK,topP,minP,repetitionPenalty}) — the same values
+/// `sampling` is the Inference tab's own settings — the same values
 /// Generate uses, not a second hidden set tucked away in here.
-async function trainingSample(prompt, words, sampling) {
+/// `maxTokens` is that tab's own length setting too (0 = Continuous).
+async function trainingSample(prompt, maxTokens, sampling) {
   const s = sampling || { temperature: 0.9, topK: 40, topP: 0.95, minP: 0.05, repetitionPenalty: 1.1 };
   const result = await llm.generate(
     prompt,
@@ -383,14 +383,13 @@ async function trainingSample(prompt, words, sampling) {
     s.minP,
     s.repetitionPenalty,
     Math.floor(Math.random() * 1e9),
-    // Always the GPU: this runs from inside the training loop itself, on
-    // the weights the run just produced, not concurrently with anything
-    // that would make CPU inference's race-free guarantee matter.
-    true,
-    // No override: the (_piece, produced) => produced < words callback
-    // below already stops the sample at the right length.
-    0,
-    (_piece, produced) => produced < words,
+    // The Inference tab's own device choice. GPU here runs on the same
+    // device training does, so it still serializes with it (see the
+    // caller); CPU is the race-free path and runs alongside training
+    // without pausing it.
+    inferenceDevice !== 'cpu',
+    maxTokens || 0,
+    () => true,
   );
   return result.text;
 }
@@ -997,7 +996,7 @@ function recordEvent(step, kind, text, extra = {}) {
 }
 
 async function train({
-  batchSize, learningRate, maxSteps, effort, sampleEvery, samplePrompt, sampleWords, sampling,
+  batchSize, learningRate, maxSteps, effort, sampleEvery, samplePrompt, sampleMaxTokens, sampling,
   autosaveFrequencySteps, metricsEvery,
 }) {
   const autosaveEvery = autosaveFrequencySteps > 0 ? autosaveFrequencySteps : AUTOSAVE_EVERY_STEPS;
@@ -1121,6 +1120,37 @@ async function train({
         device: llm.device_summary(),
         dispatchesPerSubmit: llm.dispatches_per_submit(),
       });
+  }
+
+  /// One periodic training sample: generate, score it against the
+  /// corpus, record it. Closes over this run's own `runId`/`smoothedLoss`/
+  /// `validationLoss`/`lastQuality` rather than taking them as
+  /// parameters, since it only ever runs as part of this training run.
+  async function runTrainingSample(prompt, maxTokens, samplingSettings) {
+    const sampleStart = performance.now();
+    const text = await trainingSample(prompt, maxTokens, samplingSettings);
+    // What the loss curve cannot say: is this English, and is it still
+    // saying anything new. Measured against the user's own corpus, so
+    // no word list has to ship with the page.
+    const quality = JSON.parse(llm.evaluate(text, validationLoss === null ? -1 : validationLoss));
+    lastQuality = quality;
+    // The Samples panel (backed by history) is the only place a sample
+    // is shown — every one kept, not just the latest.
+    post('train-record', {
+      runId, kind: 'sample', at: Date.now(), step: llm.step(),
+      text, quality, loss: smoothedLoss, prompt,
+    });
+    log(
+      `sample at step ${llm.step().toLocaleString()}: ` +
+        `${(quality.knownWordRate * 100).toFixed(0)}% of its words are in your corpus, ` +
+        `${(quality.repeated4gramRate * 100).toFixed(0)}% of its four-word runs are repeats, ` +
+        `${(quality.distinctWordRate * 100).toFixed(0)}% of its words are distinct` +
+        (quality.unknownExamples.length > 0
+          ? ` — words it invented: ${quality.unknownExamples.slice(0, 5).join(', ')}`
+          : ''),
+      quality,
+    );
+    log(`sample generated in ${(performance.now() - sampleStart).toFixed(0)} ms`);
   }
 
   while (!stopRequested && (maxSteps <= 0 || steps < maxSteps)) {
@@ -1372,33 +1402,23 @@ async function train({
     // same thing across stop/resume.
     if (sampleEvery > 0 && llm.step() >= nextSampleAt) {
       nextSampleAt = llm.step() + sampleEvery;
-      const sampleStart = performance.now();
-      try {
-        const text = await trainingSample(samplePrompt, sampleWords || 40, sampling);
-        // What the loss curve cannot say: is this English, and is it
-        // still saying anything new. Measured against the user's own
-        // corpus, so no word list has to ship with the page.
-        const quality = JSON.parse(llm.evaluate(text, validationLoss === null ? -1 : validationLoss));
-        lastQuality = quality;
-        // The Samples panel (backed by history) is the only place a
-        // sample is shown — every one kept, not just the latest.
-        post('train-record', {
-          runId, kind: 'sample', at: Date.now(), step: llm.step(),
-          text, quality, loss: smoothedLoss, prompt: samplePrompt,
+      if (inferenceDevice === 'cpu') {
+        // Race-free by design (see WasmLLM::generate): runs alongside
+        // training instead of pausing it, so this is fired and not
+        // awaited — the training loop moves straight on to the next
+        // slice while it runs in the background.
+        runTrainingSample(samplePrompt, sampleMaxTokens, sampling).catch((error) => {
+          log(`sample failed: ${(error && error.message) || error}`);
         });
-        log(
-          `sample at step ${llm.step().toLocaleString()}: ` +
-            `${(quality.knownWordRate * 100).toFixed(0)}% of its words are in your corpus, ` +
-            `${(quality.repeated4gramRate * 100).toFixed(0)}% of its four-word runs are repeats, ` +
-            `${(quality.distinctWordRate * 100).toFixed(0)}% of its words are distinct` +
-            (quality.unknownExamples.length > 0
-              ? ` — words it invented: ${quality.unknownExamples.slice(0, 5).join(', ')}`
-              : ''),
-          quality,
-        );
-        log(`sample generated in ${(performance.now() - sampleStart).toFixed(0)} ms`);
-      } catch (error) {
-        log(`sample failed: ${(error && error.message) || error}`);
+      } else {
+        // GPU sampling runs on the same device training does, so it has
+        // to serialize with it — awaited here, between slices, never
+        // inside one.
+        try {
+          await runTrainingSample(samplePrompt, sampleMaxTokens, sampling);
+        } catch (error) {
+          log(`sample failed: ${(error && error.message) || error}`);
+        }
       }
     }
 
