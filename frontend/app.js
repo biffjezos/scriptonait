@@ -9,6 +9,7 @@
 // and — if you ask for it — a notification when it finishes.
 
 import * as db from './db.js';
+import * as project from './project.js';
 
 const worker = new Worker('./worker.js', { type: 'module' });
 
@@ -2168,6 +2169,87 @@ $('import-input').addEventListener('change', async (event) => {
   event.target.value = '';
 });
 
+$('export-project-btn').addEventListener('click', async () => {
+  clearError();
+  try {
+    const checkpointBytes = model ? (await call('export-checkpoint')).bytes : null;
+    const optimizerBytes = model
+      ? await call('export-optimizer').then((r) => r.bytes).catch(() => null)
+      : null;
+    const blob = project.buildProjectFile({
+      checkpointBytes,
+      optimizerBytes,
+      sources: await db.listSources(),
+      history: await db.listHistory(),
+      settings: {
+        autosaveConfig: await db.getAutosaveConfig(),
+        devicePreference: await db.getDevicePreference(),
+        benchmarkConfig: await db.getBenchmarkConfig(),
+        trainingPlan: await db.getTrainingPlanSettings(),
+      },
+    });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = 'scriptonait.snp';
+    link.click();
+    URL.revokeObjectURL(url);
+  } catch (error) {
+    showError(error);
+  }
+});
+
+$('import-project-input').addEventListener('change', async (event) => {
+  const file = event.target.files[0];
+  if (!file) return;
+  if (!confirm(`Import "${file.name}"? This replaces the current model, corpus, history and settings.`)) {
+    event.target.value = '';
+    return;
+  }
+  clearError();
+  setModelStatus('loading', `Loading ${file.name}…`);
+  try {
+    const buffer = await file.arrayBuffer();
+    const { header, checkpointBytes, optimizerBytes } = project.parseProjectFile(buffer);
+
+    await db.replaceAllSources(header.sources || []);
+    await db.replaceAllHistory(header.history || []);
+    const settings = header.settings || {};
+    if (settings.autosaveConfig) await db.putAutosaveConfig(settings.autosaveConfig);
+    if (settings.devicePreference) await db.putDevicePreference(settings.devicePreference);
+    if (settings.benchmarkConfig) await db.putBenchmarkConfig(settings.benchmarkConfig);
+    if (settings.trainingPlan) await db.putTrainingPlanSettings(settings.trainingPlan);
+
+    if (checkpointBytes) {
+      renderModel(await call('import-checkpoint', { bytes: checkpointBytes }, [checkpointBytes]));
+      if (optimizerBytes) {
+        await call('import-optimizer', { bytes: optimizerBytes }, [optimizerBytes]).catch(() => {});
+      }
+    } else {
+      setModelStatus('absent', 'No model yet.');
+    }
+
+    // A full replace, not a merge: refreshSources only ever adds sources
+    // it doesn't already know about, so the in-memory list has to be
+    // cleared first or a source dropped by the import would linger.
+    // syncAllSources hands each one to the model and restores its
+    // persisted sample count (syncSource does that per source already).
+    sources = [];
+    history.length = 0;
+    await refreshSources();
+    await syncAllSources();
+    history.push(...(await db.listHistory()));
+    renderHistory();
+    await applyLoadedSettings();
+    updateGuidance();
+    notice(`Imported ${file.name}.`, 'success');
+  } catch (error) {
+    showError(`that project file didn't load: ${(error && error.message) || error}`);
+    setModelStatus('absent', 'No model loaded.');
+  }
+  event.target.value = '';
+});
+
 
 // Profiling from the console: `scriptonait.profile()` runs one step per
 // command-buffer size and logs where the milliseconds go.
@@ -2465,11 +2547,13 @@ async function restoreModel() {
 
 // --- Start -------------------------------------------------------------
 
-(async function start() {
-  // Settings, before anything reads them: every field below writes
-  // through to db.js on change, so this is the one place that has to
-  // pull the stored value back and apply it to both the module state
-  // and the control showing it.
+/// Pull every Settings-tab and Training-tab record back from db.js and
+/// apply it to both the module state and the control showing it — every
+/// field involved writes through to db.js on change, so this is the one
+/// place that has to do the reverse. Called at startup, and again after
+/// a project import replaces what's stored (see the Import Project
+/// handler) so the two paths can't drift apart.
+async function applyLoadedSettings() {
   try {
     const autosaveConfig = await db.getAutosaveConfig();
     if (autosaveConfig) {
@@ -2516,6 +2600,11 @@ async function restoreModel() {
   } catch (error) {
     console.warn('[scriptonait] could not read training-plan settings', error);
   }
+}
+
+(async function start() {
+  // Settings, before anything reads them.
+  await applyLoadedSettings();
 
   // Guidance first, before anything that can be slow. Reading saved
   // sources waits on IndexedDB, and until it answers the page would

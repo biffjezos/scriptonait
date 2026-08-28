@@ -177,6 +177,19 @@ export async function getSource(id) {
   return withStore(SOURCES_STORE, 'readonly', (store) => store.get(id));
 }
 
+/// Replace every stored source with `list`, id and all — a project
+/// import's job, not an edit to any one source. One request per record
+/// (see the module header on why `withStore` only ever issues one).
+export async function replaceAllSources(list) {
+  const existing = await listSources();
+  for (const record of existing) {
+    await withStore(SOURCES_STORE, 'readwrite', (store) => store.delete(record.id));
+  }
+  for (const record of list) {
+    await withStore(SOURCES_STORE, 'readwrite', (store) => store.put(record));
+  }
+}
+
 /// How many training windows have been drawn from this source, as of the
 /// last time it was pulled from the wasm corpus and written back —
 /// doesn't touch `updatedAt`, since this isn't an edit to the source
@@ -396,4 +409,14 @@ export async function listRunHistory(runId) {
 
 export async function clearHistory() {
   await withStore(HISTORY_STORE, 'readwrite', (store) => store.clear());
+}
+
+/// Replace the whole run history with `rows` — a project import's job.
+/// Rows keep the ids they were exported with, so ordering (run id, then
+/// zero-padded step) survives the round trip untouched.
+export async function replaceAllHistory(rows) {
+  await clearHistory();
+  for (const row of rows) {
+    await withStore(HISTORY_STORE, 'readwrite', (store) => store.put(row));
+  }
 }
