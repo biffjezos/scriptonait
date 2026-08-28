@@ -246,6 +246,53 @@ export async function deleteMachineProfile(device) {
   await withStore(SETTINGS_STORE, 'readwrite', (store) => store.delete(machineKey(device)));
 }
 
+// --- App settings --------------------------------------------------------
+//
+// Three fixed-id records in the same store the machine profile lives in.
+// Fixed id, not per-adapter, because these are the user's own choices
+// (whether to auto-save, which device to prefer) rather than something
+// measured about the hardware.
+
+const AUTOSAVE_CONFIG = 'autosave-config';
+const DEVICE_PREFERENCE = 'device-preference';
+const BENCHMARK_CONFIG = 'benchmark-config';
+
+/// { enabled, frequencySteps, mode: 'overwrite'|'add' }
+export async function putAutosaveConfig(config) {
+  const record = { ...config, id: AUTOSAVE_CONFIG, savedAt: Date.now() };
+  await withStore(SETTINGS_STORE, 'readwrite', (store) => store.put(record));
+  return record;
+}
+
+export async function getAutosaveConfig() {
+  return withStore(SETTINGS_STORE, 'readonly', (store) => store.get(AUTOSAVE_CONFIG));
+}
+
+/// { trainingDevice: 'gpu', inferenceDevice: 'gpu'|'cpu' }. trainingDevice
+/// is always 'gpu' today (there is no CPU training path) but is stored
+/// as its own key, not hardcoded into the shape, so a future
+/// training-backend selector can use it without a rename.
+export async function putDevicePreference(preference) {
+  const record = { ...preference, id: DEVICE_PREFERENCE, savedAt: Date.now() };
+  await withStore(SETTINGS_STORE, 'readwrite', (store) => store.put(record));
+  return record;
+}
+
+export async function getDevicePreference() {
+  return withStore(SETTINGS_STORE, 'readonly', (store) => store.get(DEVICE_PREFERENCE));
+}
+
+/// { autoEnabled }
+export async function putBenchmarkConfig(config) {
+  const record = { ...config, id: BENCHMARK_CONFIG, savedAt: Date.now() };
+  await withStore(SETTINGS_STORE, 'readwrite', (store) => store.put(record));
+  return record;
+}
+
+export async function getBenchmarkConfig() {
+  return withStore(SETTINGS_STORE, 'readonly', (store) => store.get(BENCHMARK_CONFIG));
+}
+
 // --- Run history -------------------------------------------------------
 //
 // One record per measurement, plus one per event worth remembering (a
