@@ -349,8 +349,12 @@ impl GpuTrainer {
             config: *config,
             weights: ParamSet::from_weights(ctx, weights),
             grads: ParamSet::zeros(ctx, config, false),
-            m: ParamSet::zeros(ctx, config, false),
-            v: ParamSet::zeros(ctx, config, false),
+            // `download_optimizer` reads these back (for the checkpoint's
+            // saved momentum) via `read_f32_concat`, which needs COPY_SRC
+            // on every buffer it copies from — `grads` above is never
+            // downloaded, so it stays write-only.
+            m: ParamSet::zeros(ctx, config, true),
+            v: ParamSet::zeros(ctx, config, true),
             acts,
             scratch,
             t_len,

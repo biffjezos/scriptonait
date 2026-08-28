@@ -38,7 +38,9 @@ use llm_core::train::TrainConfig;
 /// generation, and — once training starts — the resident training state.
 struct GpuBackend {
     ctx: Rc<llm_gpu::GpuContext>,
-    model: llm_gpu::GpuModel,
+    /// `None` only while `generate_on_gpu` has it checked out for the
+    /// duration of a generation — see that function's comment for why.
+    model: Option<llm_gpu::GpuModel>,
     /// Allocated on the first training step, not at init: it holds the
     /// gradients, both Adam moments and every layer's activations, which
     /// is several times the model's own size and pointless to reserve
@@ -624,7 +626,7 @@ impl WasmLLM {
         let step = self.0.borrow().step;
         self.0.borrow_mut().gpu = Some(GpuBackend {
             ctx,
-            model,
+            model: Some(model),
             trainer: None,
             uploaded_at_step: step,
             summary: summary.clone(),
@@ -879,11 +881,21 @@ impl WasmLLM {
         };
 
         let (mut logits, cache) = llm_core::model::prefill(&weights, &config, &prompt_tokens);
-        let ctx = {
+        // The model comes out of `Inner` for the rest of this call, the
+        // same pattern `train_step_inner` uses for the trainer: holding a
+        // `RefCell` borrow across `decode_step`'s `.await` below would
+        // panic the moment CPU inference — which never checks `busy`, by
+        // design, so it does not wait for this to finish — ran while a
+        // token was mid-flight here. `gpu.model` is restored once the
+        // loop ends; on an error mid-loop it stays `None`, which is fine
+        // because the caller (`generate_inner`) drops the whole `gpu`
+        // backend on any `Err` from here.
+        let (ctx, mut model) = {
             let mut inner = self.0.borrow_mut();
             let gpu = inner.gpu.as_mut().ok_or("no GPU")?;
-            gpu.model.seed_from_cpu_cache(&gpu.ctx, &cache);
-            gpu.ctx.clone()
+            let mut model = gpu.model.take().ok_or("no GPU")?;
+            model.seed_from_cpu_cache(&gpu.ctx, &cache);
+            (gpu.ctx.clone(), model)
         };
 
         let mut guard = instruct::LengthGuard::new(request.target_words);
@@ -916,11 +928,14 @@ impl WasmLLM {
                 break;
             }
 
-            logits = {
-                let mut inner = self.0.borrow_mut();
-                let gpu = inner.gpu.as_mut().ok_or("no GPU")?;
-                gpu.model.decode_step(&ctx, next).await?
-            };
+            logits = model.decode_step(&ctx, next).await?;
+        }
+
+        {
+            let mut inner = self.0.borrow_mut();
+            if let Some(gpu) = inner.gpu.as_mut() {
+                gpu.model = Some(model);
+            }
         }
 
         if !pending.is_empty() {
@@ -1431,7 +1446,7 @@ impl WasmLLM {
         inner.pretrained = true;
         let step = inner.step;
         if let Some(gpu) = inner.gpu.as_mut() {
-            gpu.model = model;
+            gpu.model = Some(model);
             gpu.uploaded_at_step = step;
         }
         Ok(())
