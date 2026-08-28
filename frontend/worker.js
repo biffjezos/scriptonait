@@ -677,7 +677,7 @@ function planActions(plan, phase, { heldOut, trainingLoss, tokensSeen, tokensPer
     actions.push({
       key: 'stop-here',
       urgency: 'high',
-      text: 'Stop and restore the best model, or add text and keep training.',
+      text: 'Held-out loss is getting worse — stop here, or add more text and keep training.',
     });
   }
   if (phase.key === 'plateau') {
@@ -1053,7 +1053,7 @@ async function train({
   // forward passes are a rounding error against training. A Settings-tab
   // value overrides the default; 0 or missing falls back to it rather
   // than turning measurement off — there is no "never" for this, since
-  // the plateau detector and the best-model tracker both depend on it.
+  // the plateau detector depends on it.
   const validateEvery = metricsEvery > 0 ? metricsEvery : VALIDATE_EVERY;
   log(
     `held-out loss will be measured every ${validateEvery} steps on a fixed set of ` +
@@ -1069,7 +1069,6 @@ async function train({
   // help more than more steps.
   const heldOut = [];
   let lastAdvice = null;
-  let bestValidation = null;
   // The phase the run was last seen in, so a change of phase is
   // announced once instead of on every recomputation.
   let lastPhase = null;
@@ -1284,14 +1283,6 @@ async function train({
                 );
               }
             }
-          }
-          // A run's best model is rarely its last, and training past the
-          // best is exactly what a small corpus makes it do. Tell the
-          // page whenever this is the best held-out loss so far so it can
-          // keep a copy.
-          if (bestValidation === null || measured < bestValidation) {
-            bestValidation = measured;
-            post('train-best', { step: llm.step(), validationLoss: measured });
           }
           lastPhase = reportPlan({
             heldOut,

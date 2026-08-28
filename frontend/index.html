@@ -9,9 +9,8 @@
 <body>
   <!-- One bar for every transient notice: errors, confirmations, and
        training events (a phase change, a rate cut). Persistent,
-       section-relevant data (the plan, the best-model line, the machine
-       profile) stays inline in its own tab instead of passing through
-       here. -->
+       section-relevant data (the plan, the machine profile) stays
+       inline in its own tab instead of passing through here. -->
   <div id="notification-bar" class="notification-bar" hidden></div>
 
   <header>
@@ -108,15 +107,8 @@
         <input type="text" id="sample-prompt" value="Write a 40 word scene." />
       </div>
 
-      <div class="row">
-        <label>Source-opening windows
-          <input type="number" id="opening-rate" value="40" min="0" max="100" />%
-        </label>
-        <span class="hint">of sampled windows start at a source's beginning, rather than the next one due.</span>
-      </div>
-
       <details class="advanced" open>
-        <summary>Plan</summary>
+        <summary>Progress</summary>
         <div id="train-plan" class="plan" hidden>
           <p class="plan-phase"><span id="plan-phase-title"></span><span id="plan-phase-detail"></span></p>
           <p id="plan-numbers" class="stats"></p>
@@ -129,16 +121,9 @@
           <p id="train-stats" class="stats"></p>
           <p id="train-window" class="hint"></p>
           <p id="train-advice" class="advice" hidden></p>
-          <div id="best-model" class="best-model row" hidden>
-            <span id="best-model-text" class="stats"></span>
-            <button id="restore-best-btn" type="button" class="secondary">Restore</button>
-          </div>
         </div>
-      </details>
 
-      <details class="advanced" open>
-        <summary>Chart</summary>
-        <canvas id="loss-chart" width="640" height="140" hidden></canvas>
+        <canvas id="loss-chart" width="640" height="160" hidden></canvas>
       </details>
 
       <details class="advanced" id="metrics-panel">
@@ -274,8 +259,12 @@
           <label>Metrics every
             <input type="number" id="metrics-every" value="100" min="1" max="100000" />
           </label>
+          <label>Source-opening windows
+            <input type="number" id="opening-rate" value="40" min="0" max="100" />%
+          </label>
         </div>
         <p class="hint" id="batch-hint"></p>
+        <p class="hint">Source-opening windows: how often a sampled window starts exactly at a source's beginning, rather than the next one due in its rotation.</p>
 
         <p class="hint" id="shape-hint">New model shape:</p>
         <p class="hint shape-estimate" id="shape-estimate"></p>
