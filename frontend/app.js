@@ -639,6 +639,16 @@ onStream('generate-progress', ({ words, tokens, elapsedSeconds, tokensPerSecond 
   setTitleProgress('Writing', fraction);
 });
 
+/// Continuous leaves length to whatever the prompt itself asks for (or
+/// the default budget, if it asks for nothing) — today's behavior.
+/// Limit hands the field's value straight through as a hard token
+/// ceiling, overriding that regardless of what the prompt says.
+function applyLengthMode() {
+  $('opt-max-tokens').disabled = $('opt-length-mode').value !== 'limit';
+}
+$('opt-length-mode').addEventListener('change', applyLengthMode);
+applyLengthMode();
+
 $('generate-btn').addEventListener('click', async () => {
   if (generating) return;
   const prompt = $('prompt-input').value.trim();
@@ -669,6 +679,7 @@ $('generate-btn').addEventListener('click', async () => {
       minP: Number($('opt-min-p').value),
       repetitionPenalty: Number($('opt-repetition').value),
       seed: Number($('opt-seed').value) || Math.floor(Math.random() * 1e9),
+      maxTokens: $('opt-length-mode').value === 'limit' ? Number($('opt-max-tokens').value) : 0,
     }, [], 0);
     setProgress('generate-progress-bar', 1);
     const why = {

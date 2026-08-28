@@ -377,6 +377,13 @@ pub struct Response {
 /// rather than mid-clause. A hard ceiling above the target catches the
 /// case where the model never produces a boundary.
 ///
+/// `max_tokens_override`, when given, replaces the word-target-derived
+/// budget with a hard token ceiling — the caller asked for exactly this
+/// many tokens and no sentence-boundary courtesy is owed past it. The
+/// word-target's own early stop (finish the current sentence once the
+/// target is reached) still applies underneath it when both are set, so
+/// whichever limit is reached first wins.
+///
 /// `on_progress` is called with each new piece of text and the running
 /// word count; returning `false` stops early (a Stop button).
 pub fn generate_response(
@@ -385,11 +392,12 @@ pub fn generate_response(
     tokenizer: &Tokenizer,
     request: &Request,
     sampling: &SamplingConfig,
+    max_tokens_override: Option<usize>,
     on_progress: &mut dyn FnMut(&str, usize) -> bool,
 ) -> Response {
     let prompt_tokens = request.to_prompt_tokens(tokenizer);
     let mut guard = LengthGuard::new(request.target_words);
-    let max_new_tokens = guard.token_budget();
+    let max_new_tokens = max_tokens_override.unwrap_or_else(|| guard.token_budget());
 
     let (text, reason) = generate::generate_stream(
         weights,
@@ -719,6 +727,7 @@ mod tests {
             &t,
             &request,
             &SamplingConfig { seed: 1, ..Default::default() },
+            None,
             &mut |_, _| true,
         );
         assert!(
@@ -726,6 +735,52 @@ mod tests {
             "overshot the hard ceiling: {} words",
             response.word_count
         );
+    }
+
+    #[test]
+    fn max_tokens_override_is_a_hard_ceiling_regardless_of_the_word_target() {
+        let config = ModelConfig {
+            num_layers: 1,
+            hidden_dim: 16,
+            num_heads: 2,
+            num_kv_heads: 1,
+            context_len: 64,
+            local_window: 32,
+            ..Default::default()
+        };
+        let weights = ModelWeights::init(&config, 3);
+        let t = Tokenizer::byte_level();
+        // A word target of 500 would normally budget hundreds of tokens;
+        // the override must win regardless.
+        let request = Request {
+            form: Form::Novel,
+            target_words: Some(500),
+            subject: "space".to_string(),
+            reference: None,
+        };
+        // Count callback invocations directly rather than trusting
+        // `tokens_generated` (re-derived by re-encoding the decoded
+        // text): an untrained, randomly-initialized model's raw byte
+        // output is mostly invalid UTF-8, and the lossy decode/re-encode
+        // round trip can inflate the count via replacement characters —
+        // a measurement artifact, not evidence the loop ran too long.
+        let mut pieces = 0;
+        generate_response(
+            &weights,
+            &config,
+            &t,
+            &request,
+            &SamplingConfig { seed: 1, ..Default::default() },
+            Some(5),
+            &mut |_, _| {
+                pieces += 1;
+                true
+            },
+        );
+        // <= 6, not 5: generate_stream's loop is bounded to exactly 5
+        // iterations, but a final callback flushing any incomplete
+        // trailing UTF-8 bytes can fire once more after it.
+        assert!(pieces <= 6, "override should cap generation at 5 tokens, got {pieces} callbacks");
     }
 
     #[test]
@@ -748,6 +803,7 @@ mod tests {
             &Tokenizer::byte_level(),
             &request,
             &SamplingConfig::default(),
+            None,
             &mut |_, _| {
                 pieces += 1;
                 pieces < 3

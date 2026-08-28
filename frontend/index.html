@@ -228,6 +228,15 @@
           <label>Seed
             <input type="number" id="opt-seed" value="0" min="0" />
           </label>
+          <label>Length
+            <select id="opt-length-mode">
+              <option value="continuous" selected>Continuous</option>
+              <option value="limit">Limit to</option>
+            </select>
+          </label>
+          <label>Max tokens
+            <input type="number" id="opt-max-tokens" value="200" min="1" max="8192" disabled />
+          </label>
         </div>
       </details>
     </section>

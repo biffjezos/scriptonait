@@ -718,13 +718,20 @@ impl WasmLLM {
         repetition_penalty: f32,
         seed: f64,
         prefer_gpu: bool,
+        // A hard ceiling on tokens generated, overriding the length the
+        // prompt itself asked for ("write a 700 word novel..."). 0 means
+        // no override — length stays whatever the prompt implies (or the
+        // default budget, if it implies nothing), exactly as before this
+        // parameter existed.
+        max_tokens: u32,
         on_token: &js_sys::Function,
     ) -> GenerationResult {
+        let max_tokens_override = (max_tokens > 0).then_some(max_tokens as usize);
         if !prefer_gpu {
             let request = self.build_request(&prompt, &extra_context);
             let sampling =
                 self.sampling_config(temperature, top_k, top_p, min_p, repetition_penalty, seed);
-            return self.generate_on_cpu(&request, &sampling, on_token);
+            return self.generate_on_cpu(&request, &sampling, max_tokens_override, on_token);
         }
 
         // Generation owns the GPU for as long as it runs, and it pulls
@@ -746,7 +753,7 @@ impl WasmLLM {
             };
         }
         let result = self.generate_inner(prompt, extra_context, temperature, top_k, top_p, min_p,
-            repetition_penalty, seed, on_token).await;
+            repetition_penalty, seed, max_tokens_override, on_token).await;
         self.release();
         result
     }
@@ -788,6 +795,7 @@ impl WasmLLM {
         min_p: f32,
         repetition_penalty: f32,
         seed: f64,
+        max_tokens_override: Option<usize>,
         on_token: &js_sys::Function,
     ) -> GenerationResult {
         let request = self.build_request(&prompt, &extra_context);
@@ -805,7 +813,7 @@ impl WasmLLM {
             inner.gpu.as_ref().is_some_and(|g| g.uploaded_at_step == inner.step)
         };
         if gpu_is_current {
-            match self.generate_on_gpu(&request, &sampling, on_token).await {
+            match self.generate_on_gpu(&request, &sampling, max_tokens_override, on_token).await {
                 Ok(result) => return result,
                 Err(_) => {
                     // A device that was lost or a kernel that failed:
@@ -815,7 +823,7 @@ impl WasmLLM {
                 }
             }
         }
-        self.generate_on_cpu(&request, &sampling, on_token)
+        self.generate_on_cpu(&request, &sampling, max_tokens_override, on_token)
     }
 
     fn build_request(&self, prompt: &str, extra_context: &str) -> instruct::Request {
@@ -834,6 +842,7 @@ impl WasmLLM {
         &self,
         request: &instruct::Request,
         sampling: &SamplingConfig,
+        max_tokens_override: Option<usize>,
         on_token: &js_sys::Function,
     ) -> GenerationResult {
         let inner = self.0.borrow();
@@ -843,6 +852,7 @@ impl WasmLLM {
             inner.corpus.tokenizer(),
             request,
             sampling,
+            max_tokens_override,
             &mut |piece, words| report(on_token, piece, words),
         );
         GenerationResult::from_response(response)
@@ -858,6 +868,7 @@ impl WasmLLM {
         &self,
         request: &instruct::Request,
         sampling: &SamplingConfig,
+        max_tokens_override: Option<usize>,
         on_token: &js_sys::Function,
     ) -> Result<GenerationResult, String> {
         let (weights, config, tokenizer, prompt_tokens) = {
@@ -876,7 +887,7 @@ impl WasmLLM {
         };
 
         let mut guard = instruct::LengthGuard::new(request.target_words);
-        let max_new_tokens = guard.token_budget();
+        let max_new_tokens = max_tokens_override.unwrap_or_else(|| guard.token_budget());
         let mut rng = llm_core::rng::Rng::seed_from_u64(sampling.seed);
         let mut produced: Vec<u32> = Vec::new();
         let mut recent: Vec<u32> = prompt_tokens.clone();
