@@ -295,9 +295,7 @@ function updateGuidance() {
     ? 'Training needs WebGPU. This browser did not give the page a GPU.'
     : !model
       ? 'New model, from scratch, trained on your GPU.'
-      : model.pretrained
-        ? ''
-        : 'Continues where it stopped.';
+      : '';
 
   if (training) {
     step.textContent = 'Training on your GPU. Stop any time — progress is kept.';
