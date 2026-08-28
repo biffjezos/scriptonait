@@ -2484,6 +2484,31 @@ async function writeModelToFile(bytes) {
 /// Skipped rather than queued when one is already in flight: an export
 /// pulls the weights off the GPU, and stacking two of those is the exact
 /// thing that exhausted the heap and lost a model in the first place.
+/// Export a checkpoint, retrying briefly if the GPU was busy with a
+/// training step at the exact moment this asked for it.
+///
+/// The refusal itself is deliberate (see `acquire()` on the wasm side):
+/// nothing should poll forever waiting for training to let go of the
+/// device. But for an autosave — the thing crash-resilience depends on —
+/// giving up after exactly one attempt turns "the model was mid-step"
+/// into "this save never happened", and the collision is common at step
+/// 0 specifically, the one step slow enough to matter (it pays for
+/// allocating every GPU training buffer). A handful of short retries
+/// covers that without ever blocking indefinitely.
+async function exportCheckpointWithRetry() {
+  const maxAttempts = 6;
+  const delayMs = 700;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      return (await call('export-checkpoint', {}, [], 0)).bytes;
+    } catch (error) {
+      const busy = error && typeof error.message === 'string' && error.message.includes('already busy');
+      if (!busy || attempt === maxAttempts) throw error;
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
+    }
+  }
+}
+
 async function autosave(step, { force = false, bytes: given = null } = {}) {
   if (!autosaveEnabled && !force) return;
   if (autosaveInFlight) return;
@@ -2495,7 +2520,7 @@ async function autosave(step, { force = false, bytes: given = null } = {}) {
     // During a run the worker exports between slices and hands the
     // bytes over, because asking for them from here means asking while
     // a training step is running — and both take the same GPU guard.
-    const bytes = given || (await call('export-checkpoint', {}, [], 0)).bytes;
+    const bytes = given || (await exportCheckpointWithRetry());
     // Keep whatever optimizer state is already stored rather than
     // writing null over it.
     //
