@@ -220,6 +220,33 @@ export async function getBestModel() {
   return withStore(MODELS_STORE, 'readonly', (store) => store.get(BEST_MODEL));
 }
 
+/// Auto-save's "Add" mode: a rolling set of recent snapshots instead of
+/// the single current-model slot "Overwrite" uses.
+///
+/// A fixed, small number of ids (`autosave-0`..`autosave-2`), chosen by
+/// step number modulo that count. Deterministic and needs no rotation
+/// state of its own — the oldest of the three is always the one the next
+/// save's step number lands on again.
+const AUTOSAVE_SNAPSHOT_COUNT = 3;
+
+export async function putAutosaveSnapshot({ bytes, step, params, optimizer = null }) {
+  const id = `autosave-${step % AUTOSAVE_SNAPSHOT_COUNT}`;
+  const record = { id, bytes, step, params, optimizer, savedAt: Date.now() };
+  await withStore(MODELS_STORE, 'readwrite', (store) => store.put(record));
+  return record;
+}
+
+/// Every stored snapshot, oldest first.
+export async function listAutosaveSnapshots() {
+  const ids = Array.from({ length: AUTOSAVE_SNAPSHOT_COUNT }, (_, i) => `autosave-${i}`);
+  const found = [];
+  for (const id of ids) {
+    const record = await withStore(MODELS_STORE, 'readonly', (store) => store.get(id));
+    if (record) found.push(record);
+  }
+  return found.sort((a, b) => a.step - b.step);
+}
+
 // --- The machine profile -----------------------------------------------
 //
 // One record per adapter the browser has handed this page. Keyed by the

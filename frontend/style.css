@@ -62,6 +62,68 @@ h1 {
   margin-top: 1rem;
 }
 
+/* One bar, fixed at the top, for every transient notice. */
+.notification-bar {
+  position: sticky;
+  top: 0;
+  z-index: 10;
+  padding: 0.6rem 1.5rem;
+  font-size: 0.9rem;
+  text-align: center;
+}
+
+.notification-bar.error {
+  background: color-mix(in srgb, var(--danger) 15%, transparent);
+  color: var(--danger);
+  border-bottom: 1px solid var(--danger);
+}
+
+.notification-bar.info {
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+  color: var(--text);
+  border-bottom: 1px solid var(--accent);
+}
+
+.notification-bar.success {
+  background: color-mix(in srgb, #4a9a5a 15%, transparent);
+  color: var(--text);
+  border-bottom: 1px solid #4a9a5a;
+}
+
+/* Tabs */
+.tabs {
+  display: flex;
+  gap: 0.25rem;
+  max-width: 760px;
+  margin: 0 auto;
+  padding: 0 1.5rem;
+  border-bottom: 1px solid var(--border);
+}
+
+.tab-button {
+  background: none;
+  border: none;
+  border-bottom: 2px solid transparent;
+  color: var(--text-dim);
+  font: inherit;
+  font-weight: 600;
+  padding: 0.6rem 0.9rem;
+  cursor: pointer;
+}
+
+.tab-button:hover {
+  color: var(--text);
+}
+
+.tab-button.active {
+  color: var(--accent);
+  border-bottom-color: var(--accent);
+}
+
+.tab-panel h2 {
+  margin-top: 0;
+}
+
 
 
 
@@ -503,13 +565,6 @@ select {
   background: var(--panel-bg);
 }
 
-.train-samples {
-  display: flex;
-  flex-direction: column;
-  gap: 0.5rem;
-  margin-top: 0.75rem;
-}
-
 .train-sample {
   border: 1px solid var(--border);
   border-radius: 6px;
@@ -567,7 +622,7 @@ select {
 .plan {
   margin: 0.75rem 0;
   padding: 0.75rem 0.9rem;
-  border: 1px solid var(--line, rgba(128, 128, 128, 0.3));
+  border: 1px solid var(--border);
   border-radius: 6px;
   background: rgba(128, 128, 128, 0.05);
 }
@@ -629,7 +684,7 @@ select {
 .history-table-wrap {
   max-height: 22rem;
   overflow: auto;
-  border: 1px solid var(--line, rgba(128, 128, 128, 0.3));
+  border: 1px solid var(--border);
   border-radius: 6px;
   margin: 0.5rem 0;
 }
@@ -646,13 +701,13 @@ select {
   padding: 0.25rem 0.6rem;
   text-align: right;
   white-space: nowrap;
-  border-bottom: 1px solid var(--line, rgba(128, 128, 128, 0.15));
+  border-bottom: 1px solid var(--border);
 }
 
 .history-table th {
   position: sticky;
   top: 0;
-  background: var(--panel, #1a1b26);
+  background: var(--panel-bg);
   text-align: right;
   font-weight: 600;
   z-index: 1;

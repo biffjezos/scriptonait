@@ -67,8 +67,9 @@ const PLATEAU_PATIENCE = 4;
 /// uses, for the same reason.
 const TOKENS_BEFORE_CUTTING_THE_RATE = 2e6;
 
-/// How often an unattended run writes itself down. A few minutes of
-/// work at risk instead of a night's.
+/// Default cadence for an unattended run to write itself down, used only
+/// until the page sends its own Settings-tab frequency in the train
+/// payload — a few minutes of work at risk instead of a night's.
 const AUTOSAVE_EVERY_STEPS = 1000;
 /// What a cut multiplies the rate by, and how far the cuts may go in
 /// total. Halving is the standard move; a run that has fallen to a
@@ -1029,7 +1030,9 @@ function recordEvent(step, kind, text, extra = {}) {
 
 async function train({
   batchSize, learningRate, maxSteps, effort, sampleEvery, samplePrompt, sampleWords, sampling,
+  autosaveFrequencySteps,
 }) {
+  const autosaveEvery = autosaveFrequencySteps > 0 ? autosaveFrequencySteps : AUTOSAVE_EVERY_STEPS;
   stopRequested = false;
   training = true;
   runId = `run-${Date.now().toString(36)}`;
@@ -1087,7 +1090,7 @@ async function train({
   let nextValidateAt = llm.step() + validateEvery;
   // Counted from where this run starts, so a model at step 4,441 does
   // not save on its very first progress report.
-  let nextAutosaveAt = llm.step() + AUTOSAVE_EVERY_STEPS;
+  let nextAutosaveAt = llm.step() + autosaveEvery;
   let validationLoss = null;
   // Held-out losses in order, so the run can say when more text would
   // help more than more steps.
@@ -1380,7 +1383,7 @@ async function train({
     // last produced, which looks exactly like a model that stopped
     // getting better.
     if (llm.step() >= nextAutosaveAt) {
-      nextAutosaveAt = llm.step() + AUTOSAVE_EVERY_STEPS;
+      nextAutosaveAt = llm.step() + autosaveEvery;
       const savedAt = performance.now();
       try {
         const bytes = await llm.export_checkpoint();
@@ -1411,11 +1414,8 @@ async function train({
         // corpus, so no word list has to ship with the page.
         const quality = JSON.parse(llm.evaluate(text, validationLoss === null ? -1 : validationLoss));
         lastQuality = quality;
-        post('train-sample', { step: llm.step(), loss: smoothedLoss, text, quality });
-        // Kept, not just shown. A sample is the most legible record of
-        // what a model could do at a moment, and the current card
-        // overwrites the last one by design — so the history is the only
-        // place the earlier ones survive.
+        // The Samples panel (backed by history) is the only place a
+        // sample is shown — every one kept, not just the latest.
         post('train-record', {
           runId, kind: 'sample', at: Date.now(), step: llm.step(),
           text, quality, loss: smoothedLoss, prompt: samplePrompt,
@@ -1433,11 +1433,6 @@ async function train({
         log(`sample generated in ${(performance.now() - sampleStart).toFixed(0)} ms`);
       } catch (error) {
         log(`sample failed: ${(error && error.message) || error}`);
-        post('train-sample', {
-          step: llm.step(),
-          loss: smoothedLoss,
-          text: `(sample failed: ${(error && error.message) || error})`,
-        });
       }
     }
 

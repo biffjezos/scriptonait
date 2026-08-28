@@ -7,27 +7,50 @@
   <link rel="stylesheet" href="style.css" />
 </head>
 <body>
+  <!-- One bar for every transient notice: errors, confirmations, and
+       training events (a phase change, a rate cut). Persistent,
+       section-relevant data (the plan, the best-model line, the machine
+       profile) stays inline in its own tab instead of passing through
+       here. -->
+  <div id="notification-bar" class="notification-bar" hidden></div>
+
   <header>
     <h1>Scriptonait</h1>
     <p class="tagline">Train a model on your writing. All local.</p>
-
-    <div id="model-status" class="model-status absent">
-      <span id="model-status-text">No model yet.</span>
-      <div class="progress" id="model-progress" hidden><div class="bar" id="model-progress-bar"></div></div>
-    </div>
-
-    <!-- One sentence saying what to do next, for whatever state the page
-         is in. Everything below is reachable at any time; this is what
-         stops you having to guess which part applies right now. -->
-    <p id="next-step" class="next-step"></p>
   </header>
 
+  <nav class="tabs" id="tabs">
+    <button class="tab-button active" type="button" data-tab="overview">Overview</button>
+    <button class="tab-button" type="button" data-tab="corpus">Corpus</button>
+    <button class="tab-button" type="button" data-tab="training">Training</button>
+    <button class="tab-button" type="button" data-tab="inference">Inference</button>
+    <button class="tab-button" type="button" data-tab="settings">Settings</button>
+  </nav>
+
   <main>
-    <section class="panel" id="material-panel">
-      <h2>1. Add your writing</h2>
+    <section class="tab-panel" id="tab-overview">
+      <h2>Overview</h2>
+
+      <div id="model-status" class="model-status absent">
+        <span id="model-status-text">No model yet.</span>
+        <div class="progress" id="model-progress" hidden><div class="bar" id="model-progress-bar"></div></div>
+      </div>
+      <p id="next-step" class="next-step"></p>
+
+      <div id="model-details" class="model-details"></div>
+      <div class="row">
+        <button id="export-btn" type="button" class="secondary">Save</button>
+      </div>
+    </section>
+
+    <section class="tab-panel" id="tab-corpus" hidden>
+      <h2>Corpus</h2>
+
       <div class="input-group">
-        <label for="file-input">Upload text files</label>
-        <input type="file" id="file-input" multiple accept=".txt,.md,.markdown,.fountain,.text" />
+        <label for="file-input" class="file-btn">
+          Add Files
+          <input type="file" id="file-input" multiple accept=".txt,.md,.markdown,.fountain,.text" hidden />
+        </label>
       </div>
 
       <div class="input-group">
@@ -39,24 +62,23 @@
         </div>
       </div>
 
-
       <div class="sources-toolbar" id="sources-toolbar" hidden>
         <input type="search" id="sources-filter" placeholder="Filter by name…" />
-        <button id="remove-all-btn" type="button" class="secondary">Remove all</button>
+        <button id="remove-all-btn" type="button" class="secondary">Remove All</button>
       </div>
       <div id="sources-list" class="sources-list"></div>
       <p id="corpus-stats" class="corpus-stats"></p>
     </section>
 
-    <section class="panel" id="train-panel">
-      <h2>2. Train a model on it</h2>
+    <section class="tab-panel" id="tab-training" hidden>
+      <h2>Training</h2>
       <p id="train-explains" class="hint"></p>
 
       <div class="row">
-        <button id="train-btn" type="button" disabled>Train a model on my writing</button>
+        <button id="train-btn" type="button" disabled>Train</button>
         <button id="train-stop-btn" type="button" class="secondary" hidden>Stop</button>
         <label class="file-btn">
-          Open a model file
+          Load Model
           <input type="file" id="import-input" accept=".ckpt,.bin" hidden />
         </label>
       </div>
@@ -70,48 +92,38 @@
         <input type="text" id="sample-prompt" value="Write a 40 word scene." />
       </div>
 
-      <!-- The plan: which phase the run is in, the numbers behind that,
-           and what a person could actually do about it. Shown before the
-           first step, not only after the first validation. -->
-      <div id="train-plan" class="plan" hidden>
-        <p class="plan-phase"><span id="plan-phase-title"></span><span id="plan-phase-detail"></span></p>
-        <p id="plan-numbers" class="stats"></p>
-        <p id="plan-corpus" class="stats"></p>
-        <p id="plan-corpus" class="stats"></p>
-        <ul id="plan-actions" class="plan-actions"></ul>
-      </div>
-
-      <div id="train-status" class="job-status" hidden>
-        <div class="progress"><div class="bar" id="train-progress-bar"></div></div>
-        <p id="train-stats" class="stats"></p>
-        <p id="train-advice" class="advice" hidden></p>
-        <div id="best-model" class="best-model row" hidden>
-          <span id="best-model-text" class="stats"></span>
-          <button id="restore-best-btn" type="button" class="secondary">Go back to it</button>
+      <details class="advanced" open>
+        <summary>Plan</summary>
+        <div id="train-plan" class="plan" hidden>
+          <p class="plan-phase"><span id="plan-phase-title"></span><span id="plan-phase-detail"></span></p>
+          <p id="plan-numbers" class="stats"></p>
+          <p id="plan-corpus" class="stats"></p>
+          <ul id="plan-actions" class="plan-actions"></ul>
         </div>
-      </div>
-      <canvas id="loss-chart" width="640" height="140" hidden></canvas>
-      <div id="train-samples" class="train-samples"></div>
 
-      <!-- Everything the run has measured, kept. The page's other panels
-           show the present moment; a run is hours long and the question
-           is almost always what it did between then and now. -->
-      <details class="advanced" id="history-panel">
-        <summary>Run history <span id="history-count" class="hint"></span></summary>
+        <div id="train-status" class="job-status" hidden>
+          <div class="progress"><div class="bar" id="train-progress-bar"></div></div>
+          <p id="train-stats" class="stats"></p>
+          <p id="train-advice" class="advice" hidden></p>
+          <div id="best-model" class="best-model row" hidden>
+            <span id="best-model-text" class="stats"></span>
+            <button id="restore-best-btn" type="button" class="secondary">Restore</button>
+          </div>
+        </div>
+      </details>
 
+      <details class="advanced" open>
+        <summary>Chart</summary>
+        <canvas id="loss-chart" width="640" height="140" hidden></canvas>
+      </details>
+
+      <details class="advanced" id="metrics-panel">
+        <summary>Metrics <span id="history-count" class="hint"></span></summary>
         <div class="row">
           <button id="history-copy-btn" type="button" class="secondary">Copy as Markdown</button>
           <button id="history-json-btn" type="button" class="secondary">Copy as JSON</button>
-          <button id="history-clear-btn" type="button" class="secondary">Clear history</button>
-          <span id="history-copied" class="hint" hidden>Copied.</span>
+          <button id="history-clear-btn" type="button" class="secondary">Clear History</button>
         </div>
-        <p class="hint">
-          Every measurement this model has taken, across every run, with the settings that
-          produced it. Copy it into a conversation with an AI and it has the whole run rather
-          than one line of it.
-        </p>
-
-        <p id="history-rewind" class="advice" hidden></p>
 
         <textarea id="history-output" class="history-output" rows="10" readonly hidden></textarea>
 
@@ -120,7 +132,10 @@
         </div>
 
         <div id="history-events" class="history-events"></div>
+      </details>
 
+      <details class="advanced" id="samples-panel">
+        <summary>Samples</summary>
         <div id="sample-history" class="sample-history" hidden>
           <div class="row">
             <button id="sample-prev" type="button" class="secondary">Earlier</button>
@@ -134,29 +149,27 @@
         </div>
       </details>
 
-      <div class="row" id="autosave-row">
-        <button id="autosave-file-btn" type="button" class="secondary">Auto-save to a file…</button>
-        <span id="autosave-status" class="hint">
-          The model is written to this browser every 1,000 steps during a run. Pick a file and
-          it is written there too — which is the copy that survives cleared storage, a full
-          disk quota, and this page crashing.
-        </span>
-      </div>
+      <details class="advanced" id="live-controls-panel">
+        <summary>Live Controls</summary>
+        <div class="row" id="live-controls">
+          <label>Peak learning rate, live
+            <input type="number" id="live-lr" min="0" max="0.01" step="0.00001" />
+          </label>
+          <button id="live-lr-btn" type="button" class="secondary">Apply</button>
+          <button id="reset-schedule-btn" type="button" class="secondary">Undo Plateau Cut</button>
+        </div>
+      </details>
 
-      <div class="row" id="live-controls" hidden>
-        <label>Peak learning rate, live
-          <input type="number" id="live-lr" min="0" max="0.01" step="0.00001" />
+      <details class="advanced" id="training-settings-panel">
+        <summary>Training Settings</summary>
+
+        <label>Mode
+          <select id="train-mode">
+            <option value="auto" selected>Auto</option>
+            <option value="manual">Manual</option>
+          </select>
         </label>
-        <button id="live-lr-btn" type="button" class="secondary">Apply now</button>
-        <button id="reset-schedule-btn" type="button" class="secondary">Undo plateau cut</button>
-        <span class="hint">
-          Changes the peak the schedule decays from, so the run keeps its shape. Recorded in
-          the history.
-        </span>
-      </div>
 
-      <details class="advanced">
-        <summary>Training settings</summary>
         <div class="settings-grid">
           <label>Effort
             <select id="train-effort">
@@ -176,23 +189,8 @@
             <input type="number" id="train-lr" value="0" min="0" max="0.01" step="0.00001" />
           </label>
         </div>
-        <p class="hint">
-          Every setting here is optional. Effort on Auto runs flat out — the benchmark
-          below only accepts a batch whose step stays short enough to interrupt —
-          batch size 0 uses whatever that benchmark measured fastest on this machine,
-          learning rate 0 picks one from whether the model is new or already trained, and
-          steps 0 trains until you press Stop.
-        </p>
-        <div class="row">
-          <span class="hint" id="machine-profile-text">Machine profile: not measured yet.</span>
-          <button id="bench-btn" type="button" class="secondary">Measure this machine</button>
-          <button id="bench-forget-btn" type="button" class="secondary" hidden>Forget it</button>
-        </div>
-        <p class="hint" id="batch-hint">
-          Batch size costs time, not memory: the sequences of a batch run one at a time and
-          their gradients add up, so a larger batch is a steadier gradient at the same
-          memory.
-        </p>
+        <p class="hint" id="batch-hint"></p>
+
         <p class="hint" id="shape-hint">New model shape:</p>
         <p class="hint shape-estimate" id="shape-estimate"></p>
         <div class="settings-grid">
@@ -206,17 +204,15 @@
       </details>
     </section>
 
-    <section class="panel" id="write-panel">
-      <h2>3. Write something</h2>
+    <section class="tab-panel" id="tab-inference" hidden>
+      <h2>Inference</h2>
       <textarea id="prompt-input" rows="3"
         placeholder="Write a 700 word novel about two people in space related to Plato's allegory of the cave"></textarea>
 
-      <!-- What the prompt was understood to mean, echoed back. A prompt
-           that was misread should be visibly misread. -->
       <div id="understood" class="understood" hidden></div>
 
       <div class="row">
-        <button id="generate-btn" type="button" disabled>Write it</button>
+        <button id="generate-btn" type="button" disabled>Generate</button>
         <button id="stop-btn" type="button" class="secondary" hidden>Stop</button>
         <label class="checkbox-label">
           <input type="checkbox" id="notify-toggle" />
@@ -233,7 +229,7 @@
       <div id="qa-notes" class="qa-notes" hidden></div>
 
       <details class="advanced">
-        <summary>Sampling settings</summary>
+        <summary>Sampling Settings</summary>
         <div class="settings-grid">
           <label>Temperature
             <input type="number" id="opt-temperature" value="0.9" min="0" max="2" step="0.05" />
@@ -254,29 +250,68 @@
             <input type="number" id="opt-seed" value="0" min="0" />
           </label>
         </div>
-        <p class="hint">
-          Temperature 0 = repeatable. Min-p keeps only tokens at least that fraction as likely
-          as the best one, so a confident step stays sharp and an uncertain one stays open —
-          which is what top-p, at a fixed 95% of the mass, cannot do. It generally does the
-          truncating on its own; 0 turns it off.
-        </p>
       </details>
     </section>
 
-    <details class="panel" id="model-panel">
-      <summary><h2>About your model</h2></summary>
-      <div id="model-details" class="model-details"></div>
-      <div class="row">
-        <button id="export-btn" type="button" class="secondary">Save this model to a file</button>
-      </div>
-      <p class="hint">One file. Reopen it in step 2.</p>
-    </details>
-  </main>
+    <section class="tab-panel" id="tab-settings" hidden>
+      <h2>Settings</h2>
 
-  <footer>
-    <p id="error-banner" class="warning" hidden></p>
-    <p class="hint">Runs locally. Nothing uploaded or downloaded.</p>
-  </footer>
+      <details class="advanced" open>
+        <summary>Auto-save</summary>
+        <div class="settings-grid">
+          <label>Auto-save
+            <select id="autosave-enabled">
+              <option value="on" selected>On</option>
+              <option value="off">Off</option>
+            </select>
+          </label>
+          <label>Frequency (steps)
+            <input type="number" id="autosave-frequency" value="1000" min="1" />
+          </label>
+          <label>Mode
+            <select id="autosave-mode">
+              <option value="overwrite" selected>Overwrite</option>
+              <option value="add">Add</option>
+            </select>
+          </label>
+        </div>
+        <p class="hint" id="autosave-mode-hint"></p>
+        <div class="row">
+          <span id="autosave-status" class="hint">File: not set.</span>
+          <button id="autosave-file-btn" type="button" class="secondary">Choose…</button>
+        </div>
+      </details>
+
+      <details class="advanced" open>
+        <summary>Device</summary>
+        <div class="settings-grid">
+          <label>Training
+            <select id="training-device">
+              <option value="gpu" selected>GPU</option>
+              <option value="cpu" disabled>CPU (needs a GPU)</option>
+            </select>
+          </label>
+          <label>Inference
+            <select id="inference-device">
+              <option value="gpu" selected>GPU</option>
+              <option value="cpu">CPU</option>
+            </select>
+          </label>
+        </div>
+      </details>
+
+      <details class="advanced" open>
+        <summary>Machine Benchmark</summary>
+        <label>Auto-benchmark
+          <select id="benchmark-enabled">
+            <option value="on" selected>On</option>
+            <option value="off">Off</option>
+          </select>
+        </label>
+        <p id="machine-profile-text" class="hint">Machine profile: not measured yet.</p>
+      </details>
+    </section>
+  </main>
 
   <script type="module" src="app.js"></script>
 </body>
