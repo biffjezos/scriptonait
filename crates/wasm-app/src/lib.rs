@@ -963,6 +963,31 @@ impl WasmLLM {
         self.0.borrow().corpus.total_tokens() as f64
     }
 
+    /// Per-source token counts and how many training windows have been
+    /// drawn from each, as JSON — for showing which sources training has
+    /// actually used, not just which sources exist. Read-only and never
+    /// touches the GPU, so it needs no `busy` guard.
+    pub fn corpus_source_stats(&self) -> String {
+        let stats = self.0.borrow_mut().corpus.per_source_stats();
+        let rows = stats
+            .iter()
+            .map(|s| {
+                format!(
+                    "{{\"id\":{:?},\"trainTokens\":{},\"heldOutTokens\":{},\"sampled\":{}}}",
+                    s.id, s.train_tokens, s.held_out_tokens, s.sampled,
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        format!("[{rows}]")
+    }
+
+    /// Restore a source's persisted sample count after a fresh page load
+    /// re-upserts it into a new corpus — see `Corpus::set_sample_count`.
+    pub fn set_source_sample_count(&self, id: String, count: f64) {
+        self.0.borrow_mut().corpus.set_sample_count(&id, count as u64);
+    }
+
     /// Learn a BPE vocabulary from the loaded sources and re-encode them
     /// with it. Returns the new vocabulary size, or 0 when there is no
     /// text yet.

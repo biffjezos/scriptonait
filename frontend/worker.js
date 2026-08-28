@@ -1548,6 +1548,22 @@ const handlers = {
     return { ids: llm.duplicate_sources() };
   },
 
+  /// Per-source token counts and how many training windows have actually
+  /// been drawn from each — for the Overview tab's corpus breakdown.
+  /// Read-only, no GPU touch.
+  async 'corpus-source-stats'() {
+    return { sources: JSON.parse(llm.corpus_source_stats()) };
+  },
+
+  /// Restore a source's sample count after a fresh page load re-upserts
+  /// it into a new corpus — the count is persisted per-source in
+  /// SOURCES_STORE and handed back in here, once per source, right after
+  /// `upsert-source` on the same source.
+  async 'set-source-sample-count'({ id, count }) {
+    llm.set_source_sample_count(id, count || 0);
+    return {};
+  },
+
   async 'upsert-source'(payload) {
     // More text is a different problem from the one the last plateau
     // was found on: whatever cut the rate then does not apply now.

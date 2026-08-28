@@ -123,7 +123,11 @@ function newId() {
 
 // --- Sources -----------------------------------------------------------
 // A source: { id, title, kind: 'file'|'paste', rawText, sourceUrl, tags,
-//             createdAt, updatedAt }
+//             createdAt, updatedAt, timesSampled }
+//
+// `timesSampled` is periodically pulled from the wasm corpus and written
+// back (see `updateSourceStats`); absent on a source added before it
+// existed, which callers treat the same as 0.
 //
 // `kind: 'url'` no longer gets created (URL fetch was removed), but a
 // record written by an older version can still carry it, and `sourceUrl`
@@ -171,6 +175,18 @@ export async function listSources() {
 
 export async function getSource(id) {
   return withStore(SOURCES_STORE, 'readonly', (store) => store.get(id));
+}
+
+/// How many training windows have been drawn from this source, as of the
+/// last time it was pulled from the wasm corpus and written back —
+/// doesn't touch `updatedAt`, since this isn't an edit to the source
+/// itself. Missing on a source added before this field existed; callers
+/// treat that the same as 0.
+export async function updateSourceStats(id, { timesSampled }) {
+  const existing = await getSource(id);
+  if (!existing) return;
+  await withStore(SOURCES_STORE, 'readwrite', (store) =>
+    store.put({ ...existing, timesSampled }));
 }
 
 // --- The trained model -------------------------------------------------
@@ -283,6 +299,7 @@ export async function deleteMachineProfile(device) {
 const AUTOSAVE_CONFIG = 'autosave-config';
 const DEVICE_PREFERENCE = 'device-preference';
 const BENCHMARK_CONFIG = 'benchmark-config';
+const TRAINING_PLAN_SETTINGS = 'training-plan-settings';
 
 /// { enabled, frequencySteps, mode: 'overwrite'|'add' }
 export async function putAutosaveConfig(config) {
@@ -318,6 +335,24 @@ export async function putBenchmarkConfig(config) {
 
 export async function getBenchmarkConfig() {
   return withStore(SETTINGS_STORE, 'readonly', (store) => store.get(BENCHMARK_CONFIG));
+}
+
+/// { mode: 'auto'|'manual', plannedSteps, effort, sampleEvery, samplePrompt,
+///   sampleWords }
+///
+/// The Training tab's own settings, previously DOM-only: they reset to
+/// the markup's hardcoded defaults on every reload, which is the gap
+/// meant here — in particular `plannedSteps`, which since the schedule
+/// rework is the project's planned length, not a per-run number, and is
+/// worth even less lost on a reload than the others.
+export async function putTrainingPlanSettings(settings) {
+  const record = { ...settings, id: TRAINING_PLAN_SETTINGS, savedAt: Date.now() };
+  await withStore(SETTINGS_STORE, 'readwrite', (store) => store.put(record));
+  return record;
+}
+
+export async function getTrainingPlanSettings() {
+  return withStore(SETTINGS_STORE, 'readonly', (store) => store.get(TRAINING_PLAN_SETTINGS));
 }
 
 // --- Run history -------------------------------------------------------

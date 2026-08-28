@@ -352,6 +352,22 @@ async function syncAllSources() {
   await refreshPlan();
 }
 
+/// Pull each source's current sample count from the wasm corpus and
+/// write it back to SOURCES_STORE, so "which sources has training
+/// actually drawn from" survives a reload. Best effort — storage or
+/// worker trouble here must not interrupt anything this isn't for.
+async function flushSourceSampleCounts() {
+  if (!model) return;
+  try {
+    const { sources: stats } = await call('corpus-source-stats');
+    for (const { id, sampled } of stats) {
+      db.updateSourceStats(id, { timesSampled: sampled }).catch(() => {});
+    }
+  } catch (error) {
+    /* best effort */
+  }
+}
+
 /// Say when the same text is loaded twice.
 ///
 /// A duplicate is trained on twice, which weights that script double and
@@ -930,6 +946,13 @@ async function syncSource(source) {
       isHtml: source.kind === 'url',
     });
     if (result && result.model) renderModel(result.model);
+    // The corpus this source just joined is a fresh one — its own count
+    // of how many training windows have come from this source starts at
+    // 0 regardless of what happened before a reload. Hand back whatever
+    // was persisted last time, if anything.
+    if (source.timesSampled) {
+      call('set-source-sample-count', { id: source.id, count: source.timesSampled }).catch(() => {});
+    }
     return true;
   } catch (error) {
     return false;
@@ -1807,6 +1830,24 @@ function applyTrainMode() {
 $('train-mode').addEventListener('change', applyTrainMode);
 applyTrainMode();
 
+/// Everything on this tab that used to reset to the markup's hardcoded
+/// defaults on every reload. Written through on change, loaded back at
+/// startup (see `start()`) — the same immediately-applied pattern the
+/// other Settings-tab controls already use.
+async function persistTrainingPlanSettings() {
+  await db.putTrainingPlanSettings({
+    mode: $('train-mode').value,
+    plannedSteps: Number($('train-steps').value) || 0,
+    effort: $('train-effort').value,
+    sampleToggle: $('sample-toggle').checked,
+    sampleEvery: Number($('sample-every').value) || 0,
+    samplePrompt: $('sample-prompt').value,
+  });
+}
+for (const id of ['train-mode', 'train-steps', 'train-effort', 'sample-toggle', 'sample-every', 'sample-prompt']) {
+  $(id).addEventListener('change', persistTrainingPlanSettings);
+}
+
 onStream('bench-progress', ({ stage, dispatchesPerSubmit }) => {
   if (!benchmarking || stage !== 'chunk') return;
   $('machine-profile-text').textContent =
@@ -2267,6 +2308,7 @@ async function autosave(step, { force = false, bytes: given = null } = {}) {
     $('autosave-status').textContent =
       `Last save: step ${step.toLocaleString()}` +
       (wroteFile ? ` — ${autosaveHandle.name} and this browser.` : ' — this browser.');
+    flushSourceSampleCounts();
   } catch (error) {
     console.warn('[scriptonait] auto-save failed', error);
     $('autosave-status').textContent = `Save failed at step ${step.toLocaleString()}: ${(error && error.message) || error}`;
@@ -2274,6 +2316,41 @@ async function autosave(step, { force = false, bytes: given = null } = {}) {
     autosaveInFlight = false;
   }
 }
+
+// --- Crash resilience ---------------------------------------------------
+//
+// The step-interval autosave above only catches steps at its own
+// cadence — a run stopped 400 steps after its last save loses those 400
+// if the tab dies before the next one. That's exactly what happened
+// switching to another site while training: the tab went to the
+// background and the browser reclaimed it before the next interval hit.
+// Saving whenever the tab is hidden or about to unload closes most of
+// that window; it can't do anything for a hard OS-level kill (nothing
+// downstream of that can, mid-write or not), but it turns "however many
+// steps since the last thousand-step checkpoint" into "however many
+// steps since you last switched away."
+
+let lastCrashSaveAt = 0;
+
+function saveBeforeTabDisappears() {
+  const now = performance.now();
+  // A tab can fire visibilitychange repeatedly in quick succession
+  // (switching tabs back and forth); this isn't a save worth repeating
+  // more than about once per ten seconds.
+  if (now - lastCrashSaveAt < 10_000) return;
+  if (!autosaveEnabled || !model || autosaveInFlight) return;
+  lastCrashSaveAt = now;
+  // `force` only bypasses autosave()'s step-count throttle, not its
+  // enabled check — already made above — so this still honors the
+  // Settings-tab toggle.
+  autosave(model.step, { force: true });
+  flushSourceSampleCounts();
+}
+
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'hidden') saveBeforeTabDisappears();
+});
+window.addEventListener('pagehide', saveBeforeTabDisappears);
 
 $('autosave-file-btn').addEventListener('click', async () => {
   if (!autosaveSupported()) {
@@ -2388,6 +2465,20 @@ async function restoreModel() {
     }
   } catch (error) {
     console.warn('[scriptonait] could not read benchmark settings', error);
+  }
+  try {
+    const planSettings = await db.getTrainingPlanSettings();
+    if (planSettings) {
+      $('train-mode').value = planSettings.mode === 'manual' ? 'manual' : 'auto';
+      if (planSettings.plannedSteps > 0) $('train-steps').value = String(planSettings.plannedSteps);
+      if (planSettings.effort) $('train-effort').value = planSettings.effort;
+      $('sample-toggle').checked = !!planSettings.sampleToggle;
+      if (planSettings.sampleEvery > 0) $('sample-every').value = String(planSettings.sampleEvery);
+      if (planSettings.samplePrompt) $('sample-prompt').value = planSettings.samplePrompt;
+      applyTrainMode();
+    }
+  } catch (error) {
+    console.warn('[scriptonait] could not read training-plan settings', error);
   }
 
   // Guidance first, before anything that can be slow. Reading saved
