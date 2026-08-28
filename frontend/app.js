@@ -117,7 +117,7 @@ const $ = (id) => document.getElementById(id);
 //
 // One bar, at the top of the page, for every transient notice: errors,
 // confirmations, training events. Persistent data that belongs to a
-// specific tab (the plan, the best-model line, the machine profile)
+// specific tab (the plan, the machine profile)
 // stays inline in that tab instead of passing through here — this bar is
 // for things that happened once and should be acknowledged and
 // forgotten.
@@ -1096,19 +1096,45 @@ const validationHistory = [];
 /// comparison, and the distance between it and the amber one is the
 /// only gap worth reading.
 const probeHistory = [];
+/// The step/loss/held-out/tokens-per-second line, drawn onto the chart
+/// itself by drawLossChart rather than kept as separate DOM text.
+let chartStats = '';
+
+/// What the most recent step's batch actually trained on, by title —
+/// which sources, since a batch can (and, thanks to the source rotation,
+/// usually does) draw from several different ones per step, not the same
+/// document run after run.
+function describeBatchSources(ids) {
+  if (!ids || ids.length === 0) return '';
+  const titles = [...new Set(ids)].map((id) => {
+    const source = sources.find((s) => s.id === id);
+    return source ? source.title : id;
+  });
+  const shown = titles.slice(0, 3).join(', ');
+  const rest = titles.length > 3 ? ` +${titles.length - 3} more` : '';
+  return `Training on: ${shown}${rest}`;
+}
 
 onStream('train-progress', (progress) => {
   setProgress('train-progress-bar', progress.fractionDone);
-  const on = model && model.device ? ` · on ${model.device}` : '';
+  const on = model && model.device ? ` on ${model.device}` : '';
   // Held-out loss is the one that says whether it is learning the
   // language or the sample, so it sits next to the training loss.
   const held =
     typeof progress.validationLoss === 'number'
       ? ` · held-out ${progress.validationLoss.toFixed(3)}`
       : '';
-  $('train-stats').textContent =
+  // Drawn onto the chart itself (see drawLossChart) rather than as a
+  // separate line of text — the chart is the thing being read while
+  // this updates, so the numbers belong where the eye already is.
+  chartStats =
     `step ${progress.step.toLocaleString()} · loss ${progress.smoothedLoss.toFixed(3)}${held} · ` +
-    `${progress.tokensPerSecond.toFixed(0)} tokens/s · ${formatDuration(progress.elapsedSeconds)} elapsed${on}`;
+    `${progress.tokensPerSecond.toFixed(0)} tokens/s${on}`;
+  // Once real numbers are flowing they live on the chart; leaving the
+  // last one-off status message ("Starting…") sitting above it would
+  // just be a stale leftover.
+  $('train-stats').textContent = '';
+  $('train-window').textContent = describeBatchSources(progress.sources);
   setTitleProgress('Fine-tuning', progress.fractionDone);
   lossHistory.push(progress.smoothedLoss);
   if (
@@ -1129,76 +1155,6 @@ onStream('train-progress', (progress) => {
 // event, so the box holds this card and nothing else no matter what was
 // in it before. Never append - a stack of stale samples buries the only
 // one worth reading, which is the current one.
-// What the held-out curve is saying to do about the corpus. It appears
-// when the numbers earn it and stays until the next run.
-// A new best held-out loss: keep a copy of this model, because training
-// continues past it and the last model of a run is usually not its best.
-let bestSaveInFlight = false;
-onStream('train-best', async ({ step, validationLoss }) => {
-  if (bestSaveInFlight || !model) return;
-  bestSaveInFlight = true;
-  try {
-    const { bytes } = await call('export-checkpoint');
-    await db.putBestModel({ bytes, step, params: model.params, validationLoss });
-    console.info(
-      `[scriptonait] kept the best model so far (held-out ${validationLoss.toFixed(3)} ` +
-        `at step ${step.toLocaleString()})`,
-    );
-    renderBestModel({ step, validationLoss });
-  } catch (error) {
-    console.warn('[scriptonait] could not keep the best model:', error);
-  } finally {
-    bestSaveInFlight = false;
-  }
-});
-
-/// Show what the best kept model is, and offer to go back to it.
-function renderBestModel(best) {
-  const row = $('best-model');
-  if (!best) {
-    row.hidden = true;
-    return;
-  }
-  // A "best" a few hundred steps back, while the curve is still falling
-  // steeply, is the measurement wobbling rather than a model worth
-  // going back to — and the button beside this offers to throw away
-  // real training for it. So the line says which of the two it is.
-  const behind = model ? model.step - best.step : 0;
-  const early = model && model.step > 0 && behind > 0 && behind < 500;
-  $('best-model-text').textContent =
-    `Best so far: held-out ${best.validationLoss.toFixed(3)} at step ` +
-    `${best.step.toLocaleString()}` +
-    (behind > 0 ? `, ${behind.toLocaleString()} steps back` : '') +
-    (early
-      ? ' — close enough to now that it is probably the measurement wobbling, not a better model.'
-      : '.');
-  row.hidden = false;
-}
-
-$('restore-best-btn').addEventListener('click', async () => {
-  const best = await db.getBestModel();
-  if (!best) return;
-  // What this costs has to be on the button, not discovered afterwards.
-  // The snapshot is weights only: the Adam moments are three times the
-  // size of the model and keeping a copy of them per snapshot is the
-  // kind of memory pressure that has already cost somebody a run. So a
-  // restore resumes with the optimizer reset, the loss steps up, and it
-  // takes a few hundred steps to get the momentum back.
-  const behind = model ? model.step - best.step : 0;
-  if (!confirm(
-    `Go back to the model from step ${best.step.toLocaleString()}?` +
-      (behind > 0 ? ` This discards the last ${behind.toLocaleString()} steps` : ' This') +
-      ' and resets the optimizer state.',
-  )) {
-    return;
-  }
-  setModelStatus('loading', 'Restoring the best model…');
-  renderModel(await call('load-model', { bytes: best.bytes }, [], 0));
-  await syncAllSources();
-  await saveModel();
-  console.info('[scriptonait] restored the best model');
-});
-
 // --- The training plan -------------------------------------------------
 //
 // Loss and step count say what is happening; the plan says what it means
@@ -1916,11 +1872,12 @@ async function persistTrainingPlanSettings() {
     sampleEvery: Number($('sample-every').value) || 0,
     samplePrompt: $('sample-prompt').value,
     boundarySampleRate: Number($('opening-rate').value) / 100,
+    metricsEvery: Number($('metrics-every').value) || 0,
   });
 }
 for (const id of [
   'train-mode', 'train-steps', 'train-effort', 'sample-toggle', 'sample-every', 'sample-prompt',
-  'opening-rate',
+  'opening-rate', 'metrics-every',
 ]) {
   $(id).addEventListener('change', persistTrainingPlanSettings);
 }
@@ -2070,6 +2027,7 @@ $('train-btn').addEventListener('click', async () => {
         repetitionPenalty: Number($('opt-repetition').value),
       },
       autosaveFrequencySteps,
+      metricsEvery: Number($('metrics-every').value) || 0,
     }, [], 0);
 
     if (result.stopReason === 'already-training') {
@@ -2131,15 +2089,44 @@ function drawLossChart() {
   const ctx = canvas.getContext('2d');
   const { width, height } = canvas;
   ctx.clearRect(0, 0, width, height);
+  ctx.font = '11px system-ui, sans-serif';
+
+  // A top band for the live numbers and the legend, so the step/loss/
+  // held-out/tokens-per-second line lives on the chart itself instead
+  // of as a separate paragraph competing for space above it.
+  const topBand = 28;
+  if (chartStats) {
+    ctx.fillStyle = '#c0caf5';
+    ctx.fillText(chartStats, 4, 12);
+  }
+  // Right-aligned by measured width rather than fixed offsets, so the
+  // three pieces get a real gap between them instead of guessing at
+  // how wide "· same windows" renders and overlapping when it's wider
+  // than guessed.
+  const legend = [
+    { text: 'held-out', colour: '#e0af68' },
+    { text: '· same windows', colour: '#7aa2f7' },
+    { text: 'training', colour: '#7aa2f7' },
+  ];
+  let legendX = width - 4;
+  for (const { text, colour } of legend) {
+    legendX -= ctx.measureText(text).width;
+    ctx.fillStyle = colour;
+    ctx.fillText(text, legendX, topBand - 4);
+    legendX -= 8;
+  }
+
   if (lossHistory.length < 2) return;
 
+  const plotTop = topBand;
   const points = lossHistory
     .concat(validationHistory.map((p) => p.loss))
     .concat(probeHistory.map((p) => p.loss));
   const min = Math.min(...points);
   const max = Math.max(...points);
   const span = max - min || 1;
-  const yFor = (loss) => height - ((loss - min) / span) * (height - 12) - 6;
+  const plotSpan = height - plotTop - 12;
+  const yFor = (loss) => height - ((loss - min) / span) * plotSpan - 6;
 
   ctx.strokeStyle = '#7aa2f7';
   ctx.lineWidth = 2;
@@ -2176,14 +2163,8 @@ function drawLossChart() {
   drawMeasured(validationHistory, '#e0af68', false);
 
   ctx.fillStyle = '#8891a8';
-  ctx.font = '11px system-ui, sans-serif';
-  ctx.fillText(max.toFixed(3), 4, 12);
+  ctx.fillText(max.toFixed(3), 4, plotTop + 12);
   ctx.fillText(min.toFixed(3), 4, height - 4);
-  ctx.fillStyle = '#7aa2f7';
-  ctx.fillText('training', width - 168, 12);
-  ctx.fillText('· same windows', width - 122, 12);
-  ctx.fillStyle = '#e0af68';
-  ctx.fillText('held-out', width - 52, 12);
 }
 
 // --- Saving and loading models ----------------------------------------
@@ -2318,13 +2299,12 @@ $('import-project-input').addEventListener('change', async (event) => {
     } else {
       // No checkpoint in this project file: the old model belongs to
       // the project just replaced, not this one — leaving it in
-      // IndexedDB would offer to "Restore" a best model, or resume an
-      // auto-save mode's rotating snapshots, from a project that's gone.
+      // IndexedDB would resume an auto-save mode's rotating snapshots
+      // from a project that's gone.
       await db.clearModels();
       model = null;
       setModelStatus('absent', 'No model yet.');
       $('model-details').replaceChildren();
-      $('best-model').hidden = true;
     }
 
     // A full replace, not a merge: refreshSources only ever adds sources
@@ -2466,6 +2446,31 @@ async function writeModelToFile(bytes) {
 /// Skipped rather than queued when one is already in flight: an export
 /// pulls the weights off the GPU, and stacking two of those is the exact
 /// thing that exhausted the heap and lost a model in the first place.
+/// Export a checkpoint, retrying briefly if the GPU was busy with a
+/// training step at the exact moment this asked for it.
+///
+/// The refusal itself is deliberate (see `acquire()` on the wasm side):
+/// nothing should poll forever waiting for training to let go of the
+/// device. But for an autosave — the thing crash-resilience depends on —
+/// giving up after exactly one attempt turns "the model was mid-step"
+/// into "this save never happened", and the collision is common at step
+/// 0 specifically, the one step slow enough to matter (it pays for
+/// allocating every GPU training buffer). A handful of short retries
+/// covers that without ever blocking indefinitely.
+async function exportCheckpointWithRetry() {
+  const maxAttempts = 6;
+  const delayMs = 700;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      return (await call('export-checkpoint', {}, [], 0)).bytes;
+    } catch (error) {
+      const busy = error && typeof error.message === 'string' && error.message.includes('already busy');
+      if (!busy || attempt === maxAttempts) throw error;
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
+    }
+  }
+}
+
 async function autosave(step, { force = false, bytes: given = null } = {}) {
   if (!autosaveEnabled && !force) return;
   if (autosaveInFlight) return;
@@ -2477,7 +2482,7 @@ async function autosave(step, { force = false, bytes: given = null } = {}) {
     // During a run the worker exports between slices and hands the
     // bytes over, because asking for them from here means asking while
     // a training step is running — and both take the same GPU guard.
-    const bytes = given || (await call('export-checkpoint', {}, [], 0)).bytes;
+    const bytes = given || (await exportCheckpointWithRetry());
     // Keep whatever optimizer state is already stored rather than
     // writing null over it.
     //
@@ -2696,6 +2701,7 @@ async function applyLoadedSettings() {
       if (typeof planSettings.boundarySampleRate === 'number') {
         $('opening-rate').value = String(Math.round(planSettings.boundarySampleRate * 100));
       }
+      if (planSettings.metricsEvery > 0) $('metrics-every').value = String(planSettings.metricsEvery);
     }
   } catch (error) {
     console.warn('[scriptonait] could not read training-plan settings', error);
@@ -2723,12 +2729,6 @@ async function applyLoadedSettings() {
   setModelStatus('absent', 'No model yet.');
   updateGuidance();
   await restoreModel();
-  try {
-    const best = await db.getBestModel();
-    if (best) renderBestModel(best);
-  } catch (error) {
-    console.warn('[scriptonait] could not read the best model:', error);
-  }
   updateGuidance();
   // What to do next, before anything has been trained: with a model and
   // a corpus already restored from the last visit, the plan is readable

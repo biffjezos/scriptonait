@@ -214,11 +214,6 @@ export async function updateSourceStats(id, changes) {
 // own tokenizer and shape, so nothing else has to be stored beside it.
 
 const CURRENT_MODEL = 'current';
-/// The model with the lowest held-out loss the run has seen. Training
-/// past its own best is normal - the best model of a run is rarely its
-/// last - so the best one is kept separately and never overwritten by a
-/// later, worse one.
-const BEST_MODEL = 'best';
 
 export async function putModel({ bytes, step, params, optimizer = null }) {
   // The optimizer's moment buffers ride along with the weights: a model
@@ -237,30 +232,11 @@ export async function deleteModel() {
   await withStore(MODELS_STORE, 'readwrite', (store) => store.delete(CURRENT_MODEL));
 }
 
-/// Every stored model record — current, best, and every auto-save
-/// snapshot. A New Project's job: leaving any of these behind means the
-/// next project's Overview offers to "Restore" a best model, or an
-/// auto-save mode picks up rotating snapshots, from a project that's
-/// gone.
+/// Every stored model record — current, and every auto-save snapshot. A
+/// New Project's job: leaving any of these behind means an auto-save
+/// mode picks up rotating snapshots from a project that's gone.
 export async function clearModels() {
   await withStore(MODELS_STORE, 'readwrite', (store) => store.clear());
-}
-
-export async function putBestModel({ bytes, step, params, validationLoss }) {
-  const record = {
-    id: BEST_MODEL,
-    bytes,
-    step,
-    params,
-    validationLoss,
-    savedAt: Date.now(),
-  };
-  await withStore(MODELS_STORE, 'readwrite', (store) => store.put(record));
-  return record;
-}
-
-export async function getBestModel() {
-  return withStore(MODELS_STORE, 'readonly', (store) => store.get(BEST_MODEL));
 }
 
 /// Auto-save's "Add" mode: a rolling set of recent snapshots instead of
@@ -365,7 +341,7 @@ export async function getBenchmarkConfig() {
 }
 
 /// { mode: 'auto'|'manual', plannedSteps, effort, sampleEvery, samplePrompt,
-///   sampleWords, boundarySampleRate }
+///   sampleWords, boundarySampleRate, metricsEvery }
 ///
 /// The Training tab's own settings, previously DOM-only: they reset to
 /// the markup's hardcoded defaults on every reload, which is the gap
@@ -378,6 +354,10 @@ export async function getBenchmarkConfig() {
 /// due in its rotation — see `Corpus::boundary_sample_rate`. Missing on
 /// a project saved before this setting existed, which callers treat as
 /// the wasm side's own default.
+///
+/// `metricsEvery` is the step interval for measuring held-out loss and
+/// recording a Metrics row — see worker.js's `VALIDATE_EVERY`. Missing
+/// or 0 falls back to that default, the same as `boundarySampleRate`.
 export async function putTrainingPlanSettings(settings) {
   const record = { ...settings, id: TRAINING_PLAN_SETTINGS, savedAt: Date.now() };
   await withStore(SETTINGS_STORE, 'readwrite', (store) => store.put(record));

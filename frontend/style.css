@@ -675,14 +675,6 @@ select {
   color: var(--accent, #e0af68);
 }
 
-/* The best model a run has produced, and the way back to it. */
-.best-model {
-  display: flex;
-  align-items: center;
-  gap: 0.75rem;
-  margin-top: 0.5rem;
-}
-
 /* --- Run history ------------------------------------------------------
    A training run is hours of numbers that scroll past once. This is
    where they stop scrolling past. */
