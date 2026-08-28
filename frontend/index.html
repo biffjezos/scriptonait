@@ -103,8 +103,7 @@
           <input type="checkbox" id="sample-toggle" /> Sample every
         </label>
         <input type="number" id="sample-every" value="50" min="1" max="100000" />
-        <span class="hint">steps, from:</span>
-        <input type="text" id="sample-prompt" value="Write a 40 word scene." />
+        <span class="hint">steps</span>
       </div>
 
       <details class="advanced" open>
@@ -192,39 +191,6 @@
 
       <pre id="output" class="output" hidden></pre>
       <div id="qa-notes" class="qa-notes" hidden></div>
-
-      <details class="advanced">
-        <summary>Sampling Settings</summary>
-        <div class="settings-grid">
-          <label>Temperature
-            <input type="number" id="opt-temperature" value="0.9" min="0" max="2" step="0.05" />
-          </label>
-          <label>Top-k
-            <input type="number" id="opt-top-k" value="40" min="0" max="500" />
-          </label>
-          <label>Top-p
-            <input type="number" id="opt-top-p" value="0.95" min="0.05" max="1" step="0.01" />
-          </label>
-          <label>Min-p
-            <input type="number" id="opt-min-p" value="0.05" min="0" max="1" step="0.01" />
-          </label>
-          <label>Repetition penalty
-            <input type="number" id="opt-repetition" value="1.1" min="1" max="2" step="0.05" />
-          </label>
-          <label>Seed
-            <input type="number" id="opt-seed" value="0" min="0" />
-          </label>
-          <label>Length
-            <select id="opt-length-mode">
-              <option value="continuous" selected>Continuous</option>
-              <option value="limit">Limit to</option>
-            </select>
-          </label>
-          <label>Max tokens
-            <input type="number" id="opt-max-tokens" value="200" min="1" max="8192" disabled />
-          </label>
-        </div>
-      </details>
     </section>
 
     <section class="tab-panel" id="tab-settings" hidden>
@@ -305,7 +271,7 @@
       </details>
 
       <details class="advanced" open>
-        <summary>Device</summary>
+        <summary>Inference</summary>
         <div class="settings-grid">
           <label>Training
             <select id="training-device">
@@ -318,6 +284,33 @@
               <option value="gpu" selected>GPU</option>
               <option value="cpu">CPU</option>
             </select>
+          </label>
+          <label>Temperature
+            <input type="number" id="opt-temperature" value="0.9" min="0" max="2" step="0.05" />
+          </label>
+          <label>Top-k
+            <input type="number" id="opt-top-k" value="40" min="0" max="500" />
+          </label>
+          <label>Top-p
+            <input type="number" id="opt-top-p" value="0.95" min="0.05" max="1" step="0.01" />
+          </label>
+          <label>Min-p
+            <input type="number" id="opt-min-p" value="0.05" min="0" max="1" step="0.01" />
+          </label>
+          <label>Repetition penalty
+            <input type="number" id="opt-repetition" value="1.1" min="1" max="2" step="0.05" />
+          </label>
+          <label>Seed
+            <input type="number" id="opt-seed" value="0" min="0" />
+          </label>
+          <label>Length
+            <select id="opt-length-mode">
+              <option value="continuous" selected>Continuous</option>
+              <option value="limit">Limit to</option>
+            </select>
+          </label>
+          <label>Max tokens
+            <input type="number" id="opt-max-tokens" value="200" min="1" max="8192" disabled />
           </label>
         </div>
       </details>
