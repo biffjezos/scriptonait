@@ -1000,20 +1000,6 @@ $('file-input').addEventListener('change', async (event) => {
   );
 });
 
-$('add-url-btn').addEventListener('click', async () => {
-  const url = $('url-input').value.trim();
-  if (!url) return;
-  try {
-    const response = await fetch(url);
-    if (!response.ok) throw new Error(`the server answered ${response.status}`);
-    const text = await response.text();
-    await addSources([{ title: url, kind: 'url', read: () => text, sourceUrl: url }]);
-    $('url-input').value = '';
-  } catch (error) {
-    showError(`couldn't fetch that URL (${error.message}). Most sites block cross-origin fetches — paste the text instead.`);
-  }
-});
-
 // --- Fine-tuning -------------------------------------------------------
 
 const lossHistory = [];

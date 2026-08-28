@@ -122,8 +122,12 @@ function newId() {
 }
 
 // --- Sources -----------------------------------------------------------
-// A source: { id, title, kind: 'url'|'file'|'paste', rawText, sourceUrl,
-//             tags, createdAt, updatedAt }
+// A source: { id, title, kind: 'file'|'paste', rawText, sourceUrl, tags,
+//             createdAt, updatedAt }
+//
+// `kind: 'url'` no longer gets created (URL fetch was removed), but a
+// record written by an older version can still carry it, and `sourceUrl`
+// stays in the shape so those records still load.
 //
 // Genre/tone tagging is gone: the model takes a real instruction (form,
 // length, subject, what to echo) parsed from the prompt itself, which is
