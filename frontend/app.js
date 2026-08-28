@@ -292,10 +292,6 @@ function updateGuidance() {
     `gradients add up. ${batch}${where} x ${context} = ` +
     `${(batch * context).toLocaleString()} tokens per step.`;
 
-  $('train-btn').textContent = model
-    ? (model.pretrained ? 'Keep training on my writing' : 'Keep training this model')
-    : 'Train a model on my writing';
-
   const explains = $('train-explains');
   explains.textContent = !canTrain
     ? 'Training needs WebGPU. This browser did not give the page a GPU.'
@@ -310,17 +306,17 @@ function updateGuidance() {
   } else if (generating) {
     step.textContent = 'Writing…';
   } else if (!model && sources.length === 0) {
-    step.textContent = 'Step 1: add your writing.';
+    step.textContent = 'Add your writing in Corpus.';
   } else if (!model && !enoughText) {
     step.textContent = `Only ${formatCount(words)} characters. Add more, then train.`;
   } else if (!model) {
-    step.textContent = 'Step 2: train.';
+    step.textContent = 'Ready to train.';
   } else if (!canTrain) {
     step.textContent = 'No WebGPU here, so this model can write but not train.';
   } else if (model.step < 500) {
-    step.textContent = 'Barely trained. Keep training, or try step 3.';
+    step.textContent = 'Barely trained. Keep training, or generate in Inference.';
   } else {
-    step.textContent = 'Ready. Step 3: type a prompt.';
+    step.textContent = 'Ready. Type a prompt in Inference.';
   }
 
   renderMachineProfile();
@@ -371,8 +367,7 @@ async function reportDuplicates() {
       .slice(0, 3);
     showError(
       `${ids.length} source${ids.length === 1 ? ' is a copy' : 's are copies'} of another ` +
-        `(${titles.join(', ')}${ids.length > 3 ? ', …' : ''}). Training on a script twice ` +
-        'weights it double — remove the copies in step 1.',
+        `(${titles.join(', ')}${ids.length > 3 ? ', …' : ''}). Remove the copies in Corpus.`,
     );
   } catch (error) {
     console.warn('[scriptonait] duplicate check failed:', error);
@@ -908,18 +903,10 @@ function updateSourceSummary(list, note = '') {
     return;
   }
   const chars = list.reduce((sum, s) => sum + (s.rawText || '').length, 0);
-  // Sources live in two places: this list, which is the browser's, and
-  // the model's corpus, which is the wasm side's. Without a model the
-  // second one does not exist, so a file added now is in the list and
-  // nowhere else until a model is made — and any number computed from
-  // the corpus is about a corpus that no longer matches this list.
-  const seen = model
-    ? ''
-    : ' — no model yet, so none of this is in a corpus: make or open one and it is all handed over';
-  const saved = persistenceWorks ? '' : ' · not saved (storage unavailable)';
+  const saved = persistenceWorks ? '' : ' · not saved';
   stats.textContent =
     `${list.length} source${list.length === 1 ? '' : 's'}, ` +
-    `${formatCount(chars)} characters${seen}${saved}${note ? ` · ${note}` : ''}`;
+    `${formatCount(chars)} characters${saved}${note ? ` · ${note}` : ''}`;
 }
 
 /// Hand one source to the model. Best effort: with no model loaded this
@@ -1144,13 +1131,9 @@ $('restore-best-btn').addEventListener('click', async () => {
   // takes a few hundred steps to get the momentum back.
   const behind = model ? model.step - best.step : 0;
   if (!confirm(
-    `Go back to the model from step ${best.step.toLocaleString()}?\n\n` +
-      (behind > 0 ? `That discards the last ${behind.toLocaleString()} steps. ` : '') +
-      'The snapshot holds the weights but not the optimizer state, so training resumes with ' +
-      "Adam's momentum reset — the loss will step up and take a few hundred steps to come " +
-      'back down.\n\nWorth it when a run has genuinely gone past its best. Early in a run, ' +
-      'when both curves are still falling steeply, a "best" a few hundred steps back is ' +
-      'usually just the measurement wobbling.',
+    `Go back to the model from step ${best.step.toLocaleString()}?` +
+      (behind > 0 ? ` This discards the last ${behind.toLocaleString()} steps` : ' This') +
+      ' and resets the optimizer state.',
   )) {
     return;
   }
@@ -1959,7 +1942,7 @@ $('train-btn').addEventListener('click', async () => {
           "your browser's flags.",
       );
     } else if (result.stopReason === 'no-data') {
-      showError('Not enough text to train on. Add more in step 1.');
+      showError('Not enough text to train on. Add more in Corpus.');
     } else {
       setProgress('train-progress-bar', 1);
       const loss = typeof result.loss === 'number' ? result.loss.toFixed(3) : '—';
@@ -2160,7 +2143,7 @@ async function saveModel() {
     console.warn('[scriptonait] could not save the model:', error);
     showError(
       `the model could not be saved (${(error && error.message) || error}). ` +
-        'It is still loaded — use "Save this model to a file" to keep it.',
+        'It is still loaded — use Save on Overview to keep it.',
     );
   }
 }
