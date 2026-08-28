@@ -56,6 +56,15 @@ pub struct Corpus {
     /// the training sampler has always had, and which the held-out
     /// sampler was missing.
     val_spans: Vec<(usize, usize)>,
+    /// How many training windows have been drawn from each source, by id.
+    ///
+    /// Keyed by id rather than by `order` index: the index shifts whenever
+    /// a source is added or removed, but a count belongs to the source, not
+    /// to a position in the list. Read by the frontend to show which
+    /// sources training has actually drawn from — useful for spotting a
+    /// source that's barely been sampled (or one worth removing before it
+    /// is).
+    sample_counts: HashMap<String, u64>,
     /// Every distinct word the sources use, built once and thrown away
     /// whenever a source changes. Generated text is measured against it
     /// (see `eval::text_stats`), and rebuilding it per measurement would
@@ -98,6 +107,7 @@ impl Corpus {
             spans: Vec::new(),
             val_cache: Vec::new(),
             val_spans: Vec::new(),
+            sample_counts: HashMap::new(),
             word_vocab: None,
             dirty: true,
             tokenizer: Tokenizer::byte_level(),
@@ -186,6 +196,7 @@ impl Corpus {
         let wrapped = tokenizer::wrap_with_boundaries(&tokens);
         if !self.sources.contains_key(id) {
             self.order.push(id.to_string());
+            self.sample_counts.entry(id.to_string()).or_insert(0);
         }
         self.cleaned_text.insert(id.to_string(), cleaned);
         self.sources.insert(id.to_string(), wrapped);
@@ -220,6 +231,7 @@ impl Corpus {
         if removed {
             self.order.retain(|existing| existing != id);
             self.cleaned_text.remove(id);
+            self.sample_counts.remove(id);
             self.dirty = true;
             self.word_vocab = None;
         }
@@ -266,11 +278,16 @@ impl Corpus {
             let held = (tokens.len() as f32 * VALIDATION_FRACTION) as usize;
             let split = tokens.len().saturating_sub(held);
             // A source too small to split at all stays entirely in
-            // training: half a scene is not a validation set.
+            // training: half a scene is not a validation set. Still push a
+            // (zero-length) val_span so `val_spans` stays index-aligned
+            // with `order`/`spans` — per-source reporting zips the three
+            // together and a skipped push here would misattribute every
+            // source after this one.
             if held < 32 || split < 32 {
                 self.boundaries.push(self.flat_cache.len());
                 self.spans.push((self.flat_cache.len(), tokens.len()));
                 self.flat_cache.extend_from_slice(tokens);
+                self.val_spans.push((self.val_cache.len(), 0));
                 continue;
             }
             self.boundaries.push(self.flat_cache.len());
@@ -339,6 +356,38 @@ impl Corpus {
         }
         totals.sort_by(|a, b| b.1.cmp(&a.1));
         totals
+    }
+
+    /// Per-source token counts and sample draws, for showing which
+    /// sources training has actually drawn from.
+    ///
+    /// `order`, `spans` and `val_spans` are kept index-aligned by
+    /// `rebuild_flat_if_needed` (a too-small-to-split source still gets a
+    /// zero-length `val_spans` entry), so zipping the three by index is
+    /// safe here.
+    pub fn per_source_stats(&mut self) -> Vec<SourceStats> {
+        self.rebuild_flat_if_needed();
+        self.order
+            .iter()
+            .zip(self.spans.iter())
+            .zip(self.val_spans.iter())
+            .map(|((id, &(_, train_tokens)), &(_, held_out_tokens))| SourceStats {
+                id: id.clone(),
+                train_tokens,
+                held_out_tokens,
+                sampled: self.sample_counts.get(id).copied().unwrap_or(0),
+            })
+            .collect()
+    }
+
+    /// Restore a sample count after a fresh page load re-upserts sources
+    /// into a new `Corpus` — the count belongs to the source, not to this
+    /// in-memory instance, so it has to be handed back in from wherever it
+    /// was persisted.
+    pub fn set_sample_count(&mut self, id: &str, count: u64) {
+        if self.sources.contains_key(id) {
+            self.sample_counts.insert(id.to_string(), count);
+        }
     }
 
     /// Tokens the training stream actually draws from, and the tokens
@@ -505,43 +554,50 @@ impl Corpus {
             return None;
         }
         // Sources long enough to hold a window, and where each one starts
-        // in the flat stream. A window is drawn from inside one source:
-        // the flat stream is a concatenation, and a window spanning the
-        // seam teaches the model that one script's last line is followed
-        // by another script's title page.
-        let usable: Vec<(usize, usize)> = self
+        // in the flat stream, and its `order` index (spans and order are
+        // kept index-aligned by `rebuild_flat_if_needed`) — needed to
+        // credit `sample_counts` to the right source. A window is drawn
+        // from inside one source: the flat stream is a concatenation, and
+        // a window spanning the seam teaches the model that one script's
+        // last line is followed by another script's title page.
+        let usable: Vec<(usize, usize, usize)> = self
             .spans
             .iter()
-            .copied()
-            .filter(|&(_, len)| len > context_len + 1)
+            .enumerate()
+            .filter(|&(_, &(_, len))| len > context_len + 1)
+            .map(|(order_idx, &(start, len))| (order_idx, start, len))
             .collect();
         if usable.is_empty() {
             return None;
         }
         // Weighted by length, so a corpus of one long script and one
         // short one samples in proportion to how much text each is.
-        let total: usize = usable.iter().map(|&(_, len)| len - context_len - 1).sum();
+        let total: usize = usable.iter().map(|&(_, _, len)| len - context_len - 1).sum();
 
         let mut inputs = Vec::with_capacity(batch_size * context_len);
         let mut targets = Vec::with_capacity(batch_size * context_len);
         for _ in 0..batch_size {
-            let start = if rng.next_f32() < BOUNDARY_ALIGNED_SAMPLE_RATE {
+            let (order_idx, start) = if rng.next_f32() < BOUNDARY_ALIGNED_SAMPLE_RATE {
                 // A window that starts where a source starts, so the model
                 // sees what an opening looks like - see the constant.
-                usable[rng.gen_range(usable.len())].0
+                let (order_idx, start, _) = usable[rng.gen_range(usable.len())];
+                (order_idx, start)
             } else {
                 let mut pick = rng.gen_range(total.max(1));
-                let mut chosen = usable[0].0;
-                for &(base, len) in &usable {
+                let mut chosen = (usable[0].0, usable[0].1);
+                for &(order_idx, base, len) in &usable {
                     let room = len - context_len - 1;
                     if pick < room {
-                        chosen = base + pick;
+                        chosen = (order_idx, base + pick);
                         break;
                     }
                     pick -= room;
                 }
                 chosen
             };
+            if let Some(id) = self.order.get(order_idx) {
+                *self.sample_counts.entry(id.clone()).or_default() += 1;
+            }
             inputs.extend_from_slice(&self.flat_cache[start..start + context_len]);
             targets.extend_from_slice(&self.flat_cache[start + 1..start + 1 + context_len]);
         }
@@ -582,6 +638,16 @@ pub struct Batch {
     pub targets: Vec<u32>,
     pub batch_size: usize,
     pub context_len: usize,
+}
+
+/// One source's share of the corpus, and how much of it training has
+/// actually drawn from. See [`Corpus::per_source_stats`].
+#[derive(Debug)]
+pub struct SourceStats {
+    pub id: String,
+    pub train_tokens: usize,
+    pub held_out_tokens: usize,
+    pub sampled: u64,
 }
 
 #[cfg(test)]
@@ -689,6 +755,56 @@ mod tests {
             assert!(c.sample_batch(2, 32, &mut rng).is_some());
             assert!(c.sample_validation_batch(2, 32, &mut rng).is_some());
         }
+    }
+
+    #[test]
+    fn sample_counts_credit_the_right_source_and_sum_to_windows_drawn() {
+        let mut c = Corpus::new();
+        c.upsert("a", &"the quick brown fox jumps over the lazy dog ".repeat(20), false);
+        c.upsert("b", &"a wizard's job is to vex chumps quickly in fog ".repeat(20), false);
+        let mut rng = Rng::seed_from_u64(7);
+        let mut drawn = 0;
+        for _ in 0..25 {
+            drawn += c.sample_batch(4, 16, &mut rng).expect("should sample").batch_size;
+        }
+        let stats = c.per_source_stats();
+        assert_eq!(stats.len(), 2);
+        let total_sampled: u64 = stats.iter().map(|s| s.sampled).sum();
+        assert_eq!(total_sampled, drawn as u64);
+        // With 100 windows drawn from two comparably-sized sources, both
+        // should have been sampled at least once — a bug that always
+        // credited the first source (e.g. an off-by-one in the order
+        // index) would leave the other at zero.
+        assert!(stats.iter().all(|s| s.sampled > 0), "{stats:?}");
+    }
+
+    #[test]
+    fn set_sample_count_restores_a_persisted_value() {
+        let mut c = Corpus::new();
+        c.upsert("a", "hello world", false);
+        c.set_sample_count("a", 4_200);
+        assert_eq!(c.per_source_stats()[0].sampled, 4_200);
+        // A count for a source that no longer exists is dropped rather
+        // than resurrecting a phantom entry.
+        c.set_sample_count("nonexistent", 99);
+        assert!(c.per_source_stats().iter().all(|s| s.id != "nonexistent"));
+    }
+
+    #[test]
+    fn per_source_stats_stay_aligned_when_a_source_is_too_small_to_hold_out() {
+        // "a" is long enough to split into train/held-out; "b" is a few
+        // words, well under the 32-token floor, so it stays entirely in
+        // training. Before the val_spans fix this shifted every stat
+        // after "b" onto the wrong source.
+        let mut c = Corpus::new();
+        c.upsert("a", &"the cave and the fire and the shadows on the wall. ".repeat(200), false);
+        c.upsert("b", "too short to hold out", false);
+        c.upsert("c", &"the cave and the fire and the shadows on the wall. ".repeat(200), false);
+        let stats = c.per_source_stats();
+        let by_id = |id: &str| stats.iter().find(|s| s.id == id).unwrap();
+        assert_eq!(by_id("b").held_out_tokens, 0);
+        assert!(by_id("a").held_out_tokens > 0);
+        assert!(by_id("c").held_out_tokens > 0);
     }
 
     #[test]
