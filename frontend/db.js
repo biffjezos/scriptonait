@@ -365,7 +365,7 @@ export async function getBenchmarkConfig() {
 }
 
 /// { mode: 'auto'|'manual', plannedSteps, effort, sampleEvery, samplePrompt,
-///   sampleWords, boundarySampleRate }
+///   sampleWords, boundarySampleRate, metricsEvery }
 ///
 /// The Training tab's own settings, previously DOM-only: they reset to
 /// the markup's hardcoded defaults on every reload, which is the gap
@@ -378,6 +378,10 @@ export async function getBenchmarkConfig() {
 /// due in its rotation — see `Corpus::boundary_sample_rate`. Missing on
 /// a project saved before this setting existed, which callers treat as
 /// the wasm side's own default.
+///
+/// `metricsEvery` is the step interval for measuring held-out loss and
+/// recording a Metrics row — see worker.js's `VALIDATE_EVERY`. Missing
+/// or 0 falls back to that default, the same as `boundarySampleRate`.
 export async function putTrainingPlanSettings(settings) {
   const record = { ...settings, id: TRAINING_PLAN_SETTINGS, savedAt: Date.now() };
   await withStore(SETTINGS_STORE, 'readwrite', (store) => store.put(record));

@@ -114,6 +114,11 @@ const VALIDATION_WINDOWS = 16;
 /// are measured now instead of one and the pair has to cost what the
 /// single noisy measurement did. At a five-thousand-step run that is
 /// still fifty points on the curve.
+///
+/// The default, not the only value — the Settings tab's own "Metrics
+/// every" field (see `train()`'s `metricsEvery` parameter) overrides it
+/// per run; this is what a run falls back to when that field is left at
+/// 0 or the setting predates this default's existence.
 const VALIDATE_EVERY = 100;
 
 /// Tokens that must have gone through the model before anything is said
@@ -993,7 +998,7 @@ function recordEvent(step, kind, text, extra = {}) {
 
 async function train({
   batchSize, learningRate, maxSteps, effort, sampleEvery, samplePrompt, sampleWords, sampling,
-  autosaveFrequencySteps,
+  autosaveFrequencySteps, metricsEvery,
 }) {
   const autosaveEvery = autosaveFrequencySteps > 0 ? autosaveFrequencySteps : AUTOSAVE_EVERY_STEPS;
   stopRequested = false;
@@ -1045,10 +1050,13 @@ async function train({
   let nextSampleAt = llm.step() + (sampleEvery || 0);
   // Held-out loss on the same cadence as the loss chart's own reporting:
   // often enough to see the two curves separate, rare enough that its
-  // forward passes are a rounding error against training.
-  const validateEvery = VALIDATE_EVERY;
+  // forward passes are a rounding error against training. A Settings-tab
+  // value overrides the default; 0 or missing falls back to it rather
+  // than turning measurement off — there is no "never" for this, since
+  // the plateau detector and the best-model tracker both depend on it.
+  const validateEvery = metricsEvery > 0 ? metricsEvery : VALIDATE_EVERY;
   log(
-    `held-out loss will be measured every ${VALIDATE_EVERY} steps on a fixed set of ` +
+    `held-out loss will be measured every ${validateEvery} steps on a fixed set of ` +
       `${VALIDATION_WINDOWS} windows (${VALIDATION_WINDOWS * info.context_len} tokens), the ` +
       'same windows each time — so two measurements differ only because the weights differ',
   );

@@ -1932,11 +1932,12 @@ async function persistTrainingPlanSettings() {
     sampleEvery: Number($('sample-every').value) || 0,
     samplePrompt: $('sample-prompt').value,
     boundarySampleRate: Number($('opening-rate').value) / 100,
+    metricsEvery: Number($('metrics-every').value) || 0,
   });
 }
 for (const id of [
   'train-mode', 'train-steps', 'train-effort', 'sample-toggle', 'sample-every', 'sample-prompt',
-  'opening-rate',
+  'opening-rate', 'metrics-every',
 ]) {
   $(id).addEventListener('change', persistTrainingPlanSettings);
 }
@@ -2086,6 +2087,7 @@ $('train-btn').addEventListener('click', async () => {
         repetitionPenalty: Number($('opt-repetition').value),
       },
       autosaveFrequencySteps,
+      metricsEvery: Number($('metrics-every').value) || 0,
     }, [], 0);
 
     if (result.stopReason === 'already-training') {
@@ -2712,6 +2714,7 @@ async function applyLoadedSettings() {
       if (typeof planSettings.boundarySampleRate === 'number') {
         $('opening-rate').value = String(Math.round(planSettings.boundarySampleRate * 100));
       }
+      if (planSettings.metricsEvery > 0) $('metrics-every').value = String(planSettings.metricsEvery);
     }
   } catch (error) {
     console.warn('[scriptonait] could not read training-plan settings', error);
