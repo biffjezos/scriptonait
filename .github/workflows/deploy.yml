@@ -20,7 +20,19 @@ on:
   # (wasm-app) this repo's dev sandbox has no way to build itself. Actual Pages deployment (the `deploy` job) is additionally
   # gated to dev/main/master only, so a work-in-progress branch gets
   # build validation without deploying to the live site.
+  #
+  # native-backend is excluded: it's dedicated to the native (non-wasm)
+  # GPU/executable work in native-probe.yml, which builds and validates
+  # an entirely different target (a Windows binary, not the website) -
+  # running the wasm/Pages pipeline there too would mean every push waits
+  # on a build this branch has no reason to care about. llm-core changes
+  # made here still get *some* coverage from native-probe.yml's own
+  # `cargo build` (llm-gpu depends on it), just not llm-core's own test
+  # suite - merge back to a branch this workflow covers before relying on
+  # that gap being closed.
   push:
+    branches-ignore:
+      - native-backend
   workflow_dispatch:
 
 permissions:
