@@ -1002,6 +1002,7 @@ async function train({
   llm.set_project_plan(maxSteps);
 
   const info = llm.info();
+  const startingPlan = JSON.parse(llm.training_plan());
   if (batchSize <= 1) {
     log(
       `training at batch size ${batchSize}: ${batchSize * info.context_len} tokens per step. ` +
@@ -1016,9 +1017,9 @@ async function train({
     contextLen: info.context_len,
     tokensPerStep: batchSize * info.context_len,
     dispatchesPerSubmit: llm.dispatches_per_submit(),
-    maxSteps: maxSteps || `until stopped (schedule shaped for ${plannedSteps})`,
+    maxSteps: maxSteps || `until stopped (schedule shaped for ${startingPlan.plannedSteps})`,
     startingAtStep: llm.step(),
-    peakLearningRate: JSON.parse(llm.training_plan()).peakLr,
+    peakLearningRate: startingPlan.peakLr,
     effort,
     learningRate: learningRate > 0 ? learningRate : 'automatic',
     plateauScale: llm.plateau_scale(),
@@ -1085,12 +1086,12 @@ async function train({
   {
     const plan = JSON.parse(llm.training_plan());
     recordEvent(llm.step(), 'run-started',
-      `run started: ${plannedSteps.toLocaleString()} steps, batch ${batchSize}, ` +
+      `run started: ${plan.plannedSteps.toLocaleString()} steps, batch ${batchSize}, ` +
       `${tokensPerStep.toLocaleString()} tokens/step, peak rate ${plan.peakLr.toExponential(2)}, ` +
       `warm-up ${plan.warmupSteps}, effort ${effort}`,
       {
         settings: {
-          plannedSteps, batchSize, tokensPerStep, effort,
+          plannedSteps: plan.plannedSteps, batchSize, tokensPerStep, effort,
           peakLr: plan.peakLr, warmupSteps: plan.warmupSteps,
           minLrRatio: plan.minLrRatio, weightDecay: plan.weightDecay,
           gradClip: plan.gradClip, plateauScale: plan.plateauScale,
