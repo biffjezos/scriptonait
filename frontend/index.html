@@ -157,16 +157,6 @@
         </div>
       </details>
 
-      <details class="advanced" id="live-controls-panel">
-        <summary>Live Controls</summary>
-        <div class="row" id="live-controls">
-          <label>Peak learning rate, live
-            <input type="number" id="live-lr" min="0" max="0.01" step="0.00001" />
-          </label>
-          <button id="live-lr-btn" type="button" class="secondary">Apply</button>
-          <button id="reset-schedule-btn" type="button" class="secondary">Undo Plateau Cut</button>
-        </div>
-      </details>
     </section>
 
     <section class="tab-panel" id="tab-inference" hidden>
@@ -240,6 +230,14 @@
           <label>KV heads <input type="number" id="cfg-kv-heads" value="2" min="1" max="16" /></label>
           <label>Context <input type="number" id="cfg-context" value="512" min="32" max="2048" step="32" /></label>
           <label>Attention window <input type="number" id="cfg-window" value="256" min="32" max="2048" step="32" /></label>
+        </div>
+
+        <div class="row" id="live-controls">
+          <label>Peak learning rate, live
+            <input type="number" id="live-lr" min="0" max="0.01" step="0.00001" />
+          </label>
+          <button id="live-lr-btn" type="button" class="secondary">Apply</button>
+          <button id="reset-schedule-btn" type="button" class="secondary">Undo Plateau Cut</button>
         </div>
       </details>
 
