@@ -341,7 +341,7 @@ export async function getBenchmarkConfig() {
 }
 
 /// { mode: 'auto'|'manual', plannedSteps, effort, sampleEvery,
-///   boundarySampleRate, metricsEvery }
+///   boundarySampleRate, metricsEvery, showTrainingWindow, trainingWindowChars }
 ///
 /// The Training tab's own settings, previously DOM-only: they reset to
 /// the markup's hardcoded defaults on every reload, which is the gap

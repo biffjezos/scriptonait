@@ -1102,12 +1102,14 @@ let chartStats = '';
 /// itself, not just which document, since a batch can (and, thanks to
 /// the source rotation, usually does) draw from several different ones
 /// per step, not the same document run after run.
-function describeBatchSources(draws) {
+function describeBatchSources(draws, maxChars) {
   if (!draws || draws.length === 0) return '';
+  const limit = maxChars > 0 ? maxChars : 200;
   const shown = draws.slice(0, 3).map((draw) => {
     const source = sources.find((s) => s.id === draw.id);
     const title = source ? source.title : draw.id;
-    const excerpt = (draw.excerpt || '').replace(/\s+/g, ' ').trim();
+    let excerpt = (draw.excerpt || '').replace(/\s+/g, ' ').trim();
+    if (excerpt.length > limit) excerpt = `${excerpt.slice(0, limit)}…`;
     return `${title}: "${excerpt}"`;
   });
   const rest = draws.length > 3 ? ` +${draws.length - 3} more` : '';
@@ -1133,7 +1135,10 @@ onStream('train-progress', (progress) => {
   // last one-off status message ("Starting…") sitting above it would
   // just be a stale leftover.
   $('train-stats').textContent = '';
-  $('train-window').textContent = describeBatchSources(progress.sources);
+  $('train-window').textContent =
+    $('show-training-window').value === 'off'
+      ? ''
+      : describeBatchSources(progress.sources, Number($('training-window-chars').value));
   setTitleProgress('Fine-tuning', progress.fractionDone);
   lossHistory.push(progress.smoothedLoss);
   if (
@@ -1901,11 +1906,13 @@ async function persistTrainingPlanSettings() {
     sampleEvery: Number($('sample-every').value) || 0,
     boundarySampleRate: Number($('opening-rate').value) / 100,
     metricsEvery: Number($('metrics-every').value) || 0,
+    showTrainingWindow: $('show-training-window').value !== 'off',
+    trainingWindowChars: Number($('training-window-chars').value) || 0,
   });
 }
 for (const id of [
   'train-mode', 'train-steps', 'train-effort', 'sample-toggle', 'sample-every',
-  'opening-rate', 'metrics-every',
+  'opening-rate', 'metrics-every', 'show-training-window', 'training-window-chars',
 ]) {
   $(id).addEventListener('change', persistTrainingPlanSettings);
 }
@@ -2782,6 +2789,12 @@ async function applyLoadedSettings() {
         $('opening-rate').value = String(Math.round(planSettings.boundarySampleRate * 100));
       }
       if (planSettings.metricsEvery > 0) $('metrics-every').value = String(planSettings.metricsEvery);
+      if (typeof planSettings.showTrainingWindow === 'boolean') {
+        $('show-training-window').value = planSettings.showTrainingWindow ? 'on' : 'off';
+      }
+      if (planSettings.trainingWindowChars > 0) {
+        $('training-window-chars').value = String(planSettings.trainingWindowChars);
+      }
     }
   } catch (error) {
     console.warn('[scriptonait] could not read training-plan settings', error);
