@@ -1865,7 +1865,12 @@ function applyTrainMode() {
   updateGuidance();
 }
 $('train-mode').addEventListener('change', applyTrainMode);
-applyTrainMode();
+// Not called eagerly here: it reaches into updateGuidance() ->
+// renderMachineProfile(), which reads module state (benchmarkAutoEnabled)
+// declared later in this file. Calling it at this point in top-level
+// module evaluation throws "Cannot access before initialization" on
+// every page load. start() calls it once, unconditionally, after every
+// module-level `let` above has run — see applyLoadedSettings().
 
 /// Everything on this tab that used to reset to the markup's hardcoded
 /// defaults on every reload. Written through on change, loaded back at
@@ -2595,11 +2600,13 @@ async function applyLoadedSettings() {
       $('sample-toggle').checked = !!planSettings.sampleToggle;
       if (planSettings.sampleEvery > 0) $('sample-every').value = String(planSettings.sampleEvery);
       if (planSettings.samplePrompt) $('sample-prompt').value = planSettings.samplePrompt;
-      applyTrainMode();
     }
   } catch (error) {
     console.warn('[scriptonait] could not read training-plan settings', error);
   }
+  // Unconditional: the Batch/Effort/Learning-rate disabled state has to
+  // be set correctly on every load, not only when saved settings exist.
+  applyTrainMode();
 }
 
 (async function start() {
