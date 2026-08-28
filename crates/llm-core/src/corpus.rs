@@ -10,19 +10,17 @@
 use std::collections::HashMap;
 
 use crate::prep::{self, PreparedStats};
-use crate::retrieval::{RetrievalIndex, RetrievedChunk};
 use crate::rng::Rng;
-use crate::screenplay::{self, StoryState};
 use crate::tokenizer::{self, Tokenizer};
 
 /// Fraction of sampled training windows that start exactly at a source's
 /// beginning (its BOS token) instead of a uniformly random offset. A
-/// control-tag preamble (see the frontend) or the story-state-derived
-/// framing only means anything to the model if it's consistently seen at
-/// the *start* of a window; pure uniform-random sampling would place it
-/// there only by chance, roughly `context_len` times less often than
-/// mid-window. The rest of the batch still samples uniformly so the model
-/// keeps seeing ordinary mid-document continuations too.
+/// control-tag preamble (see the frontend) only means anything to the
+/// model if it's consistently seen at the *start* of a window; pure
+/// uniform-random sampling would place it there only by chance, roughly
+/// `context_len` times less often than mid-window. The rest of the batch
+/// still samples uniformly so the model keeps seeing ordinary
+/// mid-document continuations too.
 const BOUNDARY_ALIGNED_SAMPLE_RATE: f32 = 0.4;
 
 /// Fraction of the corpus held out of training, to measure loss on text
@@ -34,8 +32,6 @@ const VALIDATION_FRACTION: f32 = 0.05;
 pub struct Corpus {
     sources: HashMap<String, Vec<u32>>,
     cleaned_text: HashMap<String, String>,
-    per_source_state: HashMap<String, StoryState>,
-    retrieval: RetrievalIndex,
     order: Vec<String>,
     flat_cache: Vec<u32>,
     /// Index into `flat_cache` of each source's first token (its BOS).
@@ -96,8 +92,6 @@ impl Corpus {
         Self {
             sources: HashMap::new(),
             cleaned_text: HashMap::new(),
-            per_source_state: HashMap::new(),
-            retrieval: RetrievalIndex::new(),
             order: Vec::new(),
             flat_cache: Vec::new(),
             boundaries: Vec::new(),
@@ -193,8 +187,6 @@ impl Corpus {
         if !self.sources.contains_key(id) {
             self.order.push(id.to_string());
         }
-        self.per_source_state.insert(id.to_string(), screenplay::extract_story_state(&cleaned));
-        self.retrieval.upsert_document(id, &cleaned);
         self.cleaned_text.insert(id.to_string(), cleaned);
         self.sources.insert(id.to_string(), wrapped);
         self.dirty = true;
@@ -206,10 +198,9 @@ impl Corpus {
     ///
     /// For the native trainer, which tokenizes a few tens of MB once
     /// ahead of time and then samples from it for hours. It skips the
-    /// retrieval index and the story-state scan that `upsert` builds —
-    /// those exist for the browser's Sources panel, and building them
-    /// over a whole pretraining corpus would cost far more memory than
-    /// the token stream itself.
+    /// per-source bookkeeping `upsert` does for the browser's Sources
+    /// panel, which would cost far more memory than the token stream
+    /// itself over a whole pretraining corpus.
     ///
     /// `tokens` is stored as given, so the caller owns the framing:
     /// `tokenizer::wrap_with_boundaries` for a plain document, or
@@ -228,9 +219,7 @@ impl Corpus {
         let removed = self.sources.remove(id).is_some();
         if removed {
             self.order.retain(|existing| existing != id);
-            self.retrieval.remove_document(id);
             self.cleaned_text.remove(id);
-            self.per_source_state.remove(id);
             self.dirty = true;
             self.word_vocab = None;
         }
@@ -251,34 +240,13 @@ impl Corpus {
     }
 
     /// The cleaned (HTML-stripped if applicable, whitespace-normalized)
-    /// text for a source, as used for both training and heuristic
-    /// screenplay-structure extraction.
+    /// text for a source, as used for training.
     pub fn cleaned_text(&self, id: &str) -> Option<&str> {
         self.cleaned_text.get(id).map(String::as_str)
     }
 
     pub fn source_ids(&self) -> impl Iterator<Item = &str> {
         self.order.iter().map(String::as_str)
-    }
-
-    /// Up to `k` scenes from the corpus most similar to `query` (TF-IDF
-    /// cosine similarity over `screenplay::split_into_scenes` chunks) —
-    /// useful as few-shot context prepended to a generation prompt.
-    pub fn retrieve(&self, query: &str, k: usize) -> Vec<RetrievedChunk> {
-        self.retrieval.top_k(query, k)
-    }
-
-    /// Characters/locations/scene-count tracked across every current
-    /// source, in first-seen (insertion) order. See `screenplay.rs` for
-    /// how this heuristic extraction works and its known limitations.
-    pub fn story_state(&self) -> StoryState {
-        let mut merged = StoryState::default();
-        for id in &self.order {
-            if let Some(state) = self.per_source_state.get(id) {
-                merged.merge(state);
-            }
-        }
-        merged
     }
 
     fn rebuild_flat_if_needed(&mut self) {
@@ -860,21 +828,6 @@ mod tests {
     }
 
     #[test]
-    fn story_state_aggregates_across_sources_and_updates_on_remove() {
-        let mut c = Corpus::new();
-        c.upsert("a", "INT. KITCHEN - DAY\n\nJANE\nHi.\n\nJANE\nStill here.", false);
-        c.upsert("b", "EXT. GARDEN - NIGHT\n\nJOHN\nBye.\n\nJOHN\nReally.", false);
-        let state = c.story_state();
-        assert_eq!(state.characters, vec!["JANE".to_string(), "JOHN".to_string()]);
-        assert_eq!(state.scene_count, 2);
-
-        c.remove("a");
-        let state = c.story_state();
-        assert_eq!(state.characters, vec!["JOHN".to_string()]);
-        assert_eq!(state.scene_count, 1);
-    }
-
-    #[test]
     fn cleaned_text_is_available_and_cleared_on_remove() {
         let mut c = Corpus::new();
         // Leading indentation is deliberately preserved (screenplay
@@ -884,24 +837,6 @@ mod tests {
         assert_eq!(c.cleaned_text("a"), Some("  Hello world"));
         c.remove("a");
         assert_eq!(c.cleaned_text("a"), None);
-    }
-
-    #[test]
-    fn retrieve_finds_similar_scenes_and_forgets_removed_sources() {
-        let mut c = Corpus::new();
-        c.upsert(
-            "spy",
-            "INT. SURVEILLANCE VAN - NIGHT\n\nAgents trace a wiretap through satellite relays.",
-            false,
-        );
-        c.upsert("romance", "INT. RESTAURANT - EVENING\n\nTwo friends share a quiet dinner.", false);
-
-        let results = c.retrieve("wiretap surveillance relays", 2);
-        assert!(!results.is_empty());
-        assert_eq!(results[0].source_id, "spy");
-
-        c.remove("spy");
-        assert!(c.retrieve("wiretap surveillance relays", 2).is_empty());
     }
 
     #[test]

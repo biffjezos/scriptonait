@@ -620,8 +620,6 @@ $('generate-btn').addEventListener('click', async () => {
       minP: Number($('opt-min-p').value),
       repetitionPenalty: Number($('opt-repetition').value),
       seed: Number($('opt-seed').value) || Math.floor(Math.random() * 1e9),
-      useStoryState: $('use-story-state').checked,
-      useRetrieval: $('use-retrieval').checked,
     }, [], 0);
     setProgress('generate-progress-bar', 1);
     const why = {
@@ -829,7 +827,6 @@ $('remove-all-btn').addEventListener('click', async () => {
       /* no model loaded: it was only ever in the list */
     }
   }
-  await refreshStoryState();
   await refreshPlan();
 });
 
@@ -839,8 +836,7 @@ async function removeSource(id) {
   await persist('deleting a source', () => db.deleteSource(id));
   try {
     renderModel(await call('remove-source', { id }));
-    await refreshStoryState();
-    await refreshPlan();
+      await refreshPlan();
   } catch (error) {
     /* no model loaded: it was only ever in the list */
   }
@@ -966,7 +962,6 @@ async function addSources(entries) {
   // caught up — and only for that, never for storage.
   await Promise.allSettled(syncing);
   renderSources();
-  await refreshStoryState();
   // The corpus just changed, so every number the plan is built from
   // did too. Without this the plan keeps reporting the corpus it was
   // last computed against.
@@ -986,33 +981,6 @@ async function addSources(entries) {
 // Across a few hundred sources these run to thousands of entries, and a
 // paragraph of comma-separated names tells nobody anything. Show the
 // first handful and count the rest.
-const MAX_NAMES_SHOWN = 25;
-
-function nameList(names) {
-  const shown = names.slice(0, MAX_NAMES_SHOWN);
-  const hidden = names.length - shown.length;
-  return escapeHtml(shown.join(', ')) + (hidden > 0 ? ` <span class="hint">+${hidden.toLocaleString()} more</span>` : '');
-}
-
-async function refreshStoryState() {
-  const box = $('story-state');
-  try {
-    const state = await call('story-state');
-    if (!state.characters.length && !state.locations.length) {
-      box.hidden = true;
-      return;
-    }
-    const parts = [];
-    if (state.characters.length) parts.push(`<strong>Characters:</strong> ${nameList(state.characters)}`);
-    if (state.locations.length) parts.push(`<strong>Locations:</strong> ${nameList(state.locations)}`);
-    if (state.sceneCount) parts.push(`<strong>Scenes:</strong> ${state.sceneCount}`);
-    box.innerHTML = `${parts.join('<br />')}<p class="hint">Found by looking at line shapes, not by understanding the text — unusual formatting can fool it.</p>`;
-    box.hidden = false;
-  } catch (error) {
-    box.hidden = true;
-  }
-}
-
 $('add-paste-btn').addEventListener('click', async () => {
   const text = $('paste-input').value.trim();
   if (!text) return;
@@ -1166,7 +1134,6 @@ $('restore-best-btn').addEventListener('click', async () => {
   setModelStatus('loading', 'Restoring the best model…');
   renderModel(await call('load-model', { bytes: best.bytes }, [], 0));
   await syncAllSources();
-  await refreshStoryState();
   await saveModel();
   console.info('[scriptonait] restored the best model');
 });
@@ -2089,8 +2056,7 @@ $('import-input').addEventListener('change', async (event) => {
     const buffer = await file.arrayBuffer();
     renderModel(await call('import-checkpoint', { bytes: buffer }, [buffer]));
     await syncAllSources();
-    await refreshStoryState();
-  } catch (error) {
+    } catch (error) {
     showError(`that file didn't load: ${error.message}`);
     setModelStatus('absent', 'No model loaded.');
   }
@@ -2307,8 +2273,7 @@ async function restoreModel() {
   try {
     renderModel(await call('load-model', { bytes: stored.bytes }, [], 0));
     await syncAllSources();
-    await refreshStoryState();
-    if (stored.optimizer) {
+      if (stored.optimizer) {
       // Momentum, so training continues where it left off instead of
       // restarting Adam from nothing.
       try {

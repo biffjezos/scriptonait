@@ -1610,28 +1610,8 @@ const handlers = {
     return describeModel();
   },
 
-  async 'story-state'() {
-    return {
-      characters: llm.story_characters() || [],
-      locations: llm.story_locations() || [],
-      sceneCount: llm.story_scene_count() || 0,
-      preamble: llm.story_state_preamble() || '',
-    };
-  },
-
-  async 'retrieve'({ query, k }) {
-    return { chunks: llm.retrieve_context(text(query, 'the query'), k || 3) };
-  },
-
   async generate(payload) {
-    let extraContext = payload.extraContext || '';
-    if (payload.useStoryState) {
-      extraContext = [extraContext, llm.story_state_preamble()].filter(Boolean).join(' ');
-    }
-    if (payload.useRetrieval) {
-      const retrieved = llm.retrieve_context_text(payload.prompt, 2);
-      if (retrieved) extraContext = [extraContext, retrieved].filter(Boolean).join(' ');
-    }
+    const extraContext = payload.extraContext || '';
     const result = await generate({
       ...payload,
       prompt: text(payload.prompt, 'the prompt'),

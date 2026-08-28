@@ -884,7 +884,7 @@ impl WasmLLM {
         instruct::LengthGuard::new(instruct::parse_prompt(&prompt).target_words).token_budget() as u32
     }
 
-    // --- Sources (fine-tuning, retrieval, story state) -------------------
+    // --- Sources -----------------------------------------------------
 
     /// Cleans and tokenizes `raw_text`, storing (or replacing, if `id`
     /// already exists) it as a source. `is_html` should be true for text
@@ -971,59 +971,13 @@ impl WasmLLM {
         self.0.borrow().gpu.is_some()
     }
 
-    pub fn story_characters(&self) -> Vec<String> {
-        self.0.borrow().corpus.story_state().characters
-    }
-
-    pub fn story_locations(&self) -> Vec<String> {
-        self.0.borrow().corpus.story_state().locations
-    }
-
-    pub fn story_scene_count(&self) -> u32 {
-        self.0.borrow().corpus.story_state().scene_count as u32
-    }
-
-    /// A short "Characters so far: ... / Locations so far: ..." block,
-    /// ready to pass as `extra_context`.
-    pub fn story_state_preamble(&self) -> String {
-        self.0.borrow().corpus.story_state().as_prompt_preamble()
-    }
-
-    /// Up to `k` scenes similar to `query`, each formatted as
-    /// `"[from: <source id> | score: <0-1>]\n<scene text>"` — for
-    /// display, not for the prompt.
-    pub fn retrieve_context(&self, query: String, k: u32) -> Vec<String> {
-        self.0
-            .borrow()
-            .corpus
-            .retrieve(&query, k as usize)
-            .into_iter()
-            .map(|c| format!("[from: {} | score: {:.2}]\n{}", c.source_id, c.score, c.text))
-            .collect()
-    }
-
-    /// The same retrieval as one block, ready to pass as
-    /// `extra_context`. Empty if nothing matched.
-    pub fn retrieve_context_text(&self, query: String, k: u32) -> String {
-        let inner = self.0.borrow();
-        inner
-            .corpus
-            .retrieve(&query, k as usize)
-            .into_iter()
-            .map(|c| c.text)
-            .collect::<Vec<_>>()
-            .join("\n\n")
-    }
-
     /// Runs `llm_core::qa::check_generated` against `text`, returning
     /// each note as `"[INFO] ..."`/`"[WARNING] ..."`.
     /// `target_word_count = 0` means "no target" (skips the length
     /// check).
     pub fn qa_check(&self, text: String, target_word_count: u32) -> Vec<String> {
-        let inner = self.0.borrow();
-        let known_state = inner.corpus.story_state();
         let target = if target_word_count == 0 { None } else { Some(target_word_count as usize) };
-        llm_core::qa::check_generated(&text, &known_state, target)
+        llm_core::qa::check_generated(&text, target)
             .into_iter()
             .map(|note| {
                 let prefix = match note.severity {

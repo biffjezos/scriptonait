@@ -4,8 +4,6 @@
 //! checks a human can read and act on. Not a quality judgement, just
 //! things worth a human's attention.
 
-use crate::screenplay::{self, StoryState};
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Severity {
     /// Purely informational — not necessarily a problem (e.g. "this
@@ -34,24 +32,6 @@ fn unbalanced_parens(text: &str) -> Option<QaNote> {
         })
     } else {
         None
-    }
-}
-
-fn new_characters(text: &str, known: &StoryState) -> Option<QaNote> {
-    let generated = screenplay::extract_story_state(text);
-    let new_names: Vec<&str> = generated
-        .characters
-        .iter()
-        .filter(|c| !known.characters.contains(c))
-        .map(String::as_str)
-        .collect();
-    if new_names.is_empty() {
-        None
-    } else {
-        Some(QaNote {
-            severity: Severity::Info,
-            message: format!("Introduces character(s) not seen in any source yet: {}.", new_names.join(", ")),
-        })
     }
 }
 
@@ -98,21 +78,14 @@ fn repetition_loop(text: &str) -> Option<QaNote> {
     None
 }
 
-/// Runs every heuristic check against `text` (freshly generated output),
-/// comparing against `known_state` (typically `Corpus::story_state()`,
-/// i.e. what's established across the training sources) and an optional
-/// rough target word count. Returns notes in a fixed, stable order;
-/// empty means nothing stood out.
-pub fn check_generated(text: &str, known_state: &StoryState, target_word_count: Option<usize>) -> Vec<QaNote> {
-    [
-        unbalanced_parens(text),
-        repetition_loop(text),
-        new_characters(text, known_state),
-        length_vs_target(text, target_word_count),
-    ]
-    .into_iter()
-    .flatten()
-    .collect()
+/// Runs every heuristic check against `text` (freshly generated output)
+/// and an optional rough target word count. Returns notes in a fixed,
+/// stable order; empty means nothing stood out.
+pub fn check_generated(text: &str, target_word_count: Option<usize>) -> Vec<QaNote> {
+    [unbalanced_parens(text), repetition_loop(text), length_vs_target(text, target_word_count)]
+        .into_iter()
+        .flatten()
+        .collect()
 }
 
 #[cfg(test)]
@@ -128,20 +101,6 @@ mod tests {
     fn unbalanced_parens_are_flagged() {
         let note = unbalanced_parens("CYPHER (V.O.\nHello.").unwrap();
         assert_eq!(note.severity, Severity::Warning);
-    }
-
-    #[test]
-    fn known_characters_are_not_flagged_as_new() {
-        let known = StoryState { characters: vec!["JANE".to_string()], ..Default::default() };
-        assert!(new_characters("JANE\nHello.", &known).is_none());
-    }
-
-    #[test]
-    fn unseen_characters_are_flagged_as_info() {
-        let known = StoryState { characters: vec!["JANE".to_string()], ..Default::default() };
-        let note = new_characters("JOHN\nHi Jane.\n\nJOHN\nStill me.", &known).unwrap();
-        assert_eq!(note.severity, Severity::Info);
-        assert!(note.message.contains("JOHN"));
     }
 
     #[test]
@@ -176,16 +135,14 @@ mod tests {
 
     #[test]
     fn check_generated_returns_empty_for_clean_text() {
-        let known = StoryState::default();
-        let notes = check_generated("A calm, ordinary scene with no issues.", &known, None);
+        let notes = check_generated("A calm, ordinary scene with no issues.", None);
         assert!(notes.is_empty());
     }
 
     #[test]
     fn check_generated_collects_multiple_notes() {
-        let known = StoryState::default();
         let text = "JOHN (V.O.\nHe walked in.\nHe walked in.\nHe walked in.";
-        let notes = check_generated(text, &known, None);
+        let notes = check_generated(text, None);
         assert!(notes.len() >= 2, "expected both a parens and a repetition note, got {notes:?}");
     }
 }
