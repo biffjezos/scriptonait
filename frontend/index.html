@@ -41,6 +41,20 @@
       <div class="row">
         <button id="export-btn" type="button" class="secondary">Save</button>
       </div>
+
+      <p id="overview-plan" class="stats" hidden></p>
+
+      <details class="advanced" id="overview-corpus-panel" open hidden>
+        <summary>Corpus</summary>
+        <div class="history-table-wrap">
+          <table class="history-table" id="overview-corpus-table">
+            <thead>
+              <tr><th>Source</th><th>Train tokens</th><th>Held out</th><th>Sampled</th></tr>
+            </thead>
+            <tbody id="overview-corpus-body"></tbody>
+          </table>
+        </div>
+      </details>
     </section>
 
     <section class="tab-panel" id="tab-corpus" hidden>

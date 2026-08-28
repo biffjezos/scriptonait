@@ -1188,6 +1188,7 @@ function renderPlan(plan) {
   // below, and no way to tell which is current.
   if (!model || !plan || !plan.phase) {
     box.hidden = true;
+    $('overview-plan').hidden = true;
     return;
   }
   $('plan-phase-title').textContent = plan.phase.title;
@@ -1244,6 +1245,8 @@ function renderPlan(plan) {
 
   $('plan-numbers').textContent = `Trained: ${progress.join(' · ')}`;
   $('plan-corpus').textContent = `Corpus: ${corpus.join(' · ')}`;
+  $('overview-plan').hidden = false;
+  $('overview-plan').textContent = `${plan.phase.title} — ${progress.join(' · ')}`;
 
   const list = $('plan-actions');
   list.replaceChildren();
@@ -1277,6 +1280,39 @@ async function refreshPlan() {
     renderPlan(await call('training-plan', { batchSize: chosenBatchSize() }));
   } catch (error) {
     console.warn('[scriptonait] could not build the training plan', error);
+  }
+  refreshCorpusStats();
+}
+
+/// Per-source token counts and how many times each has actually been
+/// sampled, on the Overview tab — updates on the same events refreshPlan
+/// does (a source added or removed, a model loaded or created), so it
+/// never shows a source list that's drifted from what's on screen above.
+async function refreshCorpusStats() {
+  const panel = $('overview-corpus-panel');
+  if (!model) {
+    panel.hidden = true;
+    return;
+  }
+  try {
+    const { sources: stats } = await call('corpus-source-stats');
+    const titleFor = (id) => (sources.find((s) => s.id === id) || {}).title || id;
+    const totalSampled = stats.reduce((sum, s) => sum + s.sampled, 0) || 1;
+    const body = $('overview-corpus-body');
+    body.replaceChildren();
+    for (const s of [...stats].sort((a, b) => b.sampled - a.sampled)) {
+      const row = document.createElement('tr');
+      const share = Math.round((s.sampled / totalSampled) * 100);
+      row.innerHTML =
+        `<td>${escapeHtml(titleFor(s.id))}</td><td>${formatCount(s.trainTokens)}</td>` +
+        `<td>${formatCount(s.heldOutTokens)}</td><td>${s.sampled.toLocaleString()}${
+          s.sampled > 0 ? ` (${share}%)` : ''
+        }</td>`;
+      body.append(row);
+    }
+    panel.hidden = stats.length === 0;
+  } catch (error) {
+    console.warn('[scriptonait] could not read corpus stats', error);
   }
 }
 
