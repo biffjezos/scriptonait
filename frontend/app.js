@@ -2147,6 +2147,31 @@ function drawLossChart() {
 
 // --- Saving and loading models ----------------------------------------
 
+/// Clears the model, corpus and history — everything Import Project
+/// replaces, just replaced with nothing instead of an imported project.
+/// Settings (auto-save, device, benchmark, training-plan) are left as
+/// they are: those are how you like the page to behave, not part of any
+/// one project.
+///
+/// Reloads the page rather than trying to reset the worker's in-memory
+/// model and corpus from here: there's no "unload" call today, and a
+/// fresh page load already does exactly this — starts with nothing,
+/// waits — for free.
+$('new-project-btn').addEventListener('click', async () => {
+  if (!confirm('Start a new project? This clears the current model, corpus and history.')) {
+    return;
+  }
+  try {
+    await db.replaceAllSources([]);
+    await db.replaceAllHistory([]);
+    await db.clearModels();
+  } catch (error) {
+    showError(error);
+    return;
+  }
+  window.location.reload();
+});
+
 $('export-btn').addEventListener('click', async () => {
   const { bytes } = await call('export-checkpoint');
   const blob = new Blob([bytes], { type: 'application/octet-stream' });
@@ -2231,7 +2256,15 @@ $('import-project-input').addEventListener('change', async (event) => {
         await call('import-optimizer', { bytes: optimizerBytes }, [optimizerBytes]).catch(() => {});
       }
     } else {
+      // No checkpoint in this project file: the old model belongs to
+      // the project just replaced, not this one — leaving it in
+      // IndexedDB would offer to "Restore" a best model, or resume an
+      // auto-save mode's rotating snapshots, from a project that's gone.
+      await db.clearModels();
+      model = null;
       setModelStatus('absent', 'No model yet.');
+      $('model-details').replaceChildren();
+      $('best-model').hidden = true;
     }
 
     // A full replace, not a merge: refreshSources only ever adds sources
