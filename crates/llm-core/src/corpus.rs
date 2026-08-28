@@ -7,21 +7,25 @@
 //! the UI, and [`Corpus::remove`] when it's deleted; the flattened token
 //! stream used for sampling is rebuilt lazily on the next batch request.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 
 use crate::prep::{self, PreparedStats};
 use crate::rng::Rng;
 use crate::tokenizer::{self, Tokenizer};
 
-/// Fraction of sampled training windows that start exactly at a source's
-/// beginning (its BOS token) instead of a uniformly random offset. A
-/// control-tag preamble (see the frontend) only means anything to the
-/// model if it's consistently seen at the *start* of a window; pure
-/// uniform-random sampling would place it there only by chance, roughly
-/// `context_len` times less often than mid-window. The rest of the batch
-/// still samples uniformly so the model keeps seeing ordinary
-/// mid-document continuations too.
-const BOUNDARY_ALIGNED_SAMPLE_RATE: f32 = 0.4;
+/// Default fraction of sampled training windows that start exactly at a
+/// source's beginning (its BOS token) instead of at the next window due in
+/// its rotation. A control-tag preamble (see the frontend) only means
+/// anything to the model if it's consistently seen at the *start* of a
+/// window; never sampling one would place it there only by chance, roughly
+/// `context_len` times less often than mid-window.
+///
+/// A training setting (see `set_boundary_sample_rate`) rather than only
+/// ever this fixed default, because how much of a source's opening is
+/// front matter — a title page, a table of contents, an epigraph — versus
+/// actual prose varies by corpus, and a corpus with a lot of it is worth
+/// turning this down for.
+const DEFAULT_BOUNDARY_SAMPLE_RATE: f32 = 0.4;
 
 /// Fraction of the corpus held out of training, to measure loss on text
 /// the model has never been shown. Five percent is enough to be a
@@ -65,6 +69,36 @@ pub struct Corpus {
     /// source that's barely been sampled (or one worth removing before it
     /// is).
     sample_counts: HashMap<String, u64>,
+    /// How far each source has gotten through its own shuffled pass over
+    /// its non-overlapping training windows, keyed by id for the same
+    /// reason `sample_counts` is. See [`WindowCursor`] and
+    /// [`Corpus::sample_batch`] for what this buys: every window in a
+    /// source gets drawn once before any of them repeats, instead of
+    /// sampling with replacement (which is what let a run replay the same
+    /// handful of windows over and over, especially right after a
+    /// reload — see `window_progress`/`set_window_progress`).
+    window_cursors: HashMap<String, WindowCursor>,
+    /// The order sources take a training window from, refilled with one
+    /// entry per usable source (shuffled) whenever it runs out.
+    ///
+    /// This is what stops training from running through one document for
+    /// many steps in a row: a full pass through this queue touches every
+    /// usable source exactly once, in a random order, before any of them
+    /// comes up again — rather than each step choosing a source at random
+    /// (weighted by length) with nothing stopping the same long source
+    /// from coming up several times in a row purely by chance.
+    ///
+    /// Not persisted: losing the exact position in this rotation across a
+    /// reload only costs a little source-ordering variety for one
+    /// session, which is nothing next to what `window_cursors` (which is
+    /// persisted) actually protects against.
+    rotation: VecDeque<String>,
+    /// The most recently drawn source, so a fresh `rotation` shuffle can
+    /// be nudged away from starting with the same one the last pass just
+    /// ended on.
+    last_source: Option<String>,
+    /// See `DEFAULT_BOUNDARY_SAMPLE_RATE` and `set_boundary_sample_rate`.
+    boundary_sample_rate: f32,
     /// Every distinct word the sources use, built once and thrown away
     /// whenever a source changes. Generated text is measured against it
     /// (see `eval::text_stats`), and rebuilding it per measurement would
@@ -108,6 +142,10 @@ impl Corpus {
             val_cache: Vec::new(),
             val_spans: Vec::new(),
             sample_counts: HashMap::new(),
+            window_cursors: HashMap::new(),
+            rotation: VecDeque::new(),
+            last_source: None,
+            boundary_sample_rate: DEFAULT_BOUNDARY_SAMPLE_RATE,
             word_vocab: None,
             dirty: true,
             tokenizer: Tokenizer::byte_level(),
@@ -232,6 +270,7 @@ impl Corpus {
             self.order.retain(|existing| existing != id);
             self.cleaned_text.remove(id);
             self.sample_counts.remove(id);
+            self.window_cursors.remove(id);
             self.dirty = true;
             self.word_vocab = None;
         }
@@ -492,12 +531,12 @@ impl Corpus {
     /// exists is the whole point of this pair.
     ///
     /// The training loss a run reports is measured on the batches it
-    /// happens to be training on, and those are not a fair sample: 40%
-    /// of them start at a source's opening (see
-    /// `BOUNDARY_ALIGNED_SAMPLE_RATE`), which is the most predictable
-    /// text in the corpus and which the model learns within a few
-    /// hundred steps. Held-out windows never start at an opening,
-    /// because openings live in the training portion of each source.
+    /// happens to be training on, and those are not a fair sample: some
+    /// of them start at a source's opening (see `boundary_sample_rate`),
+    /// which is the most predictable text in the corpus and which the
+    /// model learns within a few hundred steps. Held-out windows never
+    /// start at an opening, because openings live in the training
+    /// portion of each source.
     ///
     /// So the two numbers measure different distributions, and their gap
     /// opens up the moment the model learns what an opening looks like —
@@ -539,10 +578,19 @@ impl Corpus {
     /// Sample a batch of `(input, target)` windows for next-token
     /// prediction. `inputs`/`targets` are flattened row-major
     /// `[batch_size * context_len]` arrays; `targets[i]` is `inputs[i]`
-    /// shifted one token to the right. A fraction of windows
-    /// (`BOUNDARY_ALIGNED_SAMPLE_RATE`) start exactly at a source
-    /// boundary rather than a uniformly random offset — see that
-    /// constant's doc comment for why.
+    /// shifted one token to the right.
+    ///
+    /// Each window comes from a different source than the one before it
+    /// (see `rotation`), and within one source every non-overlapping
+    /// window is drawn exactly once before any of them repeat (see
+    /// `window_cursors` and [`WindowCursor`]) — training never sits on
+    /// one document for a run of consecutive steps, and never replays a
+    /// window it has already shown the model while there are others in
+    /// that source still untouched this pass. A fraction of draws
+    /// (`boundary_sample_rate`) use a source's first window instead of
+    /// its rotation's next one, so the model regularly sees openings —
+    /// see `set_boundary_sample_rate` for turning it down on a corpus
+    /// with a lot of front matter.
     pub fn sample_batch(
         &mut self,
         batch_size: usize,
@@ -550,58 +598,136 @@ impl Corpus {
         rng: &mut Rng,
     ) -> Option<Batch> {
         self.rebuild_flat_if_needed();
-        if self.flat_cache.len() <= context_len {
+        if context_len == 0 || self.flat_cache.len() <= context_len {
             return None;
         }
-        // Sources long enough to hold a window, and where each one starts
-        // in the flat stream, and its `order` index (spans and order are
-        // kept index-aligned by `rebuild_flat_if_needed`) — needed to
-        // credit `sample_counts` to the right source. A window is drawn
-        // from inside one source: the flat stream is a concatenation, and
-        // a window spanning the seam teaches the model that one script's
-        // last line is followed by another script's title page.
-        let usable: Vec<(usize, usize, usize)> = self
-            .spans
+        // Every source long enough to hold at least one window, where it
+        // starts in the flat stream, and how many non-overlapping windows
+        // it holds. A window is drawn from inside one source: the flat
+        // stream is a concatenation, and a window spanning the seam
+        // teaches the model that one script's last line is followed by
+        // another script's title page.
+        let usable: HashMap<String, (usize, u32)> = self
+            .order
             .iter()
-            .enumerate()
-            .filter(|&(_, &(_, len))| len > context_len + 1)
-            .map(|(order_idx, &(start, len))| (order_idx, start, len))
+            .zip(self.spans.iter())
+            .filter(|&(_, &(_, len))| len > context_len)
+            .map(|(id, &(base, len))| {
+                let slots = (len - context_len - 1) / context_len + 1;
+                (id.clone(), (base, slots as u32))
+            })
             .collect();
         if usable.is_empty() {
             return None;
         }
-        // Weighted by length, so a corpus of one long script and one
-        // short one samples in proportion to how much text each is.
-        let total: usize = usable.iter().map(|&(_, _, len)| len - context_len - 1).sum();
+        // Anything left over from before a source was removed or shrank
+        // below one window would otherwise sit in the queue forever,
+        // never drawn and never replaced.
+        self.rotation.retain(|id| usable.contains_key(id));
 
         let mut inputs = Vec::with_capacity(batch_size * context_len);
         let mut targets = Vec::with_capacity(batch_size * context_len);
         for _ in 0..batch_size {
-            let (order_idx, start) = if rng.next_f32() < BOUNDARY_ALIGNED_SAMPLE_RATE {
-                // A window that starts where a source starts, so the model
-                // sees what an opening looks like - see the constant.
-                let (order_idx, start, _) = usable[rng.gen_range(usable.len())];
-                (order_idx, start)
-            } else {
-                let mut pick = rng.gen_range(total.max(1));
-                let mut chosen = (usable[0].0, usable[0].1);
-                for &(order_idx, base, len) in &usable {
-                    let room = len - context_len - 1;
-                    if pick < room {
-                        chosen = (order_idx, base + pick);
-                        break;
-                    }
-                    pick -= room;
-                }
-                chosen
-            };
-            if let Some(id) = self.order.get(order_idx) {
-                *self.sample_counts.entry(id.clone()).or_default() += 1;
+            if self.rotation.is_empty() {
+                self.refill_rotation(&usable, rng);
             }
+            let Some(id) = self.rotation.pop_front() else { break };
+            let &(base, slots) = usable.get(&id).expect("just filtered to usable");
+            let boundary = rng.next_f32() < self.boundary_sample_rate;
+            let slot = if boundary {
+                0
+            } else {
+                self.window_cursors
+                    .entry(id.clone())
+                    .or_insert_with(|| WindowCursor::new(&id))
+                    .next(slots)
+                    .unwrap_or(0)
+            };
+            let start = base + slot as usize * context_len;
+            if start + context_len + 1 > self.flat_cache.len() {
+                // Should not happen — `slots` is derived from this same
+                // source's own span — but a window that would read past
+                // it is a window skipped, not a panic.
+                self.last_source = Some(id);
+                continue;
+            }
+            *self.sample_counts.entry(id.clone()).or_default() += 1;
             inputs.extend_from_slice(&self.flat_cache[start..start + context_len]);
             targets.extend_from_slice(&self.flat_cache[start + 1..start + 1 + context_len]);
+            self.last_source = Some(id);
+        }
+        let batch_size = inputs.len() / context_len;
+        if batch_size == 0 {
+            return None;
         }
         Some(Batch { inputs, targets, batch_size, context_len })
+    }
+
+    /// Refill `rotation` with one entry per usable source, shuffled.
+    ///
+    /// Nudged away from starting with whatever source the previous pass
+    /// just ended on, so two sources are never adjacent across the seam
+    /// between one pass through the rotation and the next.
+    fn refill_rotation(&mut self, usable: &HashMap<String, (usize, u32)>, rng: &mut Rng) {
+        let mut ids: Vec<String> = usable.keys().cloned().collect();
+        ids.sort_unstable();
+        for i in (1..ids.len()).rev() {
+            let j = rng.gen_range(i + 1);
+            ids.swap(i, j);
+        }
+        if ids.len() > 1 {
+            if let Some(last) = &self.last_source {
+                if ids[0] == *last {
+                    ids.swap(0, 1);
+                }
+            }
+        }
+        self.rotation = ids.into();
+    }
+
+    /// This source's progress through its own shuffled pass over its
+    /// non-overlapping training windows, as `(epoch, cursor)` — for
+    /// persisting so a reload resumes that pass instead of restarting it
+    /// (which is what let a training run replay the same handful of
+    /// windows from the same source it happened to be on right before a
+    /// reload). `None` if nothing has been drawn from this source yet.
+    pub fn window_progress(&self, id: &str) -> Option<(u32, u32)> {
+        self.window_cursors.get(id).map(|c| (c.epoch, c.cursor))
+    }
+
+    /// Every source's window-pass progress that exists yet, as
+    /// `(id, epoch, cursor)` — the bulk form of `window_progress`, for
+    /// writing it all back to storage in one pass rather than one round
+    /// trip per source.
+    pub fn all_window_progress(&self) -> Vec<(String, u32, u32)> {
+        self.window_cursors.iter().map(|(id, c)| (id.clone(), c.epoch, c.cursor)).collect()
+    }
+
+    /// Restore a source's window-pass progress after a fresh page load
+    /// re-upserts sources into a new `Corpus` — the progress belongs to
+    /// the source, not to this in-memory instance, so it has to be handed
+    /// back in from wherever it was persisted. A source that no longer
+    /// exists is left alone rather than resurrecting a phantom entry.
+    pub fn set_window_progress(&mut self, id: &str, epoch: u32, cursor: u32) {
+        if self.sources.contains_key(id) {
+            self.window_cursors.insert(id.to_string(), WindowCursor { epoch, cursor, ..WindowCursor::new(id) });
+        }
+    }
+
+    /// How often a sampled window starts exactly at a source's beginning
+    /// rather than at the next window due in its rotation.
+    ///
+    /// A training setting rather than a fixed rate because how much of a
+    /// source's opening is actual prose, versus front matter (a title
+    /// page, a table of contents, an epigraph), varies by corpus — a
+    /// clean plain-text corpus can afford a higher rate than one built
+    /// from scanned books.
+    pub fn boundary_sample_rate(&self) -> f32 {
+        self.boundary_sample_rate
+    }
+
+    pub fn set_boundary_sample_rate(&mut self, rate: f32) {
+        self.boundary_sample_rate = rate.clamp(0.0, 1.0);
     }
 
     /// Source ids whose cleaned text is identical to an earlier source's.
@@ -631,6 +757,71 @@ impl Corpus {
         }
         duplicates
     }
+}
+
+/// One source's progress through a shuffled pass ("epoch") over its own
+/// non-overlapping training windows.
+///
+/// `order` — which window each position in the pass draws — is never
+/// persisted, only `epoch` and `cursor` are (see
+/// [`Corpus::window_progress`]/[`Corpus::set_window_progress`]): `order`
+/// is rebuilt from the source's own id and `epoch` the moment it's
+/// needed, deterministically, so there is nothing bigger than two small
+/// integers to keep in a project file no matter how large the source is.
+#[derive(Clone)]
+struct WindowCursor {
+    seed: u64,
+    epoch: u32,
+    cursor: u32,
+    order: Vec<u32>,
+}
+
+impl WindowCursor {
+    fn new(id: &str) -> Self {
+        Self { seed: fnv1a(id.as_bytes()), epoch: 0, cursor: 0, order: Vec::new() }
+    }
+
+    /// The next window slot in this source's current pass — starting a
+    /// fresh, freshly-shuffled pass when the current one runs out, or
+    /// when `slots` no longer matches it (the source was edited out from
+    /// under an in-progress pass, so its old indices no longer mean
+    /// anything and this restarts the count rather than reading garbage).
+    fn next(&mut self, slots: u32) -> Option<u32> {
+        if slots == 0 {
+            return None;
+        }
+        if self.order.len() as u32 != slots || self.cursor as usize >= self.order.len() {
+            if self.cursor as usize >= self.order.len() && !self.order.is_empty() {
+                self.epoch = self.epoch.wrapping_add(1);
+            }
+            self.order = shuffled_slots(self.seed ^ self.epoch as u64, slots);
+            self.cursor = 0;
+        }
+        let slot = self.order[self.cursor as usize];
+        self.cursor += 1;
+        Some(slot)
+    }
+}
+
+fn shuffled_slots(seed: u64, slots: u32) -> Vec<u32> {
+    let mut order: Vec<u32> = (0..slots).collect();
+    let mut rng = Rng::seed_from_u64(seed);
+    for i in (1..order.len()).rev() {
+        let j = rng.gen_range(i + 1);
+        order.swap(i, j);
+    }
+    order
+}
+
+/// FNV-1a, for turning a source id into a stable per-source shuffle seed
+/// without having to persist the seed itself.
+fn fnv1a(bytes: &[u8]) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in bytes {
+        hash ^= *byte as u64;
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
 }
 
 pub struct Batch {
@@ -970,11 +1161,136 @@ mod tests {
                 boundary_hits += 1;
             }
         }
-        // Should land on a boundary roughly BOUNDARY_ALIGNED_SAMPLE_RATE of
+        // Should land on a boundary roughly DEFAULT_BOUNDARY_SAMPLE_RATE of
         // the time (40%) - well above what a uniformly random start over a
         // corpus this size would produce by chance (a fraction of a
         // percent), and comfortably below 100%.
         let rate = boundary_hits as f64 / trials as f64;
         assert!(rate > 0.2 && rate < 0.6, "boundary-aligned rate was {rate}");
+    }
+
+    #[test]
+    fn boundary_sample_rate_is_a_training_setting() {
+        let mut c = Corpus::new();
+        let text = "the quick brown fox jumps over the lazy dog ".repeat(20);
+        c.upsert("a", &text, false);
+        c.set_boundary_sample_rate(1.0);
+        let mut rng = Rng::seed_from_u64(3);
+        for _ in 0..10 {
+            let batch = c.sample_batch(1, 16, &mut rng).unwrap();
+            assert_eq!(batch.inputs[0], tokenizer::BOS, "rate of 1.0 should always land on a boundary");
+        }
+        c.set_boundary_sample_rate(0.0);
+        let mut boundary_hits = 0;
+        for _ in 0..200 {
+            let batch = c.sample_batch(1, 16, &mut rng).unwrap();
+            if batch.inputs[0] == tokenizer::BOS {
+                boundary_hits += 1;
+            }
+        }
+        assert!(boundary_hits < 20, "rate of 0.0 should almost never land on a boundary, got {boundary_hits}/200");
+        // Out-of-range values are clamped, not rejected.
+        c.set_boundary_sample_rate(5.0);
+        assert_eq!(c.boundary_sample_rate(), 1.0);
+        c.set_boundary_sample_rate(-1.0);
+        assert_eq!(c.boundary_sample_rate(), 0.0);
+    }
+
+    #[test]
+    fn sample_batch_covers_every_window_once_before_repeating_any() {
+        // 94 distinct printable characters, none repeated anywhere in the
+        // source - so any two windows starting at different offsets are
+        // guaranteed to differ, and a duplicate in `starts` below can only
+        // mean the same window was drawn twice.
+        let text: String = (0x21u8..=0x7E_u8).map(|b| b as char).collect();
+        let mut c = Corpus::new();
+        c.upsert("a", &text, false);
+        c.set_boundary_sample_rate(0.0);
+        let mut rng = Rng::seed_from_u64(11);
+        let mut starts = std::collections::HashSet::new();
+        // context_len 8 over this source holds 11 non-overlapping
+        // windows; drawing 10 stays inside that one pass; a repeat among
+        // them means a window was drawn twice before all 11 were seen.
+        for _ in 0..10 {
+            let batch = c.sample_batch(1, 8, &mut rng).unwrap();
+            starts.insert(batch.inputs.clone());
+        }
+        assert_eq!(starts.len(), 10, "one pass should not repeat a window before covering the others");
+    }
+
+    #[test]
+    fn consecutive_draws_favor_different_sources() {
+        let mut c = Corpus::new();
+        for letter in ["a", "b", "c", "d"] {
+            c.upsert(letter, &format!("{letter} ").repeat(4000), false);
+        }
+        c.set_boundary_sample_rate(0.0);
+        let mut rng = Rng::seed_from_u64(13);
+        let mut last: Option<String> = None;
+        let mut adjacent_repeats = 0;
+        for _ in 0..200 {
+            let before = c.per_source_stats();
+            c.sample_batch(1, 16, &mut rng).unwrap();
+            let after = c.per_source_stats();
+            // The one source whose sample count just went up is the one
+            // this draw came from — unambiguous, unlike inspecting the
+            // window's own bytes (two different sources can share a byte
+            // value at the offset a window happens to start on).
+            let drawn = after
+                .iter()
+                .find(|a| {
+                    let prior = before.iter().find(|b| b.id == a.id).map(|b| b.sampled).unwrap_or(0);
+                    a.sampled > prior
+                })
+                .map(|s| s.id.clone())
+                .expect("exactly one source's count should have moved");
+            if last.as_deref() == Some(drawn.as_str()) {
+                adjacent_repeats += 1;
+            }
+            last = Some(drawn);
+        }
+        assert_eq!(adjacent_repeats, 0, "the same source was drawn twice in a row");
+    }
+
+    #[test]
+    fn window_progress_survives_being_read_back_in() {
+        let mut c = Corpus::new();
+        c.upsert("a", &"a".repeat(1000), false);
+        c.set_boundary_sample_rate(0.0);
+        let mut rng = Rng::seed_from_u64(5);
+        c.sample_batch(1, 16, &mut rng).unwrap();
+        c.sample_batch(1, 16, &mut rng).unwrap();
+        let (epoch, cursor) = c.window_progress("a").expect("drawn from");
+        assert_eq!(cursor, 2);
+
+        // A fresh corpus, as a reload would build, with the progress
+        // handed back in - the next draw should be the third window, not
+        // a repeat of the first.
+        let mut fresh = Corpus::new();
+        fresh.upsert("a", &"a".repeat(1000), false);
+        fresh.set_boundary_sample_rate(0.0);
+        fresh.set_window_progress("a", epoch, cursor);
+        let mut fresh_rng = Rng::seed_from_u64(999); // a different stream entirely
+        let mut original = Corpus::new();
+        original.upsert("a", &"a".repeat(1000), false);
+        original.set_boundary_sample_rate(0.0);
+        let mut original_rng = Rng::seed_from_u64(5);
+        original.sample_batch(1, 16, &mut original_rng).unwrap();
+        original.sample_batch(1, 16, &mut original_rng).unwrap();
+        let expected_third = original.sample_batch(1, 16, &mut original_rng).unwrap();
+
+        let restored_third = fresh.sample_batch(1, 16, &mut fresh_rng).unwrap();
+        assert_eq!(
+            restored_third.inputs, expected_third.inputs,
+            "restoring progress should resume the same pass, not restart it"
+        );
+    }
+
+    #[test]
+    fn set_window_progress_ignores_a_source_that_no_longer_exists() {
+        let mut c = Corpus::new();
+        c.upsert("a", "hello world", false);
+        c.set_window_progress("nonexistent", 1, 5);
+        assert!(c.window_progress("nonexistent").is_none());
     }
 }
