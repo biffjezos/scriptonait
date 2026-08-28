@@ -1788,6 +1788,17 @@ function applyTrainMode() {
   for (const id of ['train-steps', 'train-batch', 'train-effort', 'train-lr']) {
     $(id).disabled = !manual;
   }
+  // Batch and Effort each have their own "pick one" sentinel (0, "auto")
+  // that the auto-pick logic already reads correctly — but only if a
+  // leftover typed value from a previous Manual session isn't still
+  // sitting in the field. Steps and Learning rate need no such reset:
+  // Steps 0 means "until stopped" in both modes, and the Train button
+  // reads Learning rate only when Manual is selected.
+  if (!manual) {
+    $('train-batch').value = '0';
+    $('train-effort').value = 'auto';
+  }
+  updateGuidance();
 }
 $('train-mode').addEventListener('change', applyTrainMode);
 applyTrainMode();
