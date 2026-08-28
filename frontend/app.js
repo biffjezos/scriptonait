@@ -2202,15 +2202,22 @@ $('import-input').addEventListener('change', async (event) => {
 $('export-project-btn').addEventListener('click', async () => {
   clearError();
   try {
+    // Source saves go through persistLater's fire-and-forget chain —
+    // addSources doesn't wait for it, so a source added moments ago
+    // could still be in flight. Wait for it to drain before reading
+    // db.listSources(), or a fast export-right-after-add misses it.
+    await persistChain;
     const checkpointBytes = model ? (await call('export-checkpoint')).bytes : null;
     const optimizerBytes = model
       ? await call('export-optimizer').then((r) => r.bytes).catch(() => null)
       : null;
+    const exportedSources = await db.listSources();
+    const exportedHistory = await db.listHistory();
     const blob = project.buildProjectFile({
       checkpointBytes,
       optimizerBytes,
-      sources: await db.listSources(),
-      history: await db.listHistory(),
+      sources: exportedSources,
+      history: exportedHistory,
       settings: {
         autosaveConfig: await db.getAutosaveConfig(),
         devicePreference: await db.getDevicePreference(),
@@ -2218,6 +2225,12 @@ $('export-project-btn').addEventListener('click', async () => {
         trainingPlan: await db.getTrainingPlanSettings(),
       },
     });
+    console.info(
+      `[scriptonait] exporting project: ${exportedSources.length} source(s), ` +
+        `${exportedHistory.length} history row(s), ` +
+        `checkpoint ${checkpointBytes ? `${checkpointBytes.byteLength} bytes` : 'none (no model)'}, ` +
+        `${blob.size} bytes total`,
+    );
     const url = URL.createObjectURL(blob);
     const link = document.createElement('a');
     link.href = url;
@@ -2241,6 +2254,12 @@ $('import-project-input').addEventListener('change', async (event) => {
   try {
     const buffer = await file.arrayBuffer();
     const { header, checkpointBytes, optimizerBytes } = project.parseProjectFile(buffer);
+    console.info(
+      `[scriptonait] importing ${file.name} (${buffer.byteLength} bytes): ` +
+        `${(header.sources || []).length} source(s), ${(header.history || []).length} history row(s), ` +
+        `checkpoint ${checkpointBytes ? `${checkpointBytes.byteLength} bytes` : 'none'}, ` +
+        `optimizer ${optimizerBytes ? `${optimizerBytes.byteLength} bytes` : 'none'}`,
+    );
 
     await db.replaceAllSources(header.sources || []);
     await db.replaceAllHistory(header.history || []);
