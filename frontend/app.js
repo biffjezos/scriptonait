@@ -1098,19 +1098,20 @@ const probeHistory = [];
 /// itself by drawLossChart rather than kept as separate DOM text.
 let chartStats = '';
 
-/// What the most recent step's batch actually trained on, by title —
-/// which sources, since a batch can (and, thanks to the source rotation,
-/// usually does) draw from several different ones per step, not the same
-/// document run after run.
-function describeBatchSources(ids) {
-  if (!ids || ids.length === 0) return '';
-  const titles = [...new Set(ids)].map((id) => {
-    const source = sources.find((s) => s.id === id);
-    return source ? source.title : id;
+/// What the most recent step's batch actually trained on — the text
+/// itself, not just which document, since a batch can (and, thanks to
+/// the source rotation, usually does) draw from several different ones
+/// per step, not the same document run after run.
+function describeBatchSources(draws) {
+  if (!draws || draws.length === 0) return '';
+  const shown = draws.slice(0, 3).map((draw) => {
+    const source = sources.find((s) => s.id === draw.id);
+    const title = source ? source.title : draw.id;
+    const excerpt = (draw.excerpt || '').replace(/\s+/g, ' ').trim();
+    return `${title}: "${excerpt}"`;
   });
-  const shown = titles.slice(0, 3).join(', ');
-  const rest = titles.length > 3 ? ` +${titles.length - 3} more` : '';
-  return `Training on: ${shown}${rest}`;
+  const rest = draws.length > 3 ? ` +${draws.length - 3} more` : '';
+  return `Training on: ${shown.join(' | ')}${rest}`;
 }
 
 onStream('train-progress', (progress) => {
