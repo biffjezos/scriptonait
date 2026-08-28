@@ -123,11 +123,14 @@ function newId() {
 
 // --- Sources -----------------------------------------------------------
 // A source: { id, title, kind: 'file'|'paste', rawText, sourceUrl, tags,
-//             createdAt, updatedAt, timesSampled }
+//             createdAt, updatedAt, timesSampled, windowProgress }
 //
-// `timesSampled` is periodically pulled from the wasm corpus and written
-// back (see `updateSourceStats`); absent on a source added before it
-// existed, which callers treat the same as 0.
+// `timesSampled` and `windowProgress` (`{epoch, cursor}`, how far this
+// source has gotten through its own pass over its training windows — see
+// worker.js's `window-progress` command) are periodically pulled from the
+// wasm corpus and written back (see `updateSourceStats`); absent on a
+// source added before they existed, which callers treat the same as 0 /
+// no progress yet.
 //
 // `kind: 'url'` no longer gets created (URL fetch was removed), but a
 // record written by an older version can still carry it, and `sourceUrl`
@@ -190,16 +193,18 @@ export async function replaceAllSources(list) {
   }
 }
 
-/// How many training windows have been drawn from this source, as of the
-/// last time it was pulled from the wasm corpus and written back —
-/// doesn't touch `updatedAt`, since this isn't an edit to the source
-/// itself. Missing on a source added before this field existed; callers
-/// treat that the same as 0.
-export async function updateSourceStats(id, { timesSampled }) {
+/// How many training windows have been drawn from this source, and how
+/// far it's gotten through its own pass over them (`windowProgress:
+/// {epoch, cursor}`, see worker.js's `window-progress` command) — both as
+/// of the last time they were pulled from the wasm corpus and written
+/// back. Doesn't touch `updatedAt`, since this isn't an edit to the
+/// source itself. Missing on a source added before these fields existed;
+/// callers treat that the same as 0 / no progress yet.
+export async function updateSourceStats(id, changes) {
   const existing = await getSource(id);
   if (!existing) return;
   await withStore(SOURCES_STORE, 'readwrite', (store) =>
-    store.put({ ...existing, timesSampled }));
+    store.put({ ...existing, ...changes }));
 }
 
 // --- The trained model -------------------------------------------------
@@ -360,13 +365,19 @@ export async function getBenchmarkConfig() {
 }
 
 /// { mode: 'auto'|'manual', plannedSteps, effort, sampleEvery, samplePrompt,
-///   sampleWords }
+///   sampleWords, boundarySampleRate }
 ///
 /// The Training tab's own settings, previously DOM-only: they reset to
 /// the markup's hardcoded defaults on every reload, which is the gap
 /// meant here — in particular `plannedSteps`, which since the schedule
 /// rework is the project's planned length, not a per-run number, and is
 /// worth even less lost on a reload than the others.
+///
+/// `boundarySampleRate` (0-1) is how often a sampled training window
+/// starts exactly at a source's beginning rather than at the next window
+/// due in its rotation — see `Corpus::boundary_sample_rate`. Missing on
+/// a project saved before this setting existed, which callers treat as
+/// the wasm side's own default.
 export async function putTrainingPlanSettings(settings) {
   const record = { ...settings, id: TRAINING_PLAN_SETTINGS, savedAt: Date.now() };
   await withStore(SETTINGS_STORE, 'readwrite', (store) => store.put(record));

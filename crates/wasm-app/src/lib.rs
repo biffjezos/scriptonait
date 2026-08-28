@@ -1014,6 +1014,51 @@ impl WasmLLM {
         self.0.borrow_mut().corpus.set_sample_count(&id, count as u64);
     }
 
+    /// How often a sampled training window starts exactly at a source's
+    /// beginning rather than at the next window due in its rotation —
+    /// see `Corpus::boundary_sample_rate`. A training setting, not a
+    /// fixed constant, because how much of a source's opening is front
+    /// matter (a title page, a table of contents) rather than prose
+    /// varies by corpus.
+    pub fn boundary_sample_rate(&self) -> f32 {
+        self.0.borrow().corpus.boundary_sample_rate()
+    }
+
+    pub fn set_boundary_sample_rate(&self, rate: f32) {
+        self.0.borrow_mut().corpus.set_boundary_sample_rate(rate);
+    }
+
+    /// One source's progress through its own shuffled pass over its
+    /// training windows, as `{"epoch":n,"cursor":n}`, or `null` if
+    /// nothing has been drawn from it yet — for persisting so a reload
+    /// resumes that pass instead of restarting it (see
+    /// `Corpus::window_progress`).
+    pub fn window_progress(&self, id: String) -> String {
+        match self.0.borrow().corpus.window_progress(&id) {
+            Some((epoch, cursor)) => format!("{{\"epoch\":{epoch},\"cursor\":{cursor}}}"),
+            None => "null".to_string(),
+        }
+    }
+
+    /// Every source's window-pass progress that exists yet, as JSON —
+    /// for writing it all back to storage in one pass rather than one
+    /// round trip per source. See `Corpus::all_window_progress`.
+    pub fn corpus_window_progress(&self) -> String {
+        let entries = self.0.borrow().corpus.all_window_progress();
+        let rows = entries
+            .iter()
+            .map(|(id, epoch, cursor)| format!("{{\"id\":{id:?},\"epoch\":{epoch},\"cursor\":{cursor}}}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        format!("[{rows}]")
+    }
+
+    /// Restore a source's window-pass progress after a fresh page load
+    /// re-upserts it into a new corpus — see `Corpus::set_window_progress`.
+    pub fn set_window_progress(&self, id: String, epoch: u32, cursor: u32) {
+        self.0.borrow_mut().corpus.set_window_progress(&id, epoch, cursor);
+    }
+
     /// Learn a BPE vocabulary from the loaded sources and re-encode them
     /// with it. Returns the new vocabulary size, or 0 when there is no
     /// text yet.

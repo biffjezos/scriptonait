@@ -325,6 +325,13 @@ function updateGuidance() {
 /// Called whenever a model appears, because sources can be added before
 /// one exists — that's the normal order now — and the model starts empty.
 async function syncAllSources() {
+  // The corpus this hands sources to is a fresh one, back at the wasm
+  // side's own default rate — reapply whatever was last saved, the same
+  // reason `set-source-sample-count`/`set-window-progress` below exist.
+  const openingRate = Number($('opening-rate').value);
+  if (openingRate >= 0) {
+    call('set-boundary-sample-rate', { rate: openingRate / 100 }).catch(() => {});
+  }
   // Counted, because syncSource swallows its failures — it has to, since
   // one unreadable record must not stop the other sixty-five. But a
   // silent partial hand-over means training on a fraction of the corpus
@@ -350,16 +357,24 @@ async function syncAllSources() {
   await refreshPlan();
 }
 
-/// Pull each source's current sample count from the wasm corpus and
-/// write it back to SOURCES_STORE, so "which sources has training
-/// actually drawn from" survives a reload. Best effort — storage or
+/// Pull each source's current sample count and window-pass progress from
+/// the wasm corpus and write them back to SOURCES_STORE, so "which
+/// sources has training actually drawn from" and "how far into its own
+/// pass over its windows is each one" both survive a reload — the second
+/// is what stops a resumed run from replaying the same handful of
+/// windows it had just drawn before the reload. Best effort — storage or
 /// worker trouble here must not interrupt anything this isn't for.
 async function flushSourceSampleCounts() {
   if (!model) return;
   try {
-    const { sources: stats } = await call('corpus-source-stats');
+    const [{ sources: stats }, { sources: progress }] = await Promise.all([
+      call('corpus-source-stats'),
+      call('corpus-window-progress'),
+    ]);
+    const progressById = new Map(progress.map((p) => [p.id, { epoch: p.epoch, cursor: p.cursor }]));
     for (const { id, sampled } of stats) {
-      db.updateSourceStats(id, { timesSampled: sampled }).catch(() => {});
+      const windowProgress = progressById.get(id);
+      db.updateSourceStats(id, { timesSampled: sampled, windowProgress }).catch(() => {});
     }
   } catch (error) {
     /* best effort */
@@ -959,6 +974,16 @@ async function syncSource(source) {
     // was persisted last time, if anything.
     if (source.timesSampled) {
       call('set-source-sample-count', { id: source.id, count: source.timesSampled }).catch(() => {});
+    }
+    // Same idea for how far training got through this source's own pass
+    // over its windows — without this, a reload would start that pass
+    // over from its first window instead of continuing it.
+    if (source.windowProgress) {
+      call('set-window-progress', {
+        id: source.id,
+        epoch: source.windowProgress.epoch,
+        cursor: source.windowProgress.cursor,
+      }).catch(() => {});
     }
     return true;
   } catch (error) {
@@ -1890,11 +1915,21 @@ async function persistTrainingPlanSettings() {
     sampleToggle: $('sample-toggle').checked,
     sampleEvery: Number($('sample-every').value) || 0,
     samplePrompt: $('sample-prompt').value,
+    boundarySampleRate: Number($('opening-rate').value) / 100,
   });
 }
-for (const id of ['train-mode', 'train-steps', 'train-effort', 'sample-toggle', 'sample-every', 'sample-prompt']) {
+for (const id of [
+  'train-mode', 'train-steps', 'train-effort', 'sample-toggle', 'sample-every', 'sample-prompt',
+  'opening-rate',
+]) {
   $(id).addEventListener('change', persistTrainingPlanSettings);
 }
+// Live, like the peak-learning-rate control: takes effect on the very
+// next window sampled, training already in flight or not.
+$('opening-rate').addEventListener('change', () => {
+  const rate = Number($('opening-rate').value);
+  if (rate >= 0) call('set-boundary-sample-rate', { rate: rate / 100 }).catch(() => {});
+});
 
 onStream('bench-progress', ({ stage, dispatchesPerSubmit }) => {
   if (!benchmarking || stage !== 'chunk') return;
@@ -2658,6 +2693,9 @@ async function applyLoadedSettings() {
       $('sample-toggle').checked = !!planSettings.sampleToggle;
       if (planSettings.sampleEvery > 0) $('sample-every').value = String(planSettings.sampleEvery);
       if (planSettings.samplePrompt) $('sample-prompt').value = planSettings.samplePrompt;
+      if (typeof planSettings.boundarySampleRate === 'number') {
+        $('opening-rate').value = String(Math.round(planSettings.boundarySampleRate * 100));
+      }
     }
   } catch (error) {
     console.warn('[scriptonait] could not read training-plan settings', error);

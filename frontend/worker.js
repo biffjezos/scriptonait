@@ -1571,6 +1571,38 @@ const handlers = {
     return {};
   },
 
+  /// One source's progress through its own pass over its training
+  /// windows, so the page can persist it back to SOURCES_STORE — see
+  /// `set-window-progress` for the other half of the round trip.
+  async 'window-progress'({ id }) {
+    return { progress: JSON.parse(llm.window_progress(id)) };
+  },
+
+  /// Every source's window-pass progress that exists yet, in one round
+  /// trip — for periodically flushing it all back to SOURCES_STORE (see
+  /// `flushSourceSampleCounts` in app.js) rather than one call per
+  /// source.
+  async 'corpus-window-progress'() {
+    return { sources: JSON.parse(llm.corpus_window_progress()) };
+  },
+
+  /// Restore a source's window-pass progress after a fresh page load
+  /// re-upserts it into a new corpus, the same way
+  /// `set-source-sample-count` restores the sample count — without this,
+  /// every reload restarts that source's pass from its first window
+  /// instead of continuing where the last session left off.
+  async 'set-window-progress'({ id, epoch, cursor }) {
+    llm.set_window_progress(id, epoch || 0, cursor || 0);
+    return {};
+  },
+
+  /// The fraction of sampled windows that start exactly at a source's
+  /// beginning, live — see `Corpus::boundary_sample_rate`.
+  async 'set-boundary-sample-rate'({ rate }) {
+    llm.set_boundary_sample_rate(rate);
+    return { rate: llm.boundary_sample_rate() };
+  },
+
   async 'upsert-source'(payload) {
     // More text is a different problem from the one the last plateau
     // was found on: whatever cut the rate then does not apply now.
