@@ -39,6 +39,13 @@ let training = false;
 // mid-step.
 let stopRequested = false;
 
+/// Which device user-initiated generation prefers, set from the Settings
+/// tab and applied to the next Generate call — never retried or polled
+/// when it can't be honored (see `llm.generate`'s own `prefer_gpu`
+/// argument). 'cpu' is the only choice that is guaranteed to work while
+/// training holds the GPU; 'gpu' can be refused if training is running.
+let inferenceDevice = 'gpu';
+
 const PROGRESS_INTERVAL_MS = 250;
 
 /// Bumped whenever the benchmark measures something different, so a
@@ -298,6 +305,7 @@ async function generate({ prompt, extraContext, temperature, topK, topP, minP, r
     minP || 0,
     repetitionPenalty,
     seed,
+    inferenceDevice !== 'cpu',
     (piece, words) => {
       tokens += 1;
       // Text goes back immediately — that's what makes the page feel
@@ -321,9 +329,11 @@ async function generate({ prompt, extraContext, temperature, topK, topP, minP, r
 
   const elapsed = (performance.now() - startedAt) / 1000;
   if (result.stop_reason === 'busy') {
-    throw new Error(
-      'the GPU is busy with a save or another generation — wait a moment and try again',
-    );
+    // A single refusal, not a retry: the GPU is doing something else
+    // (training, a save, another generation) right now. Nothing here
+    // waits or polls for it to finish — switch Inference to CPU, or try
+    // again once whatever's running has finished.
+    throw new Error('the GPU is busy (training or another save) — switch to CPU, or try again once it finishes');
   }
   return {
     text: result.text,
@@ -350,20 +360,24 @@ async function generate({ prompt, extraContext, temperature, topK, topP, minP, r
 /// `generate` pulls the freshly trained weights off the GPU first, so a
 /// sample shows the model as it is at this step rather than as it was
 /// when training started.
-async function trainingSample(prompt, words) {
+/// `sampling` is the Inference tab's own settings
+/// ({temperature,topK,topP,minP,repetitionPenalty}) — the same values
+/// Generate uses, not a second hidden set tucked away in here.
+async function trainingSample(prompt, words, sampling) {
+  const s = sampling || { temperature: 0.9, topK: 40, topP: 0.95, minP: 0.05, repetitionPenalty: 1.1 };
   const result = await llm.generate(
     prompt,
     '',
-    0.9,
-    40,
-    0.95,
-    // A training sample is the one place min-p earns its keep without
-    // being asked for: an early model's distribution is nearly flat, so
-    // this keeps the field wide, and a later one's is peaked, so it
-    // stops the sample wandering into the tail.
-    0.05,
-    1.1,
+    s.temperature,
+    s.topK,
+    s.topP,
+    s.minP,
+    s.repetitionPenalty,
     Math.floor(Math.random() * 1e9),
+    // Always the GPU: this runs from inside the training loop itself, on
+    // the weights the run just produced, not concurrently with anything
+    // that would make CPU inference's race-free guarantee matter.
+    true,
     (_piece, produced) => produced < words,
   );
   return result.text;
@@ -1013,7 +1027,9 @@ function recordEvent(step, kind, text, extra = {}) {
   post('train-record', { runId, step, kind, text, at: Date.now(), ...extra });
 }
 
-async function train({ batchSize, learningRate, maxSteps, effort, sampleEvery, samplePrompt, sampleWords }) {
+async function train({
+  batchSize, learningRate, maxSteps, effort, sampleEvery, samplePrompt, sampleWords, sampling,
+}) {
   stopRequested = false;
   training = true;
   runId = `run-${Date.now().toString(36)}`;
@@ -1389,7 +1405,7 @@ async function train({ batchSize, learningRate, maxSteps, effort, sampleEvery, s
       nextSampleAt = llm.step() + sampleEvery;
       const sampleStart = performance.now();
       try {
-        const text = await trainingSample(samplePrompt, sampleWords || 40);
+        const text = await trainingSample(samplePrompt, sampleWords || 40, sampling);
         // What the loss curve cannot say: is this English, and is it
         // still saying anything new. Measured against the user's own
         // corpus, so no word list has to ship with the page.
@@ -1727,6 +1743,15 @@ const handlers = {
     return { dispatchesPerSubmit: applied };
   },
 
+  /// Which device the next Generate call prefers. Takes effect
+  /// immediately — the very next call to `generate`, nothing queued or
+  /// deferred.
+  async 'set-inference-device'({ device }) {
+    inferenceDevice = device === 'cpu' ? 'cpu' : 'gpu';
+    log(`inference device set to ${inferenceDevice}`);
+    return { device: inferenceDevice };
+  },
+
   async train(payload) {
     // One run at a time, checked here rather than only on the page.
     //
@@ -1825,7 +1850,7 @@ self.onmessage = async (event) => {
     return;
   }
   // Everything except `stop` needs a model; saying so beats a wasm panic.
-  if (!llm && !['load-model', 'create-model', 'import-checkpoint', 'parse-prompt', 'describe-shape', 'stop'].includes(type)) {
+  if (!llm && !['load-model', 'create-model', 'import-checkpoint', 'parse-prompt', 'describe-shape', 'set-inference-device', 'stop'].includes(type)) {
     fail(
       rid,
       new Error(

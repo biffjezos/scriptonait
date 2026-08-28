@@ -678,6 +678,20 @@ impl WasmLLM {
     /// subject — that's how retrieved scenes and the story-state
     /// preamble get in without inventing a second prompt format.
     #[allow(clippy::too_many_arguments)]
+    /// `prefer_gpu` chooses the device for this call, independent of
+    /// whether training is using the GPU right now.
+    ///
+    /// When `false`, this deliberately takes none of the machinery below:
+    /// no `acquire()`, no `busy` check, no `sync_from_gpu_inner()`. CPU
+    /// inference has to work *while training holds the GPU*, using
+    /// whatever weights are already resident on this side — the current
+    /// state if a sync has already happened, the previous state if
+    /// training hasn't synced back yet. Waiting for that sync, or being
+    /// refused because the GPU is busy, is exactly the failure this
+    /// avoids: there is nothing here for a concurrent training step to
+    /// race, because this path never touches anything a training step
+    /// touches.
+    #[allow(clippy::too_many_arguments)]
     pub async fn generate(
         &self,
         prompt: String,
@@ -688,14 +702,26 @@ impl WasmLLM {
         min_p: f32,
         repetition_penalty: f32,
         seed: f64,
+        prefer_gpu: bool,
         on_token: &js_sys::Function,
     ) -> GenerationResult {
+        if !prefer_gpu {
+            let request = self.build_request(&prompt, &extra_context);
+            let sampling =
+                self.sampling_config(temperature, top_k, top_p, min_p, repetition_penalty, seed);
+            return self.generate_on_cpu(&request, &sampling, on_token);
+        }
+
         // Generation owns the GPU for as long as it runs, and it pulls
         // the trained weights back across the bus first. Two of those at
         // once — or one alongside a save, which is what happened —
         // put two futures through `sync_from_gpu_inner` together and
         // exhausted the wasm heap between them. `busy` exists to stop
-        // exactly that; generation was simply never asking it.
+        // exactly that.
+        //
+        // A single attempt, not a retry: if the GPU is busy, this
+        // returns "busy" once and stops. Nothing here polls or loops
+        // waiting for training to let go of the device.
         if self.acquire().is_err() {
             return GenerationResult {
                 text: String::new(),
@@ -708,6 +734,32 @@ impl WasmLLM {
             repetition_penalty, seed, on_token).await;
         self.release();
         result
+    }
+
+    fn sampling_config(
+        &self,
+        temperature: f32,
+        top_k: u32,
+        top_p: f32,
+        min_p: f32,
+        repetition_penalty: f32,
+        seed: f64,
+    ) -> SamplingConfig {
+        SamplingConfig {
+            temperature,
+            top_k: top_k as usize,
+            top_p,
+            min_p,
+            repetition_penalty,
+            seed: seed as u64,
+            // Never emit a token the training text does not contain. A
+            // vocabulary holds every byte value so any input can be
+            // encoded, but a model early in training has had no reason to
+            // push the unused ones down, and they are what fills an early
+            // sample with replacement characters.
+            allowed: Some(self.0.borrow().corpus.seen_tokens()),
+            ..SamplingConfig::default()
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -724,21 +776,7 @@ impl WasmLLM {
         on_token: &js_sys::Function,
     ) -> GenerationResult {
         let request = self.build_request(&prompt, &extra_context);
-        let sampling = SamplingConfig {
-            temperature,
-            top_k: top_k as usize,
-            top_p,
-            min_p,
-            repetition_penalty,
-            seed: seed as u64,
-            // Never emit a token the training text does not contain. A
-            // vocabulary holds every byte value so any input can be
-            // encoded, but a model early in training has had no reason to
-            // push the unused ones down, and they are what fills an early
-            // sample with replacement characters.
-            allowed: Some(self.0.borrow().corpus.seen_tokens()),
-            ..SamplingConfig::default()
-        };
+        let sampling = self.sampling_config(temperature, top_k, top_p, min_p, repetition_penalty, seed);
 
         // Training since the last generation left the current weights on
         // the GPU's training buffers; bring them across and re-upload

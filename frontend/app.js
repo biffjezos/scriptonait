@@ -1904,6 +1904,16 @@ $('train-btn').addEventListener('click', async () => {
       sampleEvery: $('sample-toggle').checked ? Number($('sample-every').value) : 0,
       samplePrompt: $('sample-prompt').value.trim() || 'Write a 40 word scene.',
       sampleWords: 40,
+      // Training samples are generated with the Inference tab's own
+      // settings, not a second hidden set — the same fields Generate
+      // reads.
+      sampling: {
+        temperature: Number($('opt-temperature').value),
+        topK: Number($('opt-top-k').value),
+        topP: Number($('opt-top-p').value),
+        minP: Number($('opt-min-p').value),
+        repetitionPenalty: Number($('opt-repetition').value),
+      },
     }, [], 0);
 
     if (result.stopReason === 'already-training') {
