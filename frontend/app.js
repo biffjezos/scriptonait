@@ -1097,6 +1097,21 @@ const validationHistory = [];
 /// only gap worth reading.
 const probeHistory = [];
 
+/// What the most recent step's batch actually trained on, by title —
+/// which sources, since a batch can (and, thanks to the source rotation,
+/// usually does) draw from several different ones per step, not the same
+/// document run after run.
+function describeBatchSources(ids) {
+  if (!ids || ids.length === 0) return '';
+  const titles = [...new Set(ids)].map((id) => {
+    const source = sources.find((s) => s.id === id);
+    return source ? source.title : id;
+  });
+  const shown = titles.slice(0, 3).join(', ');
+  const rest = titles.length > 3 ? ` +${titles.length - 3} more` : '';
+  return `Training on: ${shown}${rest}`;
+}
+
 onStream('train-progress', (progress) => {
   setProgress('train-progress-bar', progress.fractionDone);
   const on = model && model.device ? ` · on ${model.device}` : '';
@@ -1109,6 +1124,7 @@ onStream('train-progress', (progress) => {
   $('train-stats').textContent =
     `step ${progress.step.toLocaleString()} · loss ${progress.smoothedLoss.toFixed(3)}${held} · ` +
     `${progress.tokensPerSecond.toFixed(0)} tokens/s · ${formatDuration(progress.elapsedSeconds)} elapsed${on}`;
+  $('train-window').textContent = describeBatchSources(progress.sources);
   setTitleProgress('Fine-tuning', progress.fractionDone);
   lossHistory.push(progress.smoothedLoss);
   if (

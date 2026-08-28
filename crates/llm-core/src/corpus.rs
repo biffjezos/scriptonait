@@ -97,6 +97,12 @@ pub struct Corpus {
     /// be nudged away from starting with the same one the last pass just
     /// ended on.
     last_source: Option<String>,
+    /// The source id each window in the most recent `sample_batch` call
+    /// came from, in draw order — so the page can show what a step
+    /// actually just trained on, not just that a step happened. Replaced
+    /// wholesale at the start of every `sample_batch` call, not
+    /// accumulated.
+    last_batch_sources: Vec<String>,
     /// See `DEFAULT_BOUNDARY_SAMPLE_RATE` and `set_boundary_sample_rate`.
     boundary_sample_rate: f32,
     /// Every distinct word the sources use, built once and thrown away
@@ -145,6 +151,7 @@ impl Corpus {
             window_cursors: HashMap::new(),
             rotation: VecDeque::new(),
             last_source: None,
+            last_batch_sources: Vec::new(),
             boundary_sample_rate: DEFAULT_BOUNDARY_SAMPLE_RATE,
             word_vocab: None,
             dirty: true,
@@ -627,6 +634,7 @@ impl Corpus {
 
         let mut inputs = Vec::with_capacity(batch_size * context_len);
         let mut targets = Vec::with_capacity(batch_size * context_len);
+        self.last_batch_sources.clear();
         for _ in 0..batch_size {
             if self.rotation.is_empty() {
                 self.refill_rotation(&usable, rng);
@@ -652,6 +660,7 @@ impl Corpus {
                 continue;
             }
             *self.sample_counts.entry(id.clone()).or_default() += 1;
+            self.last_batch_sources.push(id.clone());
             inputs.extend_from_slice(&self.flat_cache[start..start + context_len]);
             targets.extend_from_slice(&self.flat_cache[start + 1..start + 1 + context_len]);
             self.last_source = Some(id);
@@ -683,6 +692,12 @@ impl Corpus {
             }
         }
         self.rotation = ids.into();
+    }
+
+    /// The source id each window in the most recent `sample_batch` call
+    /// came from, in draw order.
+    pub fn last_batch_sources(&self) -> &[String] {
+        &self.last_batch_sources
     }
 
     /// This source's progress through its own shuffled pass over its
@@ -1292,5 +1307,19 @@ mod tests {
         c.upsert("a", "hello world", false);
         c.set_window_progress("nonexistent", 1, 5);
         assert!(c.window_progress("nonexistent").is_none());
+    }
+
+    #[test]
+    fn last_batch_sources_names_where_each_window_of_the_latest_batch_came_from() {
+        let mut c = Corpus::new();
+        for letter in ["a", "b", "c"] {
+            c.upsert(letter, &format!("{letter} ").repeat(4000), false);
+        }
+        let mut rng = Rng::seed_from_u64(3);
+        let batch = c.sample_batch(3, 16, &mut rng).expect("should sample");
+        assert_eq!(c.last_batch_sources().len(), batch.batch_size);
+        // Replaced wholesale, not accumulated across calls.
+        let second = c.sample_batch(2, 16, &mut rng).expect("should sample");
+        assert_eq!(c.last_batch_sources().len(), second.batch_size);
     }
 }

@@ -1187,6 +1187,9 @@ async function train({
           elapsedSeconds: elapsed,
           tokensPerSecond: elapsed > 0 ? tokens / elapsed : 0,
           fractionDone: maxSteps > 0 ? steps / maxSteps : 0,
+          // Source ids this step's batch actually drew windows from —
+          // ids, not titles, since the page (not the worker) knows those.
+          sources: JSON.parse(report.sources),
         });
       }
       if (stopRequested || (maxSteps > 0 && steps >= maxSteps)) break;
