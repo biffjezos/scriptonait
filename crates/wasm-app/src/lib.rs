@@ -38,7 +38,9 @@ use llm_core::train::TrainConfig;
 /// generation, and — once training starts — the resident training state.
 struct GpuBackend {
     ctx: Rc<llm_gpu::GpuContext>,
-    model: llm_gpu::GpuModel,
+    /// `None` only while `generate_on_gpu` has it checked out for the
+    /// duration of a generation — see that function's comment for why.
+    model: Option<llm_gpu::GpuModel>,
     /// Allocated on the first training step, not at init: it holds the
     /// gradients, both Adam moments and every layer's activations, which
     /// is several times the model's own size and pointless to reserve
@@ -624,7 +626,7 @@ impl WasmLLM {
         let step = self.0.borrow().step;
         self.0.borrow_mut().gpu = Some(GpuBackend {
             ctx,
-            model,
+            model: Some(model),
             trainer: None,
             uploaded_at_step: step,
             summary: summary.clone(),
@@ -718,13 +720,20 @@ impl WasmLLM {
         repetition_penalty: f32,
         seed: f64,
         prefer_gpu: bool,
+        // A hard ceiling on tokens generated, overriding the length the
+        // prompt itself asked for ("write a 700 word novel..."). 0 means
+        // no override — length stays whatever the prompt implies (or the
+        // default budget, if it implies nothing), exactly as before this
+        // parameter existed.
+        max_tokens: u32,
         on_token: &js_sys::Function,
     ) -> GenerationResult {
+        let max_tokens_override = (max_tokens > 0).then_some(max_tokens as usize);
         if !prefer_gpu {
             let request = self.build_request(&prompt, &extra_context);
             let sampling =
                 self.sampling_config(temperature, top_k, top_p, min_p, repetition_penalty, seed);
-            return self.generate_on_cpu(&request, &sampling, on_token);
+            return self.generate_on_cpu(&request, &sampling, max_tokens_override, on_token);
         }
 
         // Generation owns the GPU for as long as it runs, and it pulls
@@ -746,7 +755,7 @@ impl WasmLLM {
             };
         }
         let result = self.generate_inner(prompt, extra_context, temperature, top_k, top_p, min_p,
-            repetition_penalty, seed, on_token).await;
+            repetition_penalty, seed, max_tokens_override, on_token).await;
         self.release();
         result
     }
@@ -788,6 +797,7 @@ impl WasmLLM {
         min_p: f32,
         repetition_penalty: f32,
         seed: f64,
+        max_tokens_override: Option<usize>,
         on_token: &js_sys::Function,
     ) -> GenerationResult {
         let request = self.build_request(&prompt, &extra_context);
@@ -805,7 +815,7 @@ impl WasmLLM {
             inner.gpu.as_ref().is_some_and(|g| g.uploaded_at_step == inner.step)
         };
         if gpu_is_current {
-            match self.generate_on_gpu(&request, &sampling, on_token).await {
+            match self.generate_on_gpu(&request, &sampling, max_tokens_override, on_token).await {
                 Ok(result) => return result,
                 Err(_) => {
                     // A device that was lost or a kernel that failed:
@@ -815,7 +825,7 @@ impl WasmLLM {
                 }
             }
         }
-        self.generate_on_cpu(&request, &sampling, on_token)
+        self.generate_on_cpu(&request, &sampling, max_tokens_override, on_token)
     }
 
     fn build_request(&self, prompt: &str, extra_context: &str) -> instruct::Request {
@@ -834,6 +844,7 @@ impl WasmLLM {
         &self,
         request: &instruct::Request,
         sampling: &SamplingConfig,
+        max_tokens_override: Option<usize>,
         on_token: &js_sys::Function,
     ) -> GenerationResult {
         let inner = self.0.borrow();
@@ -843,6 +854,7 @@ impl WasmLLM {
             inner.corpus.tokenizer(),
             request,
             sampling,
+            max_tokens_override,
             &mut |piece, words| report(on_token, piece, words),
         );
         GenerationResult::from_response(response)
@@ -858,6 +870,7 @@ impl WasmLLM {
         &self,
         request: &instruct::Request,
         sampling: &SamplingConfig,
+        max_tokens_override: Option<usize>,
         on_token: &js_sys::Function,
     ) -> Result<GenerationResult, String> {
         let (weights, config, tokenizer, prompt_tokens) = {
@@ -868,15 +881,25 @@ impl WasmLLM {
         };
 
         let (mut logits, cache) = llm_core::model::prefill(&weights, &config, &prompt_tokens);
-        let ctx = {
+        // The model comes out of `Inner` for the rest of this call, the
+        // same pattern `train_step_inner` uses for the trainer: holding a
+        // `RefCell` borrow across `decode_step`'s `.await` below would
+        // panic the moment CPU inference — which never checks `busy`, by
+        // design, so it does not wait for this to finish — ran while a
+        // token was mid-flight here. `gpu.model` is restored once the
+        // loop ends; on an error mid-loop it stays `None`, which is fine
+        // because the caller (`generate_inner`) drops the whole `gpu`
+        // backend on any `Err` from here.
+        let (ctx, mut model) = {
             let mut inner = self.0.borrow_mut();
             let gpu = inner.gpu.as_mut().ok_or("no GPU")?;
-            gpu.model.seed_from_cpu_cache(&gpu.ctx, &cache);
-            gpu.ctx.clone()
+            let mut model = gpu.model.take().ok_or("no GPU")?;
+            model.seed_from_cpu_cache(&gpu.ctx, &cache);
+            (gpu.ctx.clone(), model)
         };
 
         let mut guard = instruct::LengthGuard::new(request.target_words);
-        let max_new_tokens = guard.token_budget();
+        let max_new_tokens = max_tokens_override.unwrap_or_else(|| guard.token_budget());
         let mut rng = llm_core::rng::Rng::seed_from_u64(sampling.seed);
         let mut produced: Vec<u32> = Vec::new();
         let mut recent: Vec<u32> = prompt_tokens.clone();
@@ -905,11 +928,14 @@ impl WasmLLM {
                 break;
             }
 
-            logits = {
-                let mut inner = self.0.borrow_mut();
-                let gpu = inner.gpu.as_mut().ok_or("no GPU")?;
-                gpu.model.decode_step(&ctx, next).await?
-            };
+            logits = model.decode_step(&ctx, next).await?;
+        }
+
+        {
+            let mut inner = self.0.borrow_mut();
+            if let Some(gpu) = inner.gpu.as_mut() {
+                gpu.model = Some(model);
+            }
         }
 
         if !pending.is_empty() {
@@ -1420,7 +1446,7 @@ impl WasmLLM {
         inner.pretrained = true;
         let step = inner.step;
         if let Some(gpu) = inner.gpu.as_mut() {
-            gpu.model = model;
+            gpu.model = Some(model);
             gpu.uploaded_at_step = step;
         }
         Ok(())

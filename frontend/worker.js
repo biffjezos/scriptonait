@@ -291,7 +291,7 @@ function describePrompt(prompt) {
   };
 }
 
-async function generate({ prompt, extraContext, temperature, topK, topP, minP, repetitionPenalty, seed }) {
+async function generate({ prompt, extraContext, temperature, topK, topP, minP, repetitionPenalty, seed, maxTokens }) {
   stopRequested = false;
   const startedAt = performance.now();
   let lastPost = 0;
@@ -307,6 +307,9 @@ async function generate({ prompt, extraContext, temperature, topK, topP, minP, r
     repetitionPenalty,
     seed,
     inferenceDevice !== 'cpu',
+    // 0 = continuous: length stays whatever the prompt itself asks for
+    // (or the default budget, if it asks for nothing).
+    maxTokens || 0,
     (piece, words) => {
       tokens += 1;
       // Text goes back immediately — that's what makes the page feel
@@ -379,6 +382,9 @@ async function trainingSample(prompt, words, sampling) {
     // the weights the run just produced, not concurrently with anything
     // that would make CPU inference's race-free guarantee matter.
     true,
+    // No override: the (_piece, produced) => produced < words callback
+    // below already stops the sample at the right length.
+    0,
     (_piece, produced) => produced < words,
   );
   return result.text;

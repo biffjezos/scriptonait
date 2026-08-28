@@ -56,11 +56,6 @@ h1 {
   letter-spacing: -0.02em;
 }
 
-.tagline {
-  color: var(--text-dim);
-  margin: 0;
-}
-
 .warning {
   background: color-mix(in srgb, var(--danger) 15%, transparent);
   border: 1px solid var(--danger);

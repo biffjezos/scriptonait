@@ -285,13 +285,10 @@ function updateGuidance() {
   const where = typedBatch > 0
     ? ''
     : machineProfile && profileShapeMatches(machineProfile)
-      ? ' (measured on this machine)'
-      : ' — a fallback, not a measurement: press Train and this machine gets benchmarked first, ' +
-        'or type a number here';
+      ? ' (measured)'
+      : ' (default)';
   $('batch-hint').textContent =
-    `Batch size costs time, not memory: the sequences of a batch run one at a time and their ` +
-    `gradients add up. ${batch}${where} x ${context} = ` +
-    `${(batch * context).toLocaleString()} tokens per step.`;
+    `${batch}${where} x ${context} = ${(batch * context).toLocaleString()} tokens per step.`;
 
   const explains = $('train-explains');
   explains.textContent = !canTrain
@@ -299,7 +296,7 @@ function updateGuidance() {
     : !model
       ? 'New model, from scratch, trained on your GPU.'
       : model.pretrained
-        ? 'Nudges the loaded model toward your writing.'
+        ? ''
         : 'Continues where it stopped.';
 
   if (training) {
@@ -317,7 +314,7 @@ function updateGuidance() {
   } else if (model.step < 500) {
     step.textContent = 'Barely trained. Keep training, or generate in Inference.';
   } else {
-    step.textContent = 'Ready. Type a prompt in Inference.';
+    step.textContent = '';
   }
 
   renderMachineProfile();
@@ -412,9 +409,7 @@ function renderModelShape(info) {
     if (info) field.value = value;
     field.disabled = Boolean(info);
   }
-  $('shape-hint').textContent = info
-    ? "This model's shape. Fixed — training continues the model you have."
-    : 'New model shape:';
+  $('shape-hint').textContent = info ? 'Fixed' : 'New model shape:';
   refreshShapeEstimate();
 }
 
@@ -639,6 +634,16 @@ onStream('generate-progress', ({ words, tokens, elapsedSeconds, tokensPerSecond 
   setTitleProgress('Writing', fraction);
 });
 
+/// Continuous leaves length to whatever the prompt itself asks for (or
+/// the default budget, if it asks for nothing) — today's behavior.
+/// Limit hands the field's value straight through as a hard token
+/// ceiling, overriding that regardless of what the prompt says.
+function applyLengthMode() {
+  $('opt-max-tokens').disabled = $('opt-length-mode').value !== 'limit';
+}
+$('opt-length-mode').addEventListener('change', applyLengthMode);
+applyLengthMode();
+
 $('generate-btn').addEventListener('click', async () => {
   if (generating) return;
   const prompt = $('prompt-input').value.trim();
@@ -669,6 +674,7 @@ $('generate-btn').addEventListener('click', async () => {
       minP: Number($('opt-min-p').value),
       repetitionPenalty: Number($('opt-repetition').value),
       seed: Number($('opt-seed').value) || Math.floor(Math.random() * 1e9),
+      maxTokens: $('opt-length-mode').value === 'limit' ? Number($('opt-max-tokens').value) : 0,
     }, [], 0);
     setProgress('generate-progress-bar', 1);
     const why = {
@@ -2202,15 +2208,22 @@ $('import-input').addEventListener('change', async (event) => {
 $('export-project-btn').addEventListener('click', async () => {
   clearError();
   try {
+    // Source saves go through persistLater's fire-and-forget chain —
+    // addSources doesn't wait for it, so a source added moments ago
+    // could still be in flight. Wait for it to drain before reading
+    // db.listSources(), or a fast export-right-after-add misses it.
+    await persistChain;
     const checkpointBytes = model ? (await call('export-checkpoint')).bytes : null;
     const optimizerBytes = model
       ? await call('export-optimizer').then((r) => r.bytes).catch(() => null)
       : null;
+    const exportedSources = await db.listSources();
+    const exportedHistory = await db.listHistory();
     const blob = project.buildProjectFile({
       checkpointBytes,
       optimizerBytes,
-      sources: await db.listSources(),
-      history: await db.listHistory(),
+      sources: exportedSources,
+      history: exportedHistory,
       settings: {
         autosaveConfig: await db.getAutosaveConfig(),
         devicePreference: await db.getDevicePreference(),
@@ -2218,6 +2231,12 @@ $('export-project-btn').addEventListener('click', async () => {
         trainingPlan: await db.getTrainingPlanSettings(),
       },
     });
+    console.info(
+      `[scriptonait] exporting project: ${exportedSources.length} source(s), ` +
+        `${exportedHistory.length} history row(s), ` +
+        `checkpoint ${checkpointBytes ? `${checkpointBytes.byteLength} bytes` : 'none (no model)'}, ` +
+        `${blob.size} bytes total`,
+    );
     const url = URL.createObjectURL(blob);
     const link = document.createElement('a');
     link.href = url;
@@ -2241,6 +2260,12 @@ $('import-project-input').addEventListener('change', async (event) => {
   try {
     const buffer = await file.arrayBuffer();
     const { header, checkpointBytes, optimizerBytes } = project.parseProjectFile(buffer);
+    console.info(
+      `[scriptonait] importing ${file.name} (${buffer.byteLength} bytes): ` +
+        `${(header.sources || []).length} source(s), ${(header.history || []).length} history row(s), ` +
+        `checkpoint ${checkpointBytes ? `${checkpointBytes.byteLength} bytes` : 'none'}, ` +
+        `optimizer ${optimizerBytes ? `${optimizerBytes.byteLength} bytes` : 'none'}`,
+    );
 
     await db.replaceAllSources(header.sources || []);
     await db.replaceAllHistory(header.history || []);
