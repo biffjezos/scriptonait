@@ -1928,6 +1928,39 @@ $('opening-rate').addEventListener('change', () => {
   if (rate >= 0) call('set-boundary-sample-rate', { rate: rate / 100 }).catch(() => {});
 });
 
+/// The rest of what a training run reads from these two tabs, pushed to
+/// a run already in flight the same way peak-learning-rate and
+/// source-opening windows already are — a run started at step 0 should
+/// not have to be stopped and restarted just to pick up a frequency or a
+/// sampling setting changed at step 3,400. Read straight off the
+/// controls rather than any cached copy of them, so this can never race
+/// a listener elsewhere that also reacts to the same change. A no-op
+/// before any model exists — the worker just keeps the values for
+/// whenever Train is next pressed.
+function pushLiveTrainingSettings() {
+  call('update-training-settings', {
+    autosaveFrequencySteps: Math.max(1, Number($('autosave-frequency').value) || 1000),
+    metricsEvery: Number($('metrics-every').value) || 0,
+    sampleEvery: $('sample-toggle').checked ? Number($('sample-every').value) : 0,
+    samplePrompt: $('prompt-input').value.trim() || 'Write a 40 word scene.',
+    sampleMaxTokens: $('opt-length-mode').value === 'limit' ? Number($('opt-max-tokens').value) : 0,
+    sampling: {
+      temperature: Number($('opt-temperature').value),
+      topK: Number($('opt-top-k').value),
+      topP: Number($('opt-top-p').value),
+      minP: Number($('opt-min-p').value),
+      repetitionPenalty: Number($('opt-repetition').value),
+    },
+  }).catch(() => {});
+}
+for (const id of [
+  'sample-toggle', 'sample-every', 'metrics-every', 'autosave-frequency', 'prompt-input',
+  'opt-temperature', 'opt-top-k', 'opt-top-p', 'opt-min-p', 'opt-repetition',
+  'opt-length-mode', 'opt-max-tokens',
+]) {
+  $(id).addEventListener('change', pushLiveTrainingSettings);
+}
+
 onStream('bench-progress', ({ stage, dispatchesPerSubmit }) => {
   if (!benchmarking || stage !== 'chunk') return;
   $('machine-profile-text').textContent =

@@ -995,11 +995,48 @@ function recordEvent(step, kind, text, extra = {}) {
   post('train-record', { runId, step, kind, text, at: Date.now(), ...extra });
 }
 
+/// Everything a run in flight reads on every cycle rather than once at
+/// the top of `train()` — the settings a page control can change while
+/// training is already going (autosave/metrics cadence, the sample
+/// prompt and its length and sampling knobs). `update-training-settings`
+/// writes into this object; `train()`'s loop only ever reads from it, so
+/// a change lands on the very next check rather than waiting for the
+/// next Train click. Batch size, effort and the initial learning rate
+/// stay one-shot `train()` parameters instead — they size GPU buffers or
+/// set the loop's own pacing at start, not something safe to swap mid-run.
+const live = {
+  autosaveEvery: AUTOSAVE_EVERY_STEPS,
+  validateEvery: VALIDATE_EVERY,
+  sampleEvery: 0,
+  samplePrompt: '',
+  sampleMaxTokens: 0,
+  sampling: null,
+};
+
+/// One place both `train()` (seeding from the settings a run started
+/// with) and the `update-training-settings` handler (applying a change
+/// mid-run) go through, so the two can never disagree about what "0" or
+/// "missing" falls back to.
+function applyLiveSettings({
+  autosaveFrequencySteps, metricsEvery, sampleEvery, samplePrompt, sampleMaxTokens, sampling,
+} = {}) {
+  if (typeof autosaveFrequencySteps === 'number') {
+    live.autosaveEvery = autosaveFrequencySteps > 0 ? autosaveFrequencySteps : AUTOSAVE_EVERY_STEPS;
+  }
+  if (typeof metricsEvery === 'number') {
+    live.validateEvery = metricsEvery > 0 ? metricsEvery : VALIDATE_EVERY;
+  }
+  if (typeof sampleEvery === 'number') live.sampleEvery = sampleEvery;
+  if (typeof samplePrompt === 'string') live.samplePrompt = samplePrompt;
+  if (typeof sampleMaxTokens === 'number') live.sampleMaxTokens = sampleMaxTokens;
+  if (sampling) live.sampling = sampling;
+}
+
 async function train({
   batchSize, learningRate, maxSteps, effort, sampleEvery, samplePrompt, sampleMaxTokens, sampling,
   autosaveFrequencySteps, metricsEvery,
 }) {
-  const autosaveEvery = autosaveFrequencySteps > 0 ? autosaveFrequencySteps : AUTOSAVE_EVERY_STEPS;
+  applyLiveSettings({ autosaveFrequencySteps, metricsEvery, sampleEvery, samplePrompt, sampleMaxTokens, sampling });
   stopRequested = false;
   training = true;
   runId = `run-${Date.now().toString(36)}`;
@@ -1046,23 +1083,22 @@ async function train({
   let smoothedLoss = null;
   // First sample after the first interval, not immediately: a sample at
   // step 0 is noise from an untouched model.
-  let nextSampleAt = llm.step() + (sampleEvery || 0);
+  let nextSampleAt = llm.step() + (live.sampleEvery || 0);
   // Held-out loss on the same cadence as the loss chart's own reporting:
   // often enough to see the two curves separate, rare enough that its
   // forward passes are a rounding error against training. A Settings-tab
   // value overrides the default; 0 or missing falls back to it rather
   // than turning measurement off — there is no "never" for this, since
   // the plateau detector depends on it.
-  const validateEvery = metricsEvery > 0 ? metricsEvery : VALIDATE_EVERY;
   log(
-    `held-out loss will be measured every ${validateEvery} steps on a fixed set of ` +
+    `held-out loss will be measured every ${live.validateEvery} steps on a fixed set of ` +
       `${VALIDATION_WINDOWS} windows (${VALIDATION_WINDOWS * info.context_len} tokens), the ` +
       'same windows each time — so two measurements differ only because the weights differ',
   );
-  let nextValidateAt = llm.step() + validateEvery;
+  let nextValidateAt = llm.step() + live.validateEvery;
   // Counted from where this run starts, so a model at step 4,441 does
   // not save on its very first progress report.
-  let nextAutosaveAt = llm.step() + autosaveEvery;
+  let nextAutosaveAt = llm.step() + live.autosaveEvery;
   let validationLoss = null;
   // Held-out losses in order, so the run can say when more text would
   // help more than more steps.
@@ -1234,7 +1270,7 @@ async function train({
 
     // Held-out loss, between slices for the same reason sampling is.
     if (llm.step() >= nextValidateAt) {
-      nextValidateAt = llm.step() + validateEvery;
+      nextValidateAt = llm.step() + live.validateEvery;
       try {
         const measured = await llm.validation_loss(VALIDATION_WINDOWS);
         // The comparable training number: the same number of windows,
@@ -1379,7 +1415,7 @@ async function train({
     // last produced, which looks exactly like a model that stopped
     // getting better.
     if (llm.step() >= nextAutosaveAt) {
-      nextAutosaveAt = llm.step() + autosaveEvery;
+      nextAutosaveAt = llm.step() + live.autosaveEvery;
       const savedAt = performance.now();
       try {
         const bytes = await llm.export_checkpoint();
@@ -1400,8 +1436,8 @@ async function train({
     // takes and shouldn't be counted against a slice's time budget.
     // Keyed on the model's own step count, so the interval means the
     // same thing across stop/resume.
-    if (sampleEvery > 0 && llm.step() >= nextSampleAt) {
-      nextSampleAt = llm.step() + sampleEvery;
+    if (live.sampleEvery > 0 && llm.step() >= nextSampleAt) {
+      nextSampleAt = llm.step() + live.sampleEvery;
       if (inferenceDevice === 'cpu') {
         // CPU generation never pulls weights off the GPU on its own (see
         // WasmLLM::generate) - that's what makes it race-free, but left
@@ -1414,7 +1450,7 @@ async function train({
         // sample rather than waiting for it - then the generation itself
         // still runs unawaited, so it never pauses training.
         llm.sync_from_gpu().catch(() => {}).finally(() => {
-          runTrainingSample(samplePrompt, sampleMaxTokens, sampling).catch((error) => {
+          runTrainingSample(live.samplePrompt, live.sampleMaxTokens, live.sampling).catch((error) => {
             log(`sample failed: ${(error && error.message) || error}`);
           });
         });
@@ -1423,7 +1459,7 @@ async function train({
         // to serialize with it — awaited here, between slices, never
         // inside one.
         try {
-          await runTrainingSample(samplePrompt, sampleMaxTokens, sampling);
+          await runTrainingSample(live.samplePrompt, live.sampleMaxTokens, live.sampling);
         } catch (error) {
           log(`sample failed: ${(error && error.message) || error}`);
         }
@@ -1816,6 +1852,16 @@ const handlers = {
       log(`training failed: ${explained}`);
       throw new Error(explained);
     }
+  },
+
+  /// Apply a Settings/Inference-tab change to the run in flight, whether
+  /// one is going or not — the same values a training run's own settings
+  /// take, updated here instead of only ever being read once when Train
+  /// is pressed. Harmless before any run exists: it just updates `live`,
+  /// which the next run also starts from.
+  async 'update-training-settings'(settings) {
+    applyLiveSettings(settings);
+    return { ok: true };
   },
 
   /// Change the peak learning rate while a run is in flight.
