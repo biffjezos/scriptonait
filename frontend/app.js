@@ -2308,11 +2308,12 @@ $('import-input').addEventListener('change', async (event) => {
   const file = event.target.files[0];
   if (!file) return;
   clearError();
-  setModelStatus('loading', `Loading ${file.name}…`);
+  notice(`Loading ${file.name}…`, 'info');
   try {
     const buffer = await file.arrayBuffer();
     renderModel(await call('import-checkpoint', { bytes: buffer }, [buffer]));
     await syncAllSources();
+    notice(`Loaded ${file.name}.`, 'success');
     } catch (error) {
     showError(`that file didn't load: ${error.message}`);
     setModelStatus('absent', 'No model loaded.');
@@ -2390,7 +2391,6 @@ $('import-project-input').addEventListener('change', async (event) => {
     return;
   }
   clearError();
-  setModelStatus('loading', `Loading ${file.name}…`);
   // The same staged progress the page's own startup restore shows —
   // several real seconds of work (parsing the file, then the model,
   // corpus and history each round-tripping through the worker and
@@ -2413,6 +2413,17 @@ $('import-project-input').addEventListener('change', async (event) => {
     if (settings.devicePreference) await db.putDevicePreference(settings.devicePreference);
     if (settings.benchmarkConfig) await db.putBenchmarkConfig(settings.benchmarkConfig);
     if (settings.trainingPlan) await db.putTrainingPlanSettings(settings.trainingPlan);
+
+    // Before the corpus gets rebuilt, not after: syncAllSources (called
+    // below, both directly and inside restoreModel-shaped paths) reads
+    // #opening-rate straight off the DOM to push the boundary-sample
+    // rate to the freshly created corpus. Restoring settings afterward
+    // meant that read still saw whatever was on screen before the
+    // import — so a project's own opening-window rate (and every other
+    // field this restores) never actually reached the rebuilt corpus,
+    // even though it was sitting correctly in IndexedDB and the field
+    // itself updated a moment later.
+    await applyLoadedSettings();
 
     if (checkpointBytes) {
       notice('Restoring model…', 'info');
@@ -2445,7 +2456,6 @@ $('import-project-input').addEventListener('change', async (event) => {
     history.push(...(await db.listHistory()));
     renderHistory();
     rebuildChartFromHistory();
-    await applyLoadedSettings();
     updateGuidance();
     notice(`Imported ${file.name}.`, 'success');
   } catch (error) {
@@ -2776,7 +2786,6 @@ async function restoreModel() {
     return;
   }
   if (!stored || !stored.bytes) return;
-  setModelStatus('loading', 'Loading your saved model…');
   try {
     renderModel(await call('load-model', { bytes: stored.bytes }, [], 0));
     await syncAllSources();
@@ -2871,9 +2880,17 @@ async function applyLoadedSettings() {
   // waits on IndexedDB and the worker (sources, model, history) with
   // nothing to show for it in between — it reads as a hang rather than
   // as several seconds of real work. The one notification bar the page
-  // already has for transient status carries it, one line per stage,
-  // rather than adding a second place to look.
-  notice('Restoring your project…', 'info');
+  // already has for transient status carries it, one line per stage —
+  // but only when there is actually something being restored. A first
+  // visit with nothing saved yet has to stay silent about it; narrating
+  // a restore that didn't happen is worse than saying nothing.
+  const [hasModel, sourceCount, historyCount] = await Promise.all([
+    db.getModel().then((m) => Boolean(m && m.bytes)).catch(() => false),
+    db.listSources().then((rows) => (rows || []).length).catch(() => 0),
+    db.listHistory().then((rows) => (rows || []).length).catch(() => 0),
+  ]);
+  const hasProject = hasModel || sourceCount > 0 || historyCount > 0;
+  if (hasProject) notice('Restoring your project…', 'info');
 
   // Settings, before anything reads them.
   await applyLoadedSettings();
@@ -2888,11 +2905,11 @@ async function applyLoadedSettings() {
   // Nothing is fetched from the network here. The page loads, shows what
   // you already have — including the model your last visit trained — and
   // waits. No model is downloaded, ever.
-  notice('Restoring corpus…', 'info');
+  if (sourceCount > 0) notice('Restoring corpus…', 'info');
   await refreshSources();
   setModelStatus('absent', 'No model yet.');
   updateGuidance();
-  notice('Restoring model…', 'info');
+  if (hasModel) notice('Restoring model…', 'info');
   await restoreModel();
   updateGuidance();
   // What to do next, before anything has been trained: with a model and
@@ -2905,7 +2922,7 @@ async function applyLoadedSettings() {
   // What every previous run measured. This is why the history is in
   // IndexedDB and not in a variable: the run worth understanding is
   // usually the one from yesterday.
-  notice('Restoring history…', 'info');
+  if (historyCount > 0) notice('Restoring history…', 'info');
   try {
     history.push(...(await db.listHistory()));
     renderHistory();
@@ -2913,5 +2930,5 @@ async function applyLoadedSettings() {
   } catch (error) {
     console.warn('[scriptonait] could not read the run history', error);
   }
-  notice('Project restored.', 'success');
+  if (hasProject) notice('Project restored.', 'success');
 })();
