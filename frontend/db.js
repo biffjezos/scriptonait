@@ -413,10 +413,16 @@ export async function clearHistory() {
 
 /// Replace the whole run history with `rows` — a project import's job.
 /// Rows keep the ids they were exported with, so ordering (run id, then
-/// zero-padded step) survives the round trip untouched.
+/// zero-padded step) survives the round trip untouched. A row exported
+/// without one (a project file saved before the in-memory copy backfilled
+/// it from appendHistory's return value) gets a fresh id here rather than
+/// failing the whole import — the store's keyPath requires one on every
+/// put, and a project file otherwise intact shouldn't be unrecoverable
+/// over rows whose only fault is a missing id.
 export async function replaceAllHistory(rows) {
   await clearHistory();
   for (const row of rows) {
-    await withStore(HISTORY_STORE, 'readwrite', (store) => store.put(row));
+    const stored = row.id ? row : { ...row, id: historyKey(row.runId || 'imported', row.step || 0) };
+    await withStore(HISTORY_STORE, 'readwrite', (store) => store.put(stored));
   }
 }

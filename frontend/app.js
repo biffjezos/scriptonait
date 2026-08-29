@@ -617,14 +617,18 @@ onStream('gpu-status', ({ available, device, reason, report }) => {
     loadMachineProfile().catch((error) => console.warn('[scriptonait]', error));
     console.info(`[scriptonait] device: ${device}`, report || {});
     if (report && report.isSoftware) {
-      console.warn(
-        '[scriptonait] this is a software renderer, not your GPU — training will be slow',
-      );
+      console.warn('[scriptonait] this is a software renderer, not your GPU — training will be slow');
+      notice('This browser gave the page a software renderer, not your GPU — training will be slow.', 'info');
     }
   } else {
     console.warn(
       `[scriptonait] no WebGPU (${reason || 'unavailable'}): generation runs on the CPU, ` +
         'and training cannot run at all',
+    );
+    notice(
+      `No WebGPU device (${reason || 'unavailable'}): generation runs on the CPU, and training ` +
+        'cannot run at all.',
+      'error',
     );
   }
 });
@@ -700,6 +704,7 @@ $('generate-btn').addEventListener('click', async () => {
       `${result.tokensPerSecond.toFixed(0)} tokens/s · ${why}`;
     renderNotes(result.notes);
     notify('Your piece is ready', `${result.wordCount} words — ${why}.`);
+    notice(`Generated ${result.wordCount} words — ${why}.`, 'success');
     // Measure what came out, to the console. Not on the page: the piece
     // is the point, and a person reading it does not need a score
     // stapled to it — but "37% of those words are not in your corpus"
@@ -1260,7 +1265,10 @@ function renderPlan(plan) {
   // in two of them, and nobody watches a tab for twenty minutes to find
   // out which.
   if (plan.phase.key !== lastPhaseKey) {
-    if (lastPhaseKey !== null) notify(`Training: ${plan.phase.title}`, plan.phase.detail);
+    if (lastPhaseKey !== null) {
+      notify(`Training: ${plan.phase.title}`, plan.phase.detail);
+      notice(`${plan.phase.title} — ${plan.phase.detail}`, 'info');
+    }
     console.info(`[scriptonait] phase: ${plan.phase.title} — ${plan.phase.detail}`, n);
     lastPhaseKey = plan.phase.key;
   }
@@ -1317,6 +1325,7 @@ onStream('train-advice', ({ advice, step }) => {
   const box = $('train-advice');
   box.textContent = `At step ${step.toLocaleString()}: ${advice}`;
   box.hidden = false;
+  notice(advice, 'info');
   console.info(`[scriptonait] advice: ${advice}`);
   notify('Your model has stopped improving', advice);
 });
@@ -1631,9 +1640,16 @@ onStream('train-record', async (record) => {
   history.push(row);
   renderHistory();
   try {
-    await db.appendHistory(row);
+    // appendHistory synthesizes the store's id; backfill it onto the
+    // same object already sitting in `history` (not a copy — this
+    // mutates what's there) so a mid-session Export Project carries a
+    // real id on every row instead of crashing the next Import on
+    // "key path did not yield a value".
+    const stored = await db.appendHistory(row);
+    row.id = stored.id;
   } catch (error) {
     console.warn('[scriptonait] could not store a history record', error);
+    notice(`Could not save a history record: ${(error && error.message) || error}.`, 'error');
   }
 });
 
@@ -1667,6 +1683,7 @@ $('history-clear-btn').addEventListener('click', async () => {
     await db.clearHistory();
   } catch (error) {
     console.warn('[scriptonait] could not clear the history', error);
+    notice(`Could not clear the stored history: ${(error && error.message) || error}.`, 'error');
   }
 });
 
@@ -1689,9 +1706,10 @@ $('sample-next').addEventListener('click', () => {
 $('reset-schedule-btn').addEventListener('click', async () => {
   try {
     const result = await call('reset-schedule');
-    console.info(
-      `[scriptonait] schedule restored from ${result.was.toFixed(2)}x to full strength; ` +
-        `rate in force ${result.lrNow.toExponential(2)}`,
+    notice(
+      `Schedule restored from ${result.was.toFixed(2)}x to full strength — rate in force ` +
+        `${result.lrNow.toExponential(2)}.`,
+      'success',
     );
   } catch (error) {
     showError(error);
@@ -1703,7 +1721,7 @@ $('live-lr-btn').addEventListener('click', async () => {
   if (!(rate > 0)) return;
   try {
     const result = await call('update-training-settings', { peakLearningRate: rate });
-    console.info(`[scriptonait] peak learning rate is now ${result.peakLr}`);
+    notice(`Peak learning rate is now ${result.peakLr}.`, 'success');
   } catch (error) {
     showError(error);
   }
@@ -1814,6 +1832,7 @@ async function runBenchmark() {
     const result = await call('benchmark', {}, [], 0);
     if (result.error) {
       console.warn(`[scriptonait] benchmark: ${result.error}`);
+      notice(`Machine benchmark failed: ${result.error}. Falling back to safe defaults.`, 'error');
       return machineProfile;
     }
     machineProfile = await db.putMachineProfile(result.profile);
@@ -2107,6 +2126,7 @@ $('train-btn').addEventListener('click', async () => {
         `${result.steps} steps in ${formatDuration(result.elapsedSeconds)} · loss ${loss}` +
         ' · press Train again to continue';
       notify('Training finished', `${result.steps} steps, loss ${loss}.`);
+      notice(`Training finished — ${result.steps} steps, loss ${loss}.`, 'success');
     }
     if (result.model) renderModel(result.model);
     await saveModel();
@@ -2371,6 +2391,11 @@ $('import-project-input').addEventListener('change', async (event) => {
   }
   clearError();
   setModelStatus('loading', `Loading ${file.name}…`);
+  // The same staged progress the page's own startup restore shows —
+  // several real seconds of work (parsing the file, then the model,
+  // corpus and history each round-tripping through the worker and
+  // IndexedDB) with nothing on screen in between otherwise.
+  notice(`Reading ${file.name}…`, 'info');
   try {
     const buffer = await file.arrayBuffer();
     const { header, checkpointBytes, optimizerBytes } = project.parseProjectFile(buffer);
@@ -2390,6 +2415,7 @@ $('import-project-input').addEventListener('change', async (event) => {
     if (settings.trainingPlan) await db.putTrainingPlanSettings(settings.trainingPlan);
 
     if (checkpointBytes) {
+      notice('Restoring model…', 'info');
       renderModel(await call('import-checkpoint', { bytes: checkpointBytes }, [checkpointBytes]));
       if (optimizerBytes) {
         await call('import-optimizer', { bytes: optimizerBytes }, [optimizerBytes]).catch(() => {});
@@ -2412,8 +2438,10 @@ $('import-project-input').addEventListener('change', async (event) => {
     // persisted sample count (syncSource does that per source already).
     sources = [];
     history.length = 0;
+    notice('Restoring corpus…', 'info');
     await refreshSources();
     await syncAllSources();
+    notice('Restoring history…', 'info');
     history.push(...(await db.listHistory()));
     renderHistory();
     rebuildChartFromHistory();
@@ -2648,7 +2676,10 @@ async function autosave(step, { force = false, bytes: given = null } = {}) {
     flushSourceSampleCounts();
   } catch (error) {
     console.warn('[scriptonait] auto-save failed', error);
-    $('autosave-status').textContent = `Save failed at step ${step.toLocaleString()}: ${(error && error.message) || error}`;
+    // The status line keeps showing the last save that actually
+    // succeeded — overwriting it with the failure would bury that fact
+    // the moment the next save works and the line moves on.
+    showError(`Auto-save failed at step ${step.toLocaleString()}: ${(error && error.message) || error}`);
   } finally {
     autosaveInFlight = false;
   }
@@ -2741,6 +2772,7 @@ async function restoreModel() {
     stored = await db.getModel();
   } catch (error) {
     console.warn('[scriptonait] could not read the saved model:', error);
+    notice(`Could not read your saved model: ${(error && error.message) || error}.`, 'error');
     return;
   }
   if (!stored || !stored.bytes) return;
@@ -2756,10 +2788,12 @@ async function restoreModel() {
         console.info('[scriptonait] restored the optimizer state with the model');
       } catch (error) {
         console.warn('[scriptonait] optimizer state did not fit this model:', error);
+        notice('Momentum from your last session did not fit this model — resuming without it.', 'info');
       }
     }
   } catch (error) {
     console.warn('[scriptonait] the saved model would not load:', error);
+    notice(`Your saved model would not load: ${(error && error.message) || error}.`, 'error');
     setModelStatus('absent', 'No model yet.');
   }
 }
@@ -2833,6 +2867,14 @@ async function applyLoadedSettings() {
 }
 
 (async function start() {
+  // Loading a project restored from the last visit is several separate
+  // waits on IndexedDB and the worker (sources, model, history) with
+  // nothing to show for it in between — it reads as a hang rather than
+  // as several seconds of real work. The one notification bar the page
+  // already has for transient status carries it, one line per stage,
+  // rather than adding a second place to look.
+  notice('Restoring your project…', 'info');
+
   // Settings, before anything reads them.
   await applyLoadedSettings();
 
@@ -2846,9 +2888,11 @@ async function applyLoadedSettings() {
   // Nothing is fetched from the network here. The page loads, shows what
   // you already have — including the model your last visit trained — and
   // waits. No model is downloaded, ever.
+  notice('Restoring corpus…', 'info');
   await refreshSources();
   setModelStatus('absent', 'No model yet.');
   updateGuidance();
+  notice('Restoring model…', 'info');
   await restoreModel();
   updateGuidance();
   // What to do next, before anything has been trained: with a model and
@@ -2861,6 +2905,7 @@ async function applyLoadedSettings() {
   // What every previous run measured. This is why the history is in
   // IndexedDB and not in a variable: the run worth understanding is
   // usually the one from yesterday.
+  notice('Restoring history…', 'info');
   try {
     history.push(...(await db.listHistory()));
     renderHistory();
@@ -2868,4 +2913,5 @@ async function applyLoadedSettings() {
   } catch (error) {
     console.warn('[scriptonait] could not read the run history', error);
   }
+  notice('Project restored.', 'success');
 })();
