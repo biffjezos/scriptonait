@@ -679,10 +679,10 @@ $('generate-btn').addEventListener('click', async () => {
   setProgress('generate-progress-bar', 0);
   $('generate-stats').textContent = 'Starting…';
 
-  const parsed = await call('parse-prompt', { prompt });
-  targetWords = parsed.targetWords;
-
   try {
+    const parsed = await call('parse-prompt', { prompt });
+    targetWords = parsed.targetWords;
+
     const result = await call('generate', {
       prompt,
       temperature: Number($('opt-temperature').value),
