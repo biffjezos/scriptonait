@@ -1247,16 +1247,74 @@ async function train({
     while (performance.now() - sliceStart < SLICE_MS) {
       const stepStart = performance.now();
       let report;
+      // Everything through the progress post below shares one guard: a
+      // step that is refused, or anything that throws while reporting on
+      // it (a bad JSON payload, say), must not end the run in silence.
+      //
+      // It used to: the guard that stops two GPU operations overlapping
+      // returns an error, nothing caught it, the promise rejected, and
+      // the loop simply stopped — leaving the page showing the last
+      // sample it had produced, with no message anywhere. A narrower
+      // try/catch around just `train_step` fixed that call, but left the
+      // reporting code after it (which can itself throw) able to
+      // reproduce the exact same silent death. A run that ends has to
+      // say so, whichever part of the iteration is what ended it.
       try {
         report = await llm.train_step(live.batchSize);
+        if (!report) {
+          training = false;
+          return { steps, stopReason: 'no-data', elapsedSeconds: (performance.now() - startedAt) / 1000 };
+        }
+        const stepMs = performance.now() - stepStart;
+        // Exponential average, and not from the first step: that one pays
+        // for allocating every training buffer on the device.
+        if (steps > 0) {
+          recentStepMs = recentStepMs === null ? stepMs : recentStepMs * 0.9 + stepMs * 0.1;
+        }
+        steps += 1;
+        tokens += report.tokens;
+        smoothedLoss = smoothedLoss === null ? report.loss : smoothedLoss * 0.9 + report.loss * 0.1;
+        lastGradNorm = report.grad_norm;
+
+        // The first step pays for allocating every training buffer on the
+        // device, so it is logged on its own rather than averaged in.
+        if (steps === 1) {
+          log(`first step ${stepMs.toFixed(0)} ms (includes allocating GPU training state)`,
+            JSON.parse(llm.gpu_report()));
+        }
+        if (steps <= 5 || steps % 25 === 0) {
+          log(
+            `step ${report.step.toLocaleString()}: ${stepMs.toFixed(1)} ms, ` +
+              `${(report.tokens / (stepMs / 1000)).toFixed(0)} tok/s, ` +
+              `loss ${report.loss.toFixed(4)}, |grad| ${report.grad_norm.toFixed(3)}, ` +
+              `lr ${report.lr.toExponential(2)}, ` +
+              `${report.dispatches} dispatches in ${report.submits} submits ` +
+              `(${(stepMs * 1000 / Math.max(report.dispatches, 1)).toFixed(1)} us each)`,
+          );
+        }
+
+        const now = performance.now();
+        if (now - lastPost >= PROGRESS_INTERVAL_MS) {
+          lastPost = now;
+          const elapsed = (now - startedAt) / 1000;
+          post('train-progress', {
+            step: report.step,
+            steps,
+            loss: report.loss,
+            smoothedLoss,
+            validationLoss,
+            trainingProbe,
+            lr: report.lr,
+            gradNorm: report.grad_norm,
+            elapsedSeconds: elapsed,
+            tokensPerSecond: elapsed > 0 ? tokens / elapsed : 0,
+            fractionDone: live.maxSteps > 0 ? steps / live.maxSteps : 0,
+            // This step's batch, in draw order — {id, excerpt} per window.
+            // `id`, not a title: the page (not the worker) knows those.
+            sources: JSON.parse(report.sources),
+          });
+        }
       } catch (error) {
-        // A step that is refused must not end the run in silence.
-        //
-        // It used to: the guard that stops two GPU operations
-        // overlapping returns an error, nothing caught it, the promise
-        // rejected, and the loop simply stopped — leaving the page
-        // showing the last sample it had produced, with no message
-        // anywhere. A run that ends has to say so.
         training = false;
         const explained = describeTrainingFailure(error);
         log(`training stopped at step ${llm.step().toLocaleString()}: ${explained}`);
@@ -1264,60 +1322,21 @@ async function train({
         post('train-stopped', { step: llm.step(), reason: explained });
         throw error;
       }
-      if (!report) {
-        training = false;
-        return { steps, stopReason: 'no-data', elapsedSeconds: (performance.now() - startedAt) / 1000 };
-      }
-      const stepMs = performance.now() - stepStart;
-      // Exponential average, and not from the first step: that one pays
-      // for allocating every training buffer on the device.
-      if (steps > 0) {
-        recentStepMs = recentStepMs === null ? stepMs : recentStepMs * 0.9 + stepMs * 0.1;
-      }
-      steps += 1;
-      tokens += report.tokens;
-      smoothedLoss = smoothedLoss === null ? report.loss : smoothedLoss * 0.9 + report.loss * 0.1;
-      lastGradNorm = report.grad_norm;
-
-      // The first step pays for allocating every training buffer on the
-      // device, so it is logged on its own rather than averaged in.
-      if (steps === 1) {
-        log(`first step ${stepMs.toFixed(0)} ms (includes allocating GPU training state)`,
-          JSON.parse(llm.gpu_report()));
-      }
-      if (steps <= 5 || steps % 25 === 0) {
-        log(
-          `step ${report.step.toLocaleString()}: ${stepMs.toFixed(1)} ms, ` +
-            `${(report.tokens / (stepMs / 1000)).toFixed(0)} tok/s, ` +
-            `loss ${report.loss.toFixed(4)}, |grad| ${report.grad_norm.toFixed(3)}, ` +
-            `lr ${report.lr.toExponential(2)}, ` +
-            `${report.dispatches} dispatches in ${report.submits} submits ` +
-            `(${(stepMs * 1000 / Math.max(report.dispatches, 1)).toFixed(1)} us each)`,
-        );
-      }
-
-      const now = performance.now();
-      if (now - lastPost >= PROGRESS_INTERVAL_MS) {
-        lastPost = now;
-        const elapsed = (now - startedAt) / 1000;
-        post('train-progress', {
-          step: report.step,
-          steps,
-          loss: report.loss,
-          smoothedLoss,
-          validationLoss,
-          trainingProbe,
-          lr: report.lr,
-          gradNorm: report.grad_norm,
-          elapsedSeconds: elapsed,
-          tokensPerSecond: elapsed > 0 ? tokens / elapsed : 0,
-          fractionDone: live.maxSteps > 0 ? steps / live.maxSteps : 0,
-          // This step's batch, in draw order — {id, excerpt} per window.
-          // `id`, not a title: the page (not the worker) knows those.
-          sources: JSON.parse(report.sources),
-        });
-      }
-      if (stopRequested || (live.maxSteps > 0 && steps >= live.maxSteps)) break;
+      // A slice runs a fixed time budget's worth of steps, not a fixed
+      // number of them — on a fast machine that's a couple dozen steps,
+      // and the sample/validate/autosave cadences are only ever checked
+      // between slices. Left alone, "every 20 steps" quietly became
+      // "every 20 steps, rounded up to the next slice boundary" — a
+      // sample requested at step 20 landing at step 80 because that's
+      // where the first slice happened to end. Breaking out as soon as a
+      // sample is due keeps the overshoot to at most one step instead of
+      // one whole slice; the sample itself still runs after the loop,
+      // between slices, exactly as before.
+      if (
+        stopRequested ||
+        (live.maxSteps > 0 && steps >= live.maxSteps) ||
+        (live.sampleEvery > 0 && llm.step() >= nextSampleAt)
+      ) break;
     }
 
     // Held-out loss, between slices for the same reason sampling is.

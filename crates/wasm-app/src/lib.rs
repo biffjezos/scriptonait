@@ -62,12 +62,44 @@ fn js_err(msg: impl std::fmt::Display) -> JsValue {
     JsValue::from_str(&msg.to_string())
 }
 
+/// Encode `s` as a JSON string literal, quotes included.
+///
+/// Not `{:?}` (Rust's `Debug` format for `str`), which every hand-rolled
+/// JSON `format!` in this file used to reach for because it happens to
+/// look like a JSON string for ordinary text. It isn't one: `Debug`
+/// renders some control characters as `\u{1}` — variable-width, curly
+/// braces — which is not valid JSON syntax (JSON requires exactly four
+/// hex digits, no braces). A source's pasted text needs
+/// nothing more exotic than a stray vertical-tab or form-feed byte (not
+/// uncommon in text copied out of a PDF) to produce one, and
+/// `JSON.parse` on the frontend throws "Bad Unicode escape in JSON" the
+/// moment it does — which doesn't just fail that one read, it throws
+/// out of whatever call in `worker.js` triggered it, including the
+/// training loop's own progress reporting.
+fn json_string(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
 /// The most recent batch's draws as a JSON array of `{"id":..,"excerpt":..}`
-/// objects, `{:?}` handling the quoting and escaping of each string.
+/// objects.
 fn json_batch_draws(draws: &[llm_core::corpus::BatchDraw]) -> String {
     let rows = draws
         .iter()
-        .map(|d| format!("{{\"id\":{:?},\"excerpt\":{:?}}}", d.source_id, d.excerpt))
+        .map(|d| format!("{{\"id\":{},\"excerpt\":{}}}", json_string(&d.source_id), json_string(&d.excerpt)))
         .collect::<Vec<_>>()
         .join(",");
     format!("[{rows}]")
@@ -634,7 +666,12 @@ impl WasmLLM {
             .mix()
             .iter()
             .map(|(kind, tokens)| {
-                format!("{{\"kind\":{:?},\"label\":{:?},\"tokens\":{}}}", kind.key(), kind.label(), tokens)
+                format!(
+                    "{{\"kind\":{},\"label\":{},\"tokens\":{}}}",
+                    json_string(kind.key()),
+                    json_string(kind.label()),
+                    tokens
+                )
             })
             .collect::<Vec<_>>()
             .join(",");
@@ -733,13 +770,13 @@ impl WasmLLM {
         let ctx = &gpu.ctx;
         let training_bytes = gpu.trainer.as_ref().map(|t| t.allocated_bytes()).unwrap_or(0);
         format!(
-            "{{\"available\":true,\"adapter\":{:?},\"backend\":{:?},\"deviceType\":{:?},\
+            "{{\"available\":true,\"adapter\":{},\"backend\":{},\"deviceType\":{},\
              \"isSoftware\":{},\"f16\":{},\"maxWorkgroupsPerDimension\":{},\
              \"maxStorageBufferBindingSize\":{},\"maxBufferSize\":{},\
              \"trainingStateBytes\":{},\"trainerReady\":{}}}",
-            ctx.adapter_name,
-            ctx.backend,
-            ctx.device_type,
+            json_string(&ctx.adapter_name),
+            json_string(&ctx.backend),
+            json_string(&ctx.device_type),
             ctx.is_software,
             ctx.has_f16,
             ctx.max_workgroups_per_dimension,
@@ -1114,8 +1151,8 @@ impl WasmLLM {
             .iter()
             .map(|s| {
                 format!(
-                    "{{\"id\":{:?},\"trainTokens\":{},\"heldOutTokens\":{},\"sampled\":{}}}",
-                    s.id, s.train_tokens, s.held_out_tokens, s.sampled,
+                    "{{\"id\":{},\"trainTokens\":{},\"heldOutTokens\":{},\"sampled\":{}}}",
+                    json_string(&s.id), s.train_tokens, s.held_out_tokens, s.sampled,
                 )
             })
             .collect::<Vec<_>>()
@@ -1873,11 +1910,11 @@ pub fn describe_shape(
             (0, 0, 0, 1.0, 0, 0, 0)
         };
     format!(
-        "{{\"valid\":{},\"problem\":{:?},\"params\":{},\"vocabSize\":{},\"headDim\":{},\
+        "{{\"valid\":{},\"problem\":{},\"params\":{},\"vocabSize\":{},\"headDim\":{},\
          \"kvDim\":{},\"ffnDim\":{},\"trainingBytes\":{},\"inferenceBytes\":{},\
          \"memoryLimitBytes\":{},\"tileEfficiency\":{:.4},\"band\":{}}}",
         problem.is_empty(),
-        problem,
+        json_string(&problem),
         params,
         vocab,
         head_dim,

@@ -2943,7 +2943,16 @@ function saveBeforeTabDisappears() {
   // (switching tabs back and forth); this isn't a save worth repeating
   // more than about once per ten seconds.
   if (now - lastCrashSaveAt < 10_000) return;
-  if (!autosaveEnabled || !model || autosaveInFlight) return;
+  // A run in flight already has its own crash-resilience: the worker
+  // exports between slices and hands the bytes straight to autosave(),
+  // no GPU contention involved. Asking for a checkpoint from here
+  // instead means asking while training (or the model-creation/vocab-
+  // learning/benchmark work that precedes its first step) is legitimately
+  // holding the GPU — which is exactly what turning a tab away or
+  // switching windows while a run is starting used to do: the export
+  // retried against a busy GPU for several seconds and then failed with
+  // an "already busy" notice, on a run that was never actually at risk.
+  if (!autosaveEnabled || !model || autosaveInFlight || training) return;
   lastCrashSaveAt = now;
   // `force` only bypasses autosave()'s step-count throttle, not its
   // enabled check — already made above — so this still honors the
