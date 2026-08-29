@@ -1640,7 +1640,13 @@ onStream('train-record', async (record) => {
   history.push(row);
   renderHistory();
   try {
-    await db.appendHistory(row);
+    // appendHistory synthesizes the store's id; backfill it onto the
+    // same object already sitting in `history` (not a copy — this
+    // mutates what's there) so a mid-session Export Project carries a
+    // real id on every row instead of crashing the next Import on
+    // "key path did not yield a value".
+    const stored = await db.appendHistory(row);
+    row.id = stored.id;
   } catch (error) {
     console.warn('[scriptonait] could not store a history record', error);
     notice(`Could not save a history record: ${(error && error.message) || error}.`, 'error');
