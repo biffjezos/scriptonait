@@ -1315,6 +1315,22 @@ async function train({
           });
         }
       } catch (error) {
+        // A CPU-preferred sample's own GPU sync (worker.js's
+        // sync_from_gpu call below, fire-and-forget so it can never
+        // block training) briefly holds the same guard a training step
+        // needs — an expected, occasional collision now that sampling
+        // and training genuinely run concurrently, not the kind of
+        // refusal that means something is actually wrong. Nothing else
+        // in this block touches the GPU, so "already busy" can only
+        // have come from the train_step() call above; skip this attempt
+        // and let the slice after next retry, rather than ending the
+        // run over a lock a training sample was always going to let go
+        // of on its own.
+        const message = (error && error.message) || String(error);
+        if (/already busy/i.test(message)) {
+          log(`step refused (GPU busy with a training sample's sync) — retrying next slice`);
+          break;
+        }
         training = false;
         const explained = describeTrainingFailure(error);
         log(`training stopped at step ${llm.step().toLocaleString()}: ${explained}`);
