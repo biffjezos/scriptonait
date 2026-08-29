@@ -1,0 +1,38 @@
+# Standalone crate (see root Cargo.toml comment), same reason as
+# llm-gpu/wasm-app: needs crates.io (axum, tokio) and a real GPU adapter,
+# neither available in every sandbox this repo might be developed in.
+[workspace]
+
+[package]
+name = "llm-server"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[[bin]]
+name = "llm-server"
+path = "src/main.rs"
+
+[dependencies]
+llm-core = { path = "../llm-core" }
+llm-gpu = { path = "../llm-gpu" }
+# Pinned to the 0.7.x line specifically (Cargo's default caret match on
+# a pre-1.0 version), not an open lower bound: axum 0.8 changed route
+# path syntax (`:id` -> `{id}`), a breaking change this code is written
+# against 0.7's syntax for and hasn't been adapted for.
+axum = { version = "0.7", features = ["json"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+tower-http = { version = "0.5", features = ["cors"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+base64 = "0.22"
+
+# The dedicated GPU thread (gpu_actor.rs) drives llm-gpu's async calls
+# with this instead of a nested tokio runtime - the same role it plays
+# in llm-gpu's own gpu_smoke_test.rs.
+pollster = "0.3"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
