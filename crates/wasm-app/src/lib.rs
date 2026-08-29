@@ -78,6 +78,22 @@ fn json_batch_draws(draws: &[llm_core::corpus::BatchDraw]) -> String {
 /// at; it is a starting point, not a tuning.
 const DEFAULT_DISPATCHES_PER_SUBMIT: u32 = 32;
 
+/// Ceiling a corpus-derived BPE vocabulary is capped at — used both by
+/// `learn_vocabulary` (via `max_vocab_size()` below, which the frontend
+/// calls instead of hardcoding this number itself) and `describe_shape`'s
+/// pre-model cost estimate, so the two agree on what vocabulary size a
+/// given corpus would actually get.
+const MAX_VOCAB: usize = 8192;
+
+/// The ceiling `learn_vocabulary` and `describe_shape`'s estimate cap a
+/// corpus-derived vocabulary at. No UI control owns this value; it's a
+/// model-shape constraint, so it's defined once here and exported rather
+/// than re-declared as a literal in the frontend.
+#[wasm_bindgen]
+pub fn max_vocab_size() -> u32 {
+    MAX_VOCAB as u32
+}
+
 /// Give the host's event loop one turn before continuing.
 ///
 /// Scheduled via `setTimeout(0)` rather than a microtask (a bare
@@ -1815,7 +1831,6 @@ pub fn describe_shape(
     window: u32,
     corpus_chars: f64,
 ) -> String {
-    const MAX_VOCAB: usize = 8192;
     let vocab = if corpus_chars > 0.0 {
         llm_core::corpus::suggested_vocab_size(corpus_chars as usize).min(MAX_VOCAB)
     } else {

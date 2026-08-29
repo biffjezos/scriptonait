@@ -1967,14 +1967,6 @@ function chosenBatchSize() {
   return 1;
 }
 
-/// True when "auto" is about to fall back rather than use a measurement.
-function batchSizeIsGuessed() {
-  return (
-    Number($('train-batch').value) <= 0 &&
-    !(machineProfile && profileShapeMatches(machineProfile))
-  );
-}
-
 /// Effort, when it is left on Auto.
 ///
 /// Effort is the share of the time the worker spends training rather
@@ -2082,8 +2074,10 @@ function readTrainingSettings() {
     sampleEvery: $('sample-toggle').checked ? Number($('sample-every').value) : 0,
     // Training samples are generated with the Inference tab's own
     // prompt, length and sampling settings, not a second hidden set —
-    // the same fields Generate reads.
-    samplePrompt: $('prompt-input').value.trim() || 'Write a 40 word scene.',
+    // the same fields Generate reads. An empty prompt falls back to
+    // that field's own placeholder example rather than a second,
+    // separately hardcoded one.
+    samplePrompt: $('prompt-input').value.trim() || $('prompt-input').placeholder,
     sampleMaxTokens: $('opt-length-mode').value === 'limit' ? Number($('opt-max-tokens').value) : 0,
     sampling: {
       temperature: Number($('opt-temperature').value),
@@ -2198,7 +2192,10 @@ $('train-btn').addEventListener('click', async () => {
       // The embedding table is one row per token, so this has to happen
       // before training starts, and it rebuilds the model.
       $('train-stats').textContent = 'Learning a vocabulary from your text…';
-      const learned = await call('learn-vocabulary', { maxVocabSize: 8192 }, [], 0);
+      // No maxVocabSize here: no UI control owns that ceiling, so the
+      // worker asks the wasm side for it instead of this call
+      // re-declaring the same number a third time.
+      const learned = await call('learn-vocabulary', {}, [], 0);
       if (learned && learned.model) renderModel(learned.model);
     }
 

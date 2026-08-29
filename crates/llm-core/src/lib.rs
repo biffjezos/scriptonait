@@ -16,4 +16,5 @@ pub mod train;
 
 pub use config::ModelConfig;
 pub use corpus::Corpus;
+#[cfg(feature = "native-trainer")]
 pub use train::Trainer;

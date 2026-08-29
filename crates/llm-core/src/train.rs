@@ -14,10 +14,18 @@
 //! GitHub Pages does not serve. So this is exactly the reason pretraining
 //! happens natively in CI and the browser only fine-tunes.
 
+// `ModelConfig`/`Corpus`/`model`/`ops`/`Rng` are used only by `Trainer`
+// below, which is feature-gated (see this crate's Cargo.toml) — gated
+// the same way so an unused-import warning doesn't follow it.
+#[cfg(feature = "native-trainer")]
 use crate::config::ModelConfig;
+#[cfg(feature = "native-trainer")]
 use crate::corpus::{Batch, Corpus};
+#[cfg(feature = "native-trainer")]
 use crate::model::{self, AdamState, Gradients, ModelWeights};
+#[cfg(feature = "native-trainer")]
 use crate::ops;
+#[cfg(feature = "native-trainer")]
 use crate::rng::Rng;
 
 /// Everything about a training step that isn't the model's shape.
@@ -122,6 +130,7 @@ impl TrainConfig {
 }
 
 /// What one training step did, beyond its loss.
+#[cfg(feature = "native-trainer")]
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct StepReport {
     pub loss: f32,
@@ -136,6 +145,15 @@ pub struct StepReport {
     pub tokens: usize,
 }
 
+/// Native, multithreaded CPU trainer. Pre-built for the `llm-train` CLI
+/// PLAN.md describes as upcoming roadmap; nothing in this workspace
+/// calls it yet — the browser trains exclusively through
+/// `crates/llm-gpu`'s `GpuTrainer`. Gated behind the `native-trainer`
+/// feature (off by default, see this crate's Cargo.toml) so it doesn't
+/// silently inflate the compiled surface of the wasm build. Do not
+/// delete this as unused without first checking whether `llm-train` has
+/// since landed and started calling it.
+#[cfg(feature = "native-trainer")]
 pub struct Trainer {
     pub weights: ModelWeights,
     pub config: ModelConfig,
@@ -156,6 +174,7 @@ pub struct Trainer {
     pub step: u64,
 }
 
+#[cfg(feature = "native-trainer")]
 impl Trainer {
     pub fn new(config: ModelConfig, seed: u64) -> Self {
         let weights = ModelWeights::init(&config, seed);
@@ -333,10 +352,12 @@ impl Trainer {
 mod tests {
     use super::*;
 
+    #[cfg(feature = "native-trainer")]
     fn tiny_config() -> ModelConfig {
         ModelConfig { num_layers: 2, hidden_dim: 8, num_heads: 2, num_kv_heads: 1, context_len: 8, local_window: 8, ..Default::default() }
     }
 
+    #[cfg(feature = "native-trainer")]
     #[test]
     fn train_step_returns_none_on_empty_corpus() {
         let mut trainer = Trainer::new(tiny_config(), 1);
@@ -344,6 +365,7 @@ mod tests {
         assert!(trainer.train_step(&mut corpus, 2, 0.01).is_none());
     }
 
+    #[cfg(feature = "native-trainer")]
     #[test]
     fn loss_trends_down_over_many_steps() {
         let config = tiny_config();
@@ -360,6 +382,7 @@ mod tests {
         assert!(last < first, "expected loss to decrease: first={first} last={last}");
     }
 
+    #[cfg(feature = "native-trainer")]
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn threaded_and_single_threaded_steps_agree() {
@@ -399,6 +422,7 @@ mod tests {
         assert!(worst < 1e-5, "threaded step moved the weights somewhere else: worst diff {worst}");
     }
 
+    #[cfg(feature = "native-trainer")]
     #[test]
     fn a_resumed_run_continues_rather_than_restarting() {
         // What this is really testing: a pretraining run split across
@@ -446,6 +470,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "native-trainer")]
     #[test]
     fn optimizer_state_survives_a_round_trip() {
         let config = tiny_config();
@@ -476,6 +501,7 @@ mod tests {
         assert!((t.lr_at(5000) - 0.1).abs() < 1e-6, "past the plan it holds the floor");
     }
 
+    #[cfg(feature = "native-trainer")]
     #[test]
     fn gradient_clipping_reports_and_bounds_the_norm() {
         let config = tiny_config();
@@ -490,6 +516,7 @@ mod tests {
         assert_eq!(report.tokens, 2 * config.context_len);
     }
 
+    #[cfg(feature = "native-trainer")]
     #[test]
     fn step_counter_increments() {
         let mut trainer = Trainer::new(tiny_config(), 1);

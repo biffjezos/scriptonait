@@ -115,12 +115,6 @@ function withStore(storeName, mode, work) {
   );
 }
 
-function newId() {
-  return crypto.randomUUID
-    ? crypto.randomUUID()
-    : `${Date.now()}-${Math.random().toString(36).slice(2)}`;
-}
-
 // --- Sources -----------------------------------------------------------
 // A source: { id, title, kind: 'file'|'paste', rawText, sourceUrl, tags,
 //             createdAt, updatedAt, timesSampled, windowProgress }
@@ -150,21 +144,6 @@ function newId() {
 export async function putSource(record) {
   await withStore(SOURCES_STORE, 'readwrite', (store) => store.put(record));
   return record;
-}
-
-export async function addSource({ title, kind, rawText, sourceUrl = null, tags = {} }) {
-  const now = Date.now();
-  const record = { id: newId(), title, kind, rawText, sourceUrl, tags, createdAt: now, updatedAt: now };
-  await withStore(SOURCES_STORE, 'readwrite', (store) => store.add(record));
-  return record;
-}
-
-export async function updateSource(id, changes) {
-  const existing = await getSource(id);
-  if (!existing) throw new Error(`no source ${id}`);
-  const updated = { ...existing, ...changes, updatedAt: Date.now() };
-  await withStore(SOURCES_STORE, 'readwrite', (store) => store.put(updated));
-  return updated;
 }
 
 export async function deleteSource(id) {
@@ -228,10 +207,6 @@ export async function getModel() {
   return withStore(MODELS_STORE, 'readonly', (store) => store.get(CURRENT_MODEL));
 }
 
-export async function deleteModel() {
-  await withStore(MODELS_STORE, 'readwrite', (store) => store.delete(CURRENT_MODEL));
-}
-
 /// The stored model record. A New Project's job: leaving it behind means
 /// a reload could restore a model from a project that's gone.
 export async function clearModels() {
@@ -246,7 +221,7 @@ export async function clearModels() {
 // integrated and a discrete GPU and gives the page whichever one it
 // feels like.
 
-export function machineKey({ adapter, backend }) {
+function machineKey({ adapter, backend }) {
   return `machine:${backend || '?'}:${adapter || 'unknown'}`;
 }
 
@@ -413,12 +388,6 @@ export async function appendHistory(record) {
 /// few hundred rows, and reading them all is the point.
 export async function listHistory() {
   return (await withStore(HISTORY_STORE, 'readonly', (store) => store.getAll())) || [];
-}
-
-/// Records for one run.
-export async function listRunHistory(runId) {
-  const all = await listHistory();
-  return all.filter((row) => row.runId === runId);
 }
 
 export async function clearHistory() {
