@@ -679,10 +679,10 @@ $('generate-btn').addEventListener('click', async () => {
   setProgress('generate-progress-bar', 0);
   $('generate-stats').textContent = 'Starting…';
 
-  const parsed = await call('parse-prompt', { prompt });
-  targetWords = parsed.targetWords;
-
   try {
+    const parsed = await call('parse-prompt', { prompt });
+    targetWords = parsed.targetWords;
+
     const result = await call('generate', {
       prompt,
       temperature: Number($('opt-temperature').value),
@@ -1022,15 +1022,34 @@ async function addSources(entries) {
       continue;
     }
 
+    // A file added again under the same name is an update, not a second
+    // copy of it — re-adding an edited draft used to duplicate it,
+    // leaving the only fix a full remove-everything-and-re-add-it-all,
+    // which resets every other source's window progress and held-out
+    // split along with it. Reusing the id turns this into what
+    // upsert_source already is: a replace, not an insert — the corpus
+    // keeps this source's sample count and progress, only its text
+    // (and, through that, its future windows) changes.
+    const existing = sources.find((s) => s.title === entry.title);
     const source = {
-      id: newSourceId(),
+      id: existing ? existing.id : newSourceId(),
       title: entry.title,
       kind: entry.kind,
       rawText,
       sourceUrl: entry.sourceUrl || null,
-      createdAt: Date.now(),
+      createdAt: existing ? existing.createdAt : Date.now(),
+      // Carried over so the stored record doesn't lose them the moment
+      // this overwrites it — the live corpus already keeps its own
+      // count regardless (upsert only initializes it if missing), but
+      // IndexedDB only knows what's on the record it's given.
+      timesSampled: existing ? existing.timesSampled : undefined,
+      windowProgress: existing ? existing.windowProgress : undefined,
     };
-    sources.push(source);
+    if (existing) {
+      sources[sources.indexOf(existing)] = source;
+    } else {
+      sources.push(source);
+    }
     added += 1;
     // Drawn immediately, and nothing below is awaited: the next file
     // starts reading straight away. Saving and handing it to the model
@@ -2275,14 +2294,28 @@ $('new-project-btn').addEventListener('click', async () => {
 });
 
 $('export-btn').addEventListener('click', async () => {
-  const { bytes } = await call('export-checkpoint');
-  const blob = new Blob([bytes], { type: 'application/octet-stream' });
+  // The picker has to be asked for before any await — export-checkpoint
+  // is a real wait (a full GPU-to-CPU weight readback), and the browser
+  // only honors showSaveFilePicker while it can still trace the call
+  // back to this click. Ask first, while that's still true; do the slow
+  // work after, into the handle already granted.
+  let handle = null;
   if (typeof window.showSaveFilePicker === 'function') {
     try {
-      const handle = await window.showSaveFilePicker({
+      handle = await window.showSaveFilePicker({
         suggestedName: 'scriptonait.ckpt',
         types: [{ description: 'scriptonait checkpoint', accept: { 'application/octet-stream': ['.ckpt'] } }],
       });
+    } catch (error) {
+      if (error && error.name === 'AbortError') return;
+      showError(error);
+      return;
+    }
+  }
+  try {
+    const { bytes } = await call('export-checkpoint');
+    const blob = new Blob([bytes], { type: 'application/octet-stream' });
+    if (handle) {
       const writable = await handle.createWritable();
       try {
         await writable.write(blob);
@@ -2290,18 +2323,16 @@ $('export-btn').addEventListener('click', async () => {
         await writable.close();
       }
       return;
-    } catch (error) {
-      if (error && error.name === 'AbortError') return;
-      showError(error);
-      return;
     }
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = 'scriptonait.ckpt';
+    link.click();
+    URL.revokeObjectURL(url);
+  } catch (error) {
+    showError(error);
   }
-  const url = URL.createObjectURL(blob);
-  const link = document.createElement('a');
-  link.href = url;
-  link.download = 'scriptonait.ckpt';
-  link.click();
-  URL.revokeObjectURL(url);
 });
 
 $('import-input').addEventListener('change', async (event) => {
@@ -2323,6 +2354,26 @@ $('import-input').addEventListener('change', async (event) => {
 
 $('export-project-btn').addEventListener('click', async () => {
   clearError();
+  // Asked for immediately, before any await: the browser only honors
+  // showSaveFilePicker while the call can still be traced back to this
+  // click, and everything below (a full checkpoint export among it) is
+  // a real wait that would otherwise burn through that window before
+  // the picker was ever shown — exactly what "must be handling a user
+  // gesture" was reporting.
+  let handle = null;
+  if (typeof window.showSaveFilePicker === 'function') {
+    try {
+      handle = await window.showSaveFilePicker({
+        suggestedName: 'scriptonait.snp',
+        types: [{ description: 'scriptonait project', accept: { 'application/octet-stream': ['.snp'] } }],
+      });
+    } catch (error) {
+      // A cancelled picker is not an error.
+      if (error && error.name === 'AbortError') return;
+      showError(error);
+      return;
+    }
+  }
   try {
     // Source saves go through persistLater's fire-and-forget chain —
     // addSources doesn't wait for it, so a source added moments ago
@@ -2353,24 +2404,14 @@ $('export-project-btn').addEventListener('click', async () => {
         `checkpoint ${checkpointBytes ? `${checkpointBytes.byteLength} bytes` : 'none (no model)'}, ` +
         `${blob.size} bytes total`,
     );
-    if (typeof window.showSaveFilePicker === 'function') {
+    if (handle) {
+      const writable = await handle.createWritable();
       try {
-        const handle = await window.showSaveFilePicker({
-          suggestedName: 'scriptonait.snp',
-          types: [{ description: 'scriptonait project', accept: { 'application/octet-stream': ['.snp'] } }],
-        });
-        const writable = await handle.createWritable();
-        try {
-          await writable.write(blob);
-        } finally {
-          await writable.close();
-        }
-        return;
-      } catch (error) {
-        // A cancelled picker is not an error.
-        if (error && error.name === 'AbortError') return;
-        throw error;
+        await writable.write(blob);
+      } finally {
+        await writable.close();
       }
+      return;
     }
     const url = URL.createObjectURL(blob);
     const link = document.createElement('a');
