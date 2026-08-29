@@ -156,6 +156,28 @@ function clearError() {
   $('notification-bar').hidden = true;
 }
 
+/// Run one action, posting a start notice immediately and exactly one
+/// end notice however it finishes — every button click and background
+/// job owes the bar at least that much.
+///
+/// `fn` may still post its own staged `notice()` calls for progress
+/// (Import Project and startup do); those just get overwritten by the
+/// final one here. `startLabel`/`endLabel` are short functional phrases
+/// only ("Training"/"Trained") — never explanatory or decorative text.
+/// If `fn`'s resolved value is a string, it replaces `endLabel` in the
+/// success notice; anything else falls back to `${endLabel}.`.
+async function withNotice(startLabel, endLabel, fn) {
+  notice(`${startLabel}…`, 'info');
+  try {
+    const result = await fn();
+    notice(typeof result === 'string' ? result : `${endLabel}.`, 'success');
+    return result;
+  } catch (error) {
+    showError(`${endLabel} failed: ${(error && error.message) || error}`);
+    throw error;
+  }
+}
+
 // --- Tabs ----------------------------------------------------------------
 
 function switchTab(name) {
@@ -232,7 +254,9 @@ $('notify-toggle').addEventListener('change', async (event) => {
   } else if (Notification.permission === 'denied') {
     event.target.checked = false;
     showError('notifications are blocked for this site in your browser settings');
+    return;
   }
+  if (event.target.checked) notice('Notifications turned on.', 'success');
 });
 
 function notify(title, body) {
@@ -692,6 +716,7 @@ $('generate-btn').addEventListener('click', async () => {
     return;
   }
   clearError();
+  notice('Generating…', 'info');
   generating = true;
   $('generate-btn').disabled = true;
   $('stop-btn').hidden = false;
@@ -911,7 +936,7 @@ function renderSources() {
 // part of drawing the list.
 $('sources-list').addEventListener('click', (event) => {
   const button = event.target.closest('.remove-source');
-  if (button) removeSource(button.dataset.id);
+  if (button) withNotice('Removing source', 'Removed source', () => removeSource(button.dataset.id));
 });
 
 $('sources-filter').addEventListener('input', (event) => {
@@ -924,20 +949,23 @@ $('remove-all-btn').addEventListener('click', async () => {
   if (!confirm(`Remove all ${sources.length.toLocaleString()} sources? This can't be undone.`)) {
     return;
   }
-  const removed = sources;
-  sources = [];
-  sourceFilter = '';
-  $('sources-filter').value = '';
-  renderSources();
-  for (const source of removed) {
-    await persist('deleting a source', () => db.deleteSource(source.id));
-    try {
-      renderModel(await call('remove-source', { id: source.id }));
-    } catch (error) {
-      /* no model loaded: it was only ever in the list */
+  await withNotice('Removing sources', 'Removed sources', async () => {
+    const removed = sources;
+    sources = [];
+    sourceFilter = '';
+    $('sources-filter').value = '';
+    renderSources();
+    for (const source of removed) {
+      await persist('deleting a source', () => db.deleteSource(source.id));
+      try {
+        renderModel(await call('remove-source', { id: source.id }));
+      } catch (error) {
+        /* no model loaded: it was only ever in the list */
+      }
     }
-  }
-  await refreshPlan();
+    await refreshPlan();
+    return `Removed ${removed.length.toLocaleString()} source${removed.length === 1 ? '' : 's'}`;
+  });
 });
 
 $('remove-duplicates-btn').addEventListener('click', async () => {
@@ -955,9 +983,11 @@ $('remove-duplicates-btn').addEventListener('click', async () => {
   if (!confirm(`Remove ${ids.length.toLocaleString()} duplicate source${ids.length === 1 ? '' : 's'}? This can't be undone.`)) {
     return;
   }
-  for (const id of ids) await removeSource(id);
-  $('remove-duplicates-btn').hidden = true;
-  notice(`Removed ${ids.length.toLocaleString()} duplicate source${ids.length === 1 ? '' : 's'}.`, 'success');
+  await withNotice('Removing duplicate sources', 'Removed duplicate sources', async () => {
+    for (const id of ids) await removeSource(id);
+    $('remove-duplicates-btn').hidden = true;
+    return `Removed ${ids.length.toLocaleString()} duplicate source${ids.length === 1 ? '' : 's'}`;
+  });
 });
 
 async function removeSource(id) {
@@ -2118,8 +2148,10 @@ let inferenceDevicePref = 'gpu';
 
 $('inference-device').addEventListener('change', async (event) => {
   inferenceDevicePref = event.target.value === 'cpu' ? 'cpu' : 'gpu';
-  await db.putDevicePreference({ trainingDevice: 'gpu', inferenceDevice: inferenceDevicePref });
-  await call('set-inference-device', { device: inferenceDevicePref });
+  await withNotice('Saving inference device', 'Inference device saved', async () => {
+    await db.putDevicePreference({ trainingDevice: 'gpu', inferenceDevice: inferenceDevicePref });
+    await call('set-inference-device', { device: inferenceDevicePref });
+  });
 });
 
 $('train-btn').addEventListener('click', async () => {
@@ -2129,6 +2161,7 @@ $('train-btn').addEventListener('click', async () => {
     notice('Set a learning rate before training in Manual mode.', 'error');
     return;
   }
+  notice('Training…', 'info');
   training = true;
   lastPhaseKey = null;
   $('live-controls').hidden = false;
@@ -2340,31 +2373,28 @@ $('new-project-btn').addEventListener('click', async () => {
   if (!confirm('Start a new project? This clears the current model, corpus and history.')) {
     return;
   }
-  // Asked for before any await, same reason Save/Export Project do —
-  // the browser only honors showSaveFilePicker while it can still trace
-  // the call back to this click. Cancelling or a browser without the
-  // API isn't fatal to starting the project; it just starts without an
-  // auto-save file set yet, same as it always could.
-  if (autosaveSupported()) {
-    try {
-      const handle = await window.showSaveFilePicker({
-        suggestedName: autosaveFileName || 'scriptonait.snp',
-        types: [{ description: 'scriptonait project', accept: { 'application/octet-stream': ['.snp'] } }],
-      });
-      await establishProjectFile(handle);
-    } catch (error) {
-      /* cancelled — proceed without one */
+  await withNotice('Starting new project', 'New project ready', async () => {
+    // Asked for before any await, same reason Save/Export Project do —
+    // the browser only honors showSaveFilePicker while it can still trace
+    // the call back to this click. Cancelling or a browser without the
+    // API isn't fatal to starting the project; it just starts without an
+    // auto-save file set yet, same as it always could.
+    if (autosaveSupported()) {
+      try {
+        const handle = await window.showSaveFilePicker({
+          suggestedName: autosaveFileName || 'scriptonait.snp',
+          types: [{ description: 'scriptonait project', accept: { 'application/octet-stream': ['.snp'] } }],
+        });
+        await establishProjectFile(handle);
+      } catch (error) {
+        /* cancelled — proceed without one */
+      }
     }
-  }
-  try {
     await db.replaceAllSources([]);
     await db.replaceAllHistory([]);
     await db.clearModels();
-  } catch (error) {
-    showError(error);
-    return;
-  }
-  window.location.reload();
+    window.location.reload();
+  });
 });
 
 $('export-btn').addEventListener('click', async () => {
@@ -2386,7 +2416,7 @@ $('export-btn').addEventListener('click', async () => {
       return;
     }
   }
-  try {
+  await withNotice('Exporting checkpoint', 'Exported checkpoint', async () => {
     const { bytes } = await call('export-checkpoint');
     const blob = new Blob([bytes], { type: 'application/octet-stream' });
     if (handle) {
@@ -2404,9 +2434,7 @@ $('export-btn').addEventListener('click', async () => {
     link.download = 'scriptonait.ckpt';
     link.click();
     URL.revokeObjectURL(url);
-  } catch (error) {
-    showError(error);
-  }
+  });
 });
 
 $('import-input').addEventListener('change', async (event) => {
@@ -2461,7 +2489,7 @@ $('export-project-btn').addEventListener('click', async () => {
       return;
     }
   }
-  try {
+  await withNotice('Exporting project', 'Exported project', async () => {
     // Source saves go through persistLater's fire-and-forget chain —
     // addSources doesn't wait for it, so a source added moments ago
     // could still be in flight. Wait for it to drain before reading
@@ -2506,9 +2534,7 @@ $('export-project-btn').addEventListener('click', async () => {
     link.download = 'scriptonait.snp';
     link.click();
     URL.revokeObjectURL(url);
-  } catch (error) {
-    showError(error);
-  }
+  });
 });
 
 $('import-project-input').addEventListener('change', async (event) => {
@@ -2765,64 +2791,67 @@ async function autosave(step, { force = false, bytes: given = null } = {}) {
   autosaveInFlight = true;
   lastAutosaveStep = step;
   try {
-    const started = performance.now();
-    // During a run the worker exports between slices and hands the
-    // bytes over, because asking for them from here means asking while
-    // a training step is running — and both take the same GPU guard.
-    const bytes = given || (await exportCheckpointWithRetry());
-    // Keep whatever optimizer state is already stored rather than
-    // writing null over it.
-    //
-    // Exporting the moments here is not an option: they are twice the
-    // size of the model, and pulling that across every thousand steps is
-    // the memory pressure that lost a run in the first place. But
-    // nulling them means this safety net quietly destroys the momentum
-    // in the saved copy — so a crash-and-recover would resume with Adam
-    // reset, which is most of what the saved copy was for.
-    //
-    // Slightly stale moments are fine. They are running averages of
-    // gradient statistics and do not reference particular weights, so
-    // moments from a thousand steps ago paired with current weights cost
-    // almost nothing. Zero costs a visible bump and a few hundred steps.
-    let optimizer = null;
-    try {
-      const stored = await db.getModel();
-      optimizer = (stored && stored.optimizer) || null;
-    } catch (error) {
-      /* no stored copy yet: there is nothing to preserve */
-    }
-    const params = model ? model.params : 0;
-    // "Add" keeps a rolling set of recent snapshots instead of
-    // overwriting the one current-model slot. The file-on-disk leg
-    // always overwrites the chosen file regardless of mode — the File
-    // System Access API cannot silently create a new file without a
-    // picker prompt on every save, which would defeat "no button
-    // needed".
-    if (autosaveMode === 'add') {
-      await db.putAutosaveSnapshot({ bytes, step, params, optimizer });
-    } else {
-      await db.putModel({ bytes, step, params, optimizer });
-    }
-    let wroteFile = false;
-    if (autosaveHandle) {
-      await writeProjectToFile(bytes, optimizer);
-      wroteFile = true;
-    }
-    console.info(
-      `[scriptonait] auto-saved at step ${step.toLocaleString()} ` +
-        `(${formatCount(bytes.byteLength)} bytes${wroteFile ? ', to your file' : ''}) in ` +
-        `${(performance.now() - started).toFixed(0)} ms`,
-    );
-    $('autosave-status').textContent =
-      `Last save: step ${step.toLocaleString()}` +
-      (wroteFile ? ` — ${autosaveHandle.name} and this browser.` : ' — this browser.');
-    flushSourceSampleCounts();
+    await withNotice('Auto-saving', 'Auto-saved', async () => {
+      const started = performance.now();
+      // During a run the worker exports between slices and hands the
+      // bytes over, because asking for them from here means asking while
+      // a training step is running — and both take the same GPU guard.
+      const bytes = given || (await exportCheckpointWithRetry());
+      // Keep whatever optimizer state is already stored rather than
+      // writing null over it.
+      //
+      // Exporting the moments here is not an option: they are twice the
+      // size of the model, and pulling that across every thousand steps is
+      // the memory pressure that lost a run in the first place. But
+      // nulling them means this safety net quietly destroys the momentum
+      // in the saved copy — so a crash-and-recover would resume with Adam
+      // reset, which is most of what the saved copy was for.
+      //
+      // Slightly stale moments are fine. They are running averages of
+      // gradient statistics and do not reference particular weights, so
+      // moments from a thousand steps ago paired with current weights cost
+      // almost nothing. Zero costs a visible bump and a few hundred steps.
+      let optimizer = null;
+      try {
+        const stored = await db.getModel();
+        optimizer = (stored && stored.optimizer) || null;
+      } catch (error) {
+        /* no stored copy yet: there is nothing to preserve */
+      }
+      const params = model ? model.params : 0;
+      // "Add" keeps a rolling set of recent snapshots instead of
+      // overwriting the one current-model slot. The file-on-disk leg
+      // always overwrites the chosen file regardless of mode — the File
+      // System Access API cannot silently create a new file without a
+      // picker prompt on every save, which would defeat "no button
+      // needed".
+      if (autosaveMode === 'add') {
+        await db.putAutosaveSnapshot({ bytes, step, params, optimizer });
+      } else {
+        await db.putModel({ bytes, step, params, optimizer });
+      }
+      let wroteFile = false;
+      if (autosaveHandle) {
+        await writeProjectToFile(bytes, optimizer);
+        wroteFile = true;
+      }
+      console.info(
+        `[scriptonait] auto-saved at step ${step.toLocaleString()} ` +
+          `(${formatCount(bytes.byteLength)} bytes${wroteFile ? ', to your file' : ''}) in ` +
+          `${(performance.now() - started).toFixed(0)} ms`,
+      );
+      $('autosave-status').textContent =
+        `Last save: step ${step.toLocaleString()}` +
+        (wroteFile ? ` — ${autosaveHandle.name} and this browser.` : ' — this browser.');
+      flushSourceSampleCounts();
+      return `Auto-saved at step ${step.toLocaleString()}`;
+    });
   } catch (error) {
-    console.warn('[scriptonait] auto-save failed', error);
-    // The status line keeps showing the last save that actually
-    // succeeded — overwriting it with the failure would bury that fact
+    // withNotice already posted the failure notice; this is just the
+    // console trail. The status line keeps showing the last save that
+    // actually succeeded — a second failure notice would bury that fact
     // the moment the next save works and the line moves on.
-    showError(`Auto-save failed at step ${step.toLocaleString()}: ${(error && error.message) || error}`);
+    console.warn('[scriptonait] auto-save failed', error);
   } finally {
     autosaveInFlight = false;
   }
@@ -2872,8 +2901,9 @@ $('autosave-file-btn').addEventListener('click', async () => {
     );
     return;
   }
+  let handle;
   try {
-    const handle = await window.showSaveFilePicker({
+    handle = await window.showSaveFilePicker({
       // Whatever the project's file is already called — from an
       // imported project's settings, an earlier Export/New Project, or
       // earlier this session — rather than always the generic default,
@@ -2882,14 +2912,19 @@ $('autosave-file-btn').addEventListener('click', async () => {
       suggestedName: autosaveFileName || 'scriptonait.snp',
       types: [{ description: 'scriptonait project', accept: { 'application/octet-stream': ['.snp'] } }],
     });
+  } catch (error) {
+    // A cancelled picker is not an error, and not something to notify
+    // about either.
+    if (error && error.name !== 'AbortError') showError(error);
+    return;
+  }
+  await withNotice('Choosing autosave file', 'Autosave file set', async () => {
     await establishProjectFile(handle);
     // Write immediately, so the file exists and the permission is proven
     // now rather than in six hours when it matters.
     if (model) await autosave(model.step, { force: true });
-  } catch (error) {
-    // A cancelled picker is not an error.
-    if (error && error.name !== 'AbortError') showError(error);
-  }
+    return `Autosave file set to ${handle.name}`;
+  });
 });
 
 /// Wherever a project's file gets chosen — New Project, Export
@@ -2926,17 +2961,17 @@ function persistAutosaveConfig() {
 
 $('autosave-enabled').addEventListener('change', async (event) => {
   autosaveEnabled = event.target.value !== 'off';
-  await persistAutosaveConfig();
+  await withNotice('Saving setting', 'Setting saved', () => persistAutosaveConfig());
 });
 
 $('autosave-frequency').addEventListener('change', async (event) => {
   autosaveFrequencySteps = Math.max(1, Number(event.target.value) || 1000);
-  await persistAutosaveConfig();
+  await withNotice('Saving setting', 'Setting saved', () => persistAutosaveConfig());
 });
 
 $('autosave-mode').addEventListener('change', async (event) => {
   autosaveMode = event.target.value === 'add' ? 'add' : 'overwrite';
-  await persistAutosaveConfig();
+  await withNotice('Saving setting', 'Setting saved', () => persistAutosaveConfig());
 });
 
 /// Load the model saved by an earlier visit, if there is one.
