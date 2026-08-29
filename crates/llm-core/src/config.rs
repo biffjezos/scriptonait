@@ -24,6 +24,15 @@
 
 use crate::tokenizer::BASE_VOCAB_SIZE;
 
+/// Output rows/columns per workgroup in `llm-gpu`'s tiled matmul kernels
+/// (see `crates/llm-gpu/src/shaders/linear.wgsl`'s own `TILE` constant,
+/// which this cross-references rather than imports — WGSL can't import a
+/// Rust constant, so the two are kept in sync by hand and by this
+/// comment). Named here, rather than a bare number buried inside
+/// `tile_efficiency`, because it is llm-core estimating a GPU-specific
+/// shape efficiency — a coupling worth being able to see.
+const GPU_TILE_SIZE: usize = 64;
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ModelConfig {
     /// Number of transformer blocks.
@@ -311,8 +320,7 @@ impl ModelConfig {
     /// step forever, and worth being able to see before committing a
     /// run to it.
     pub fn tile_efficiency(&self) -> f64 {
-        const TILE: usize = 64;
-        let tiles = |n: usize| n.div_ceil(TILE) * TILE;
+        let tiles = |n: usize| n.div_ceil(GPU_TILE_SIZE) * GPU_TILE_SIZE;
         let (h, kv, ffn, t) = (self.hidden_dim, self.kv_dim(), self.ffn_dim(), self.context_len);
         let v = self.vocab_size();
         let layers = self.num_layers;
