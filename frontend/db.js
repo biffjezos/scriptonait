@@ -325,7 +325,10 @@ export async function getAutosaveFileHandle() {
   return (record && record.handle) || null;
 }
 
-/// { enabled, frequencySteps, mode: 'overwrite'|'add' }
+/// { enabled, frequencySteps, mode: 'overwrite'|'add', fileName }
+/// `fileName` is just the string the picker returned last — the part of
+/// "which file" that can travel in the project file, unlike the handle
+/// itself (see putAutosaveFileHandle).
 export async function putAutosaveConfig(config) {
   const record = { ...config, id: AUTOSAVE_CONFIG, savedAt: Date.now() };
   await withStore(SETTINGS_STORE, 'readwrite', (store) => store.put(record));
