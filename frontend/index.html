@@ -98,14 +98,6 @@
         <button id="train-stop-btn" type="button" class="secondary" hidden>Stop</button>
       </div>
 
-      <div class="row">
-        <label class="checkbox-label">
-          <input type="checkbox" id="sample-toggle" /> Sample every
-        </label>
-        <input type="number" id="sample-every" value="50" min="1" max="100000" />
-        <span class="hint">steps</span>
-      </div>
-
       <details class="advanced" open>
         <summary>Progress</summary>
         <div id="train-plan" class="plan" hidden>
@@ -226,6 +218,12 @@
           </label>
           <label>Max characters
             <input type="number" id="training-window-chars" value="200" min="10" max="2000" />
+          </label>
+          <label class="checkbox-label">
+            <input type="checkbox" id="sample-toggle" /> Sample every
+          </label>
+          <label>Sample steps
+            <input type="number" id="sample-every" value="50" min="1" max="100000" />
           </label>
         </div>
         <p class="hint" id="batch-hint"></p>
