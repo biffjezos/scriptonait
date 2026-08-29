@@ -276,6 +276,11 @@ function updateGuidance() {
   const canTrain = !model || model.usingGpu;
   $('train-btn').disabled = training || sources.length === 0 || (model && !model.usingGpu);
   $('generate-btn').disabled = generating || !model;
+  // Importing a checkpoint mid-run replaces the model out from under the
+  // in-flight step — see the wasm side's own `busy` guard, which now
+  // refuses this too; disabling it here is the friendlier first line of
+  // defense.
+  $('import-input').disabled = training;
 
   // Say what a step will actually cover, since batch size and context
   // multiply and neither number means much alone.
@@ -2128,6 +2133,7 @@ $('train-btn').addEventListener('click', async () => {
   lastPhaseKey = null;
   $('live-controls').hidden = false;
   $('train-btn').disabled = true;
+  $('import-input').disabled = true;
   $('train-stop-btn').hidden = false;
   $('train-stop-btn').disabled = false;
   $('train-status').hidden = false;
@@ -2406,6 +2412,11 @@ $('export-btn').addEventListener('click', async () => {
 $('import-input').addEventListener('change', async (event) => {
   const file = event.target.files[0];
   if (!file) return;
+  if (training) {
+    showError('a training run is in flight — press Stop, then import a checkpoint');
+    event.target.value = '';
+    return;
+  }
   clearError();
   notice(`Loading ${file.name}…`, 'info');
   try {

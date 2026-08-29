@@ -551,7 +551,7 @@ function trainingPhase(plan, { heldOut, trainingLoss }) {
 /// trained the corpus cannot be what is limiting it. The corpus second,
 /// and only once there is enough training behind it for the claim to
 /// mean anything.
-function planActions(plan, phase, { heldOut, trainingLoss, tokensSeen, tokensPerSecond }) {
+function planActions(plan, phase, { heldOut, trainingLoss, tokensSeen, tokensPerSecond, tokensPerStep }) {
   const actions = [];
   const { params, trainingTokens, validationTokens, contextLen } = plan;
   const round = (n) => Math.round(n).toLocaleString();
@@ -1621,6 +1621,7 @@ const handlers = {
   },
 
   async 'import-checkpoint'({ bytes }) {
+    if (training) return { error: 'a training run is in flight - press Stop, then import a checkpoint' };
     await ensureWasm();
     if (!llm) {
       llm = wasm.WasmLLM.from_checkpoint(new Uint8Array(bytes));
@@ -1767,6 +1768,7 @@ const handlers = {
   },
 
   async 'learn-vocabulary'({ maxVocabSize = 8192 }) {
+    if (training) return { error: 'a training run is in flight - press Stop, then learn a vocabulary' };
     const before = llm.vocab_size();
     const started = performance.now();
     const size = llm.learn_vocabulary(maxVocabSize);

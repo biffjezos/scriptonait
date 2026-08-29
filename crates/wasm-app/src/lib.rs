@@ -78,6 +78,42 @@ fn json_batch_draws(draws: &[llm_core::corpus::BatchDraw]) -> String {
 /// at; it is a starting point, not a tuning.
 const DEFAULT_DISPATCHES_PER_SUBMIT: u32 = 32;
 
+/// Give the host's event loop one turn before continuing.
+///
+/// Scheduled via `setTimeout(0)` rather than a microtask (a bare
+/// resolved `Promise`): a microtask queue drains completely before the
+/// event loop is allowed to process anything else, including the
+/// callback a GPU buffer-mapping readback resolves through, so a
+/// microtask-only yield would not actually let a concurrently in-flight
+/// training step's readback make progress. `setTimeout` is a macrotask,
+/// scheduled the same way, so it does.
+async fn yield_to_event_loop() {
+    let promise = js_sys::Promise::new(&mut |resolve, _reject| {
+        let global: JsValue = js_sys::global().into();
+        let set_timeout = js_sys::Reflect::get(&global, &JsValue::from_str("setTimeout"))
+            .ok()
+            .and_then(|f| f.dyn_into::<js_sys::Function>().ok());
+        match set_timeout {
+            Some(set_timeout) => {
+                // Errors here would mean the host has no `setTimeout`
+                // (true of every wasm host this project runs in), so
+                // there is nothing useful to do with one but drop it —
+                // the `Promise` just never resolves, and neither
+                // `resolve` nor `reject` were called.
+                let resolve: JsValue = resolve.into();
+                let _ = set_timeout.call2(&global, &resolve, &JsValue::from_f64(0.0));
+            }
+            None => {
+                // No `setTimeout` on this host: resolve immediately
+                // rather than hang forever on a yield nothing can ever
+                // deliver.
+                let _ = resolve.call0(&JsValue::UNDEFINED);
+            }
+        }
+    });
+    let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
+}
+
 struct Inner {
     /// True while an async GPU operation owns the training state.
     ///
@@ -639,6 +675,13 @@ impl WasmLLM {
     /// isn't one. Generation survives a failure here (it finishes on the
     /// CPU); training does not, because there is no CPU training path.
     pub async fn init_gpu(&self) -> Result<String, JsValue> {
+        self.acquire()?;
+        let result = self.init_gpu_inner().await;
+        self.release();
+        result
+    }
+
+    async fn init_gpu_inner(&self) -> Result<String, JsValue> {
         let (config, weights) = {
             let inner = self.0.borrow();
             (inner.config, inner.weights.clone())
@@ -721,7 +764,6 @@ impl WasmLLM {
     /// `extra_context`, if non-empty, is folded into the instruction's
     /// subject — that's how retrieved scenes and the story-state
     /// preamble get in without inventing a second prompt format.
-    #[allow(clippy::too_many_arguments)]
     /// `prefer_gpu` chooses the device for this call, independent of
     /// whether training is using the GPU right now.
     ///
@@ -760,7 +802,7 @@ impl WasmLLM {
             let request = self.build_request(&prompt, &extra_context);
             let sampling =
                 self.sampling_config(temperature, top_k, top_p, min_p, repetition_penalty, seed);
-            return self.generate_on_cpu(&request, &sampling, max_tokens_override, on_token);
+            return self.generate_on_cpu(&request, &sampling, max_tokens_override, on_token).await;
         }
 
         // Generation owns the GPU for as long as it runs, and it pulls
@@ -852,7 +894,7 @@ impl WasmLLM {
                 }
             }
         }
-        self.generate_on_cpu(&request, &sampling, max_tokens_override, on_token)
+        self.generate_on_cpu(&request, &sampling, max_tokens_override, on_token).await
     }
 
     fn build_request(&self, prompt: &str, extra_context: &str) -> instruct::Request {
@@ -867,24 +909,54 @@ impl WasmLLM {
         request
     }
 
-    fn generate_on_cpu(
+    /// Generation runs one token at a time via `ResponseSession`, with a
+    /// yield back to the browser's event loop between tokens.
+    ///
+    /// It used to be one uninterrupted call into `generate_response`.
+    /// wasm in a browser tab is single-threaded, so that blocked the
+    /// event loop for the whole generation — including the callback a
+    /// concurrently in-flight GPU training step's buffer readback was
+    /// waiting on, stalling training for as long as a long CPU
+    /// generation ran. Yielding between tokens gives that callback (and
+    /// anything else queued) a turn.
+    ///
+    /// Deliberately clones the weights/config/tokenizer out of `inner`
+    /// up front rather than holding a `Ref` across the loop: a `Ref`
+    /// held across a yield point would panic the first `borrow_mut()`
+    /// a concurrent caller made while this was suspended (see
+    /// `acquire`/`release` above for why nothing here can risk that).
+    async fn generate_on_cpu(
         &self,
         request: &instruct::Request,
         sampling: &SamplingConfig,
         max_tokens_override: Option<usize>,
         on_token: &js_sys::Function,
     ) -> GenerationResult {
-        let inner = self.0.borrow();
-        let response = instruct::generate_response(
-            &inner.weights,
-            &inner.config,
-            inner.corpus.tokenizer(),
+        let (weights, config, tokenizer) = {
+            let inner = self.0.borrow();
+            (inner.weights.clone(), inner.config, inner.corpus.tokenizer().clone())
+        };
+        let mut session = instruct::ResponseSession::new(
+            &weights,
+            &config,
+            &tokenizer,
             request,
-            sampling,
+            sampling.clone(),
             max_tokens_override,
-            &mut |piece, words| report(on_token, piece, words),
         );
-        GenerationResult::from_response(response)
+        loop {
+            let (piece, reason) = session.step();
+            let keep_going = report(on_token, &piece, session.words());
+            if reason.is_some() {
+                break;
+            }
+            if !keep_going {
+                session.cancel();
+                break;
+            }
+            yield_to_event_loop().await;
+        }
+        GenerationResult::from_response(session.finish())
     }
 
     /// The same generation, decoded on the GPU.
@@ -1098,7 +1170,14 @@ impl WasmLLM {
     /// the embedding table. Without it every token is one byte, which
     /// costs about four times the tokens - and therefore four times the
     /// training time - for the same text.
-    pub fn learn_vocabulary(&self, max_vocab_size: u32) -> u32 {
+    pub fn learn_vocabulary(&self, max_vocab_size: u32) -> Result<u32, JsValue> {
+        self.acquire()?;
+        let result = self.learn_vocabulary_inner(max_vocab_size);
+        self.release();
+        Ok(result)
+    }
+
+    fn learn_vocabulary_inner(&self, max_vocab_size: u32) -> u32 {
         let inner = &mut *self.0.borrow_mut();
         let current = inner.corpus.tokenizer().vocab_size() as u32;
         // A trained model's weights are indexed by the vocabulary that
@@ -1267,12 +1346,12 @@ impl WasmLLM {
         };
         let lr = train.lr_at(step);
 
-        let (ctx, mut trainer) = {
+        let (ctx, trainer) = {
             let inner = &mut *self.0.borrow_mut();
             let gpu = inner.gpu.as_mut().expect("checked above");
             (Rc::clone(&gpu.ctx), gpu.trainer.take())
         };
-        let mut trainer = match trainer.take() {
+        let mut trainer = match trainer {
             Some(existing) => existing,
             None => {
                 let weights = self.0.borrow().weights.clone();
@@ -1532,6 +1611,13 @@ impl WasmLLM {
     /// larger means a kernel is wrong. Nothing calls this in normal use —
     /// it exists so a machine with a real GPU can check the kernels.
     pub async fn debug_compare_forward(&self, tokens: Vec<u32>) -> Result<f32, JsValue> {
+        self.acquire()?;
+        let result = self.debug_compare_forward_inner(tokens).await;
+        self.release();
+        result
+    }
+
+    async fn debug_compare_forward_inner(&self, tokens: Vec<u32>) -> Result<f32, JsValue> {
         let (ctx, trainer) = {
             let inner = &mut *self.0.borrow_mut();
             let Some(gpu) = inner.gpu.as_mut() else {
@@ -1676,6 +1762,13 @@ impl WasmLLM {
     /// checkpoint. Sources are re-encoded with the new tokenizer, since
     /// token ids from the old one would mean something different.
     pub fn import_checkpoint(&self, bytes: &[u8]) -> Result<(), JsValue> {
+        self.acquire()?;
+        let result = self.import_checkpoint_inner(bytes);
+        self.release();
+        result
+    }
+
+    fn import_checkpoint_inner(&self, bytes: &[u8]) -> Result<(), JsValue> {
         let checkpoint = Checkpoint::from_bytes(bytes).map_err(js_err)?;
         let mut inner = self.0.borrow_mut();
         inner.config = checkpoint.config;
