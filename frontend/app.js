@@ -1022,15 +1022,34 @@ async function addSources(entries) {
       continue;
     }
 
+    // A file added again under the same name is an update, not a second
+    // copy of it — re-adding an edited draft used to duplicate it,
+    // leaving the only fix a full remove-everything-and-re-add-it-all,
+    // which resets every other source's window progress and held-out
+    // split along with it. Reusing the id turns this into what
+    // upsert_source already is: a replace, not an insert — the corpus
+    // keeps this source's sample count and progress, only its text
+    // (and, through that, its future windows) changes.
+    const existing = sources.find((s) => s.title === entry.title);
     const source = {
-      id: newSourceId(),
+      id: existing ? existing.id : newSourceId(),
       title: entry.title,
       kind: entry.kind,
       rawText,
       sourceUrl: entry.sourceUrl || null,
-      createdAt: Date.now(),
+      createdAt: existing ? existing.createdAt : Date.now(),
+      // Carried over so the stored record doesn't lose them the moment
+      // this overwrites it — the live corpus already keeps its own
+      // count regardless (upsert only initializes it if missing), but
+      // IndexedDB only knows what's on the record it's given.
+      timesSampled: existing ? existing.timesSampled : undefined,
+      windowProgress: existing ? existing.windowProgress : undefined,
     };
-    sources.push(source);
+    if (existing) {
+      sources[sources.indexOf(existing)] = source;
+    } else {
+      sources.push(source);
+    }
     added += 1;
     // Drawn immediately, and nothing below is awaited: the next file
     // starts reading straight away. Saving and handing it to the model
