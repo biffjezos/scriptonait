@@ -2371,6 +2371,11 @@ $('import-project-input').addEventListener('change', async (event) => {
   }
   clearError();
   setModelStatus('loading', `Loading ${file.name}…`);
+  // The same staged progress the page's own startup restore shows —
+  // several real seconds of work (parsing the file, then the model,
+  // corpus and history each round-tripping through the worker and
+  // IndexedDB) with nothing on screen in between otherwise.
+  notice(`Reading ${file.name}…`, 'info');
   try {
     const buffer = await file.arrayBuffer();
     const { header, checkpointBytes, optimizerBytes } = project.parseProjectFile(buffer);
@@ -2390,6 +2395,7 @@ $('import-project-input').addEventListener('change', async (event) => {
     if (settings.trainingPlan) await db.putTrainingPlanSettings(settings.trainingPlan);
 
     if (checkpointBytes) {
+      notice('Restoring model…', 'info');
       renderModel(await call('import-checkpoint', { bytes: checkpointBytes }, [checkpointBytes]));
       if (optimizerBytes) {
         await call('import-optimizer', { bytes: optimizerBytes }, [optimizerBytes]).catch(() => {});
@@ -2412,8 +2418,10 @@ $('import-project-input').addEventListener('change', async (event) => {
     // persisted sample count (syncSource does that per source already).
     sources = [];
     history.length = 0;
+    notice('Restoring corpus…', 'info');
     await refreshSources();
     await syncAllSources();
+    notice('Restoring history…', 'info');
     history.push(...(await db.listHistory()));
     renderHistory();
     rebuildChartFromHistory();
@@ -2833,6 +2841,14 @@ async function applyLoadedSettings() {
 }
 
 (async function start() {
+  // Loading a project restored from the last visit is several separate
+  // waits on IndexedDB and the worker (sources, model, history) with
+  // nothing to show for it in between — it reads as a hang rather than
+  // as several seconds of real work. The one notification bar the page
+  // already has for transient status carries it, one line per stage,
+  // rather than adding a second place to look.
+  notice('Restoring your project…', 'info');
+
   // Settings, before anything reads them.
   await applyLoadedSettings();
 
@@ -2846,9 +2862,11 @@ async function applyLoadedSettings() {
   // Nothing is fetched from the network here. The page loads, shows what
   // you already have — including the model your last visit trained — and
   // waits. No model is downloaded, ever.
+  notice('Restoring corpus…', 'info');
   await refreshSources();
   setModelStatus('absent', 'No model yet.');
   updateGuidance();
+  notice('Restoring model…', 'info');
   await restoreModel();
   updateGuidance();
   // What to do next, before anything has been trained: with a model and
@@ -2861,6 +2879,7 @@ async function applyLoadedSettings() {
   // What every previous run measured. This is why the history is in
   // IndexedDB and not in a variable: the run worth understanding is
   // usually the one from yesterday.
+  notice('Restoring history…', 'info');
   try {
     history.push(...(await db.listHistory()));
     renderHistory();
@@ -2868,4 +2887,5 @@ async function applyLoadedSettings() {
   } catch (error) {
     console.warn('[scriptonait] could not read the run history', error);
   }
+  notice('Project restored.', 'success');
 })();
