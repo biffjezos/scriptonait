@@ -2871,9 +2871,17 @@ async function applyLoadedSettings() {
   // waits on IndexedDB and the worker (sources, model, history) with
   // nothing to show for it in between — it reads as a hang rather than
   // as several seconds of real work. The one notification bar the page
-  // already has for transient status carries it, one line per stage,
-  // rather than adding a second place to look.
-  notice('Restoring your project…', 'info');
+  // already has for transient status carries it, one line per stage —
+  // but only when there is actually something being restored. A first
+  // visit with nothing saved yet has to stay silent about it; narrating
+  // a restore that didn't happen is worse than saying nothing.
+  const [hasModel, sourceCount, historyCount] = await Promise.all([
+    db.getModel().then((m) => Boolean(m && m.bytes)).catch(() => false),
+    db.listSources().then((rows) => (rows || []).length).catch(() => 0),
+    db.listHistory().then((rows) => (rows || []).length).catch(() => 0),
+  ]);
+  const hasProject = hasModel || sourceCount > 0 || historyCount > 0;
+  if (hasProject) notice('Restoring your project…', 'info');
 
   // Settings, before anything reads them.
   await applyLoadedSettings();
@@ -2888,11 +2896,11 @@ async function applyLoadedSettings() {
   // Nothing is fetched from the network here. The page loads, shows what
   // you already have — including the model your last visit trained — and
   // waits. No model is downloaded, ever.
-  notice('Restoring corpus…', 'info');
+  if (sourceCount > 0) notice('Restoring corpus…', 'info');
   await refreshSources();
   setModelStatus('absent', 'No model yet.');
   updateGuidance();
-  notice('Restoring model…', 'info');
+  if (hasModel) notice('Restoring model…', 'info');
   await restoreModel();
   updateGuidance();
   // What to do next, before anything has been trained: with a model and
@@ -2905,7 +2913,7 @@ async function applyLoadedSettings() {
   // What every previous run measured. This is why the history is in
   // IndexedDB and not in a variable: the run worth understanding is
   // usually the one from yesterday.
-  notice('Restoring history…', 'info');
+  if (historyCount > 0) notice('Restoring history…', 'info');
   try {
     history.push(...(await db.listHistory()));
     renderHistory();
@@ -2913,5 +2921,5 @@ async function applyLoadedSettings() {
   } catch (error) {
     console.warn('[scriptonait] could not read the run history', error);
   }
-  notice('Project restored.', 'success');
+  if (hasProject) notice('Project restored.', 'success');
 })();
