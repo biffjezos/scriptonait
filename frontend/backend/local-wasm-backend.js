@@ -23,7 +23,15 @@ export class LocalWasmBackend extends Backend {
   constructor({ onFatalError } = {}) {
     super();
     this.onFatalError = onFatalError || (() => {});
-    this.worker = new Worker('./worker.js', { type: 'module' });
+    // Resolved against this module's own URL, not the page's — a plain
+    // './worker.js' here would ask for frontend/backend/worker.js (this
+    // file's own directory), which doesn't exist; the real file is one
+    // level up at frontend/worker.js. That 404 broke every worker call
+    // silently: `restoreModel()`'s startup `load-model` call carries
+    // `timeoutMs: 0` (no timeout, see DEFAULT_TIMEOUT_MS's own comment),
+    // so instead of erroring it just hung forever, and the page never
+    // rendered a restored model at all.
+    this.worker = new Worker(new URL('../worker.js', import.meta.url), { type: 'module' });
     this.nextRequestId = 1;
     this.pending = new Map();
     this.streamHandlers = new Map();
