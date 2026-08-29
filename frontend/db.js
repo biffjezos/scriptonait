@@ -232,38 +232,10 @@ export async function deleteModel() {
   await withStore(MODELS_STORE, 'readwrite', (store) => store.delete(CURRENT_MODEL));
 }
 
-/// Every stored model record — current, and every auto-save snapshot. A
-/// New Project's job: leaving any of these behind means an auto-save
-/// mode picks up rotating snapshots from a project that's gone.
+/// The stored model record. A New Project's job: leaving it behind means
+/// a reload could restore a model from a project that's gone.
 export async function clearModels() {
   await withStore(MODELS_STORE, 'readwrite', (store) => store.clear());
-}
-
-/// Auto-save's "Add" mode: a rolling set of recent snapshots instead of
-/// the single current-model slot "Overwrite" uses.
-///
-/// A fixed, small number of ids (`autosave-0`..`autosave-2`), chosen by
-/// step number modulo that count. Deterministic and needs no rotation
-/// state of its own — the oldest of the three is always the one the next
-/// save's step number lands on again.
-const AUTOSAVE_SNAPSHOT_COUNT = 3;
-
-export async function putAutosaveSnapshot({ bytes, step, params, optimizer = null }) {
-  const id = `autosave-${step % AUTOSAVE_SNAPSHOT_COUNT}`;
-  const record = { id, bytes, step, params, optimizer, savedAt: Date.now() };
-  await withStore(MODELS_STORE, 'readwrite', (store) => store.put(record));
-  return record;
-}
-
-/// Every stored snapshot, oldest first.
-export async function listAutosaveSnapshots() {
-  const ids = Array.from({ length: AUTOSAVE_SNAPSHOT_COUNT }, (_, i) => `autosave-${i}`);
-  const found = [];
-  for (const id of ids) {
-    const record = await withStore(MODELS_STORE, 'readonly', (store) => store.get(id));
-    if (record) found.push(record);
-  }
-  return found.sort((a, b) => a.step - b.step);
 }
 
 // --- The machine profile -----------------------------------------------
@@ -325,10 +297,28 @@ export async function getAutosaveFileHandle() {
   return (record && record.handle) || null;
 }
 
+const AUTOSAVE_DIR_HANDLE = 'autosave-dir-handle';
+
+/// The `FileSystemDirectoryHandle` Add mode writes step-suffixed files
+/// into — the directory counterpart of `putAutosaveFileHandle`, stored
+/// under its own key so switching between Overwrite and Add doesn't
+/// make either mode forget the handle it was given. Same rationale for
+/// staying out of the exported .snp: a directory grant only ever means
+/// anything on the machine and origin that granted it.
+export async function putAutosaveDirectoryHandle(handle) {
+  await withStore(SETTINGS_STORE, 'readwrite', (store) =>
+    store.put({ id: AUTOSAVE_DIR_HANDLE, handle, savedAt: Date.now() }));
+}
+
+export async function getAutosaveDirectoryHandle() {
+  const record = await withStore(SETTINGS_STORE, 'readonly', (store) => store.get(AUTOSAVE_DIR_HANDLE));
+  return (record && record.handle) || null;
+}
+
 /// { enabled, frequencySteps, mode: 'overwrite'|'add', fileName }
 /// `fileName` is just the string the picker returned last — the part of
 /// "which file" that can travel in the project file, unlike the handle
-/// itself (see putAutosaveFileHandle).
+/// itself (see putAutosaveFileHandle/putAutosaveDirectoryHandle).
 export async function putAutosaveConfig(config) {
   const record = { ...config, id: AUTOSAVE_CONFIG, savedAt: Date.now() };
   await withStore(SETTINGS_STORE, 'readwrite', (store) => store.put(record));

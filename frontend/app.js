@@ -2378,7 +2378,10 @@ $('new-project-btn').addEventListener('click', async () => {
     // the browser only honors showSaveFilePicker while it can still trace
     // the call back to this click. Cancelling or a browser without the
     // API isn't fatal to starting the project; it just starts without an
-    // auto-save file set yet, same as it always could.
+    // auto-save file set yet, same as it always could — but the *old*
+    // project's target must not survive into it: without this, a
+    // cancelled picker left the previous project's file/folder connected,
+    // and the new, blank project's first autosave silently overwrote it.
     if (autosaveSupported()) {
       try {
         const handle = await window.showSaveFilePicker({
@@ -2387,8 +2390,13 @@ $('new-project-btn').addEventListener('click', async () => {
         });
         await establishProjectFile(handle);
       } catch (error) {
-        /* cancelled — proceed without one */
+        if (error && error.name !== 'AbortError') {
+          console.warn('[scriptonait] could not set the new project\'s autosave file', error);
+        }
+        await clearAutosaveTarget();
       }
+    } else {
+      await clearAutosaveTarget();
     }
     await db.replaceAllSources([]);
     await db.replaceAllHistory([]);
@@ -2719,22 +2727,50 @@ let autosaveMode = 'overwrite';
 /// up where a project's own auto-save name left off) even before
 /// there's a live handle to match it to.
 let autosaveHandle = null;
+/// Add mode's target: a granted folder, written into instead of
+/// overwriting a single file. Independent of `autosaveHandle` so
+/// switching modes back and forth doesn't make either forget the grant
+/// it was given.
+let autosaveDirHandle = null;
 let autosaveFileName = null;
 let lastAutosaveStep = 0;
 let autosaveInFlight = false;
+/// Set when `autosave()` is called while a save is already in flight —
+/// a fast machine can reach the next scheduled save before the previous
+/// one's file write has finished. Recorded rather than dropped, so the
+/// in-flight save's `finally` can run exactly one catch-up save for
+/// whatever the most recent call asked for; a second overlapping call
+/// just replaces this, since only the latest state is worth catching up
+/// to.
+let autosavePending = null;
 
 function autosaveSupported() {
   return typeof window.showSaveFilePicker === 'function';
 }
 
-/// Write the current model to the chosen file, replacing what is there.
-/// The whole project — model, corpus, history, settings — not just the
-/// weights: a file that is the only copy left after a crash has to be
-/// enough on its own to get back to where things were, not just the
-/// trained parameters with everything else stranded in this browser's
-/// IndexedDB.
-async function writeProjectToFile(checkpointBytes, optimizerBytes) {
-  const blob = project.buildProjectFile({
+function autosaveDirectorySupported() {
+  return typeof window.showDirectoryPicker === 'function';
+}
+
+/// The name Add mode builds step-suffixed filenames from, and Overwrite
+/// mode suggests to the file picker — the Settings-tab field if
+/// anything's been typed into it, else whatever file was last connected,
+/// else a plain default.
+function autosaveBaseName() {
+  return (autosaveFileName || 'scriptonait').replace(/\.snp$/i, '');
+}
+
+function autosaveStepFileName(step) {
+  return `${autosaveBaseName()}-step${String(Math.max(0, Math.round(step))).padStart(10, '0')}.snp`;
+}
+
+/// The whole project — model, corpus, history, settings — as one blob,
+/// not just the trained weights: a file that is the only copy left
+/// after a crash has to be enough on its own to get back to where
+/// things were, not just the trained parameters with everything else
+/// stranded in this browser's IndexedDB.
+async function buildProjectBlob(checkpointBytes, optimizerBytes) {
+  return project.buildProjectFile({
     checkpointBytes,
     optimizerBytes,
     sources,
@@ -2746,12 +2782,32 @@ async function writeProjectToFile(checkpointBytes, optimizerBytes) {
       trainingPlan: await db.getTrainingPlanSettings(),
     },
   });
-  const writable = await autosaveHandle.createWritable();
+}
+
+async function writeBlobTo(handle, blob) {
+  const writable = await handle.createWritable();
   try {
     await writable.write(blob);
   } finally {
     await writable.close();
   }
+}
+
+/// Overwrite mode: replace the one chosen file every time.
+async function writeProjectToFile(checkpointBytes, optimizerBytes) {
+  await writeBlobTo(autosaveHandle, await buildProjectBlob(checkpointBytes, optimizerBytes));
+}
+
+/// Add mode: one more step-suffixed file in the chosen folder every
+/// time, never overwriting an earlier one. That's what makes it safe
+/// against a fast machine reaching the next autosave before an earlier
+/// write's promise has settled — each step gets its own filename, so
+/// there is nothing for two in-flight writes to collide on even if
+/// `autosaveInFlight`'s own guard (see `autosave`) somehow let that
+/// happen.
+async function writeProjectToNewFile(step, checkpointBytes, optimizerBytes) {
+  const fileHandle = await autosaveDirHandle.getFileHandle(autosaveStepFileName(step), { create: true });
+  await writeBlobTo(fileHandle, await buildProjectBlob(checkpointBytes, optimizerBytes));
 }
 
 /// Save without interrupting anything, on a step boundary.
@@ -2786,7 +2842,10 @@ async function exportCheckpointWithRetry() {
 
 async function autosave(step, { force = false, bytes: given = null } = {}) {
   if (!autosaveEnabled && !force) return;
-  if (autosaveInFlight) return;
+  if (autosaveInFlight) {
+    autosavePending = { step, force, given };
+    return;
+  }
   if (!force && !given && step - lastAutosaveStep < autosaveFrequencySteps) return;
   autosaveInFlight = true;
   lastAutosaveStep = step;
@@ -2819,30 +2878,26 @@ async function autosave(step, { force = false, bytes: given = null } = {}) {
         /* no stored copy yet: there is nothing to preserve */
       }
       const params = model ? model.params : 0;
-      // "Add" keeps a rolling set of recent snapshots instead of
-      // overwriting the one current-model slot. The file-on-disk leg
-      // always overwrites the chosen file regardless of mode — the File
-      // System Access API cannot silently create a new file without a
-      // picker prompt on every save, which would defeat "no button
-      // needed".
-      if (autosaveMode === 'add') {
-        await db.putAutosaveSnapshot({ bytes, step, params, optimizer });
-      } else {
-        await db.putModel({ bytes, step, params, optimizer });
-      }
+      await db.putModel({ bytes, step, params, optimizer });
       let wroteFile = false;
-      if (autosaveHandle) {
+      let fileDescription = '';
+      if (autosaveMode === 'add' && autosaveDirHandle) {
+        await writeProjectToNewFile(step, bytes, optimizer);
+        wroteFile = true;
+        fileDescription = `${autosaveStepFileName(step)} in ${autosaveDirHandle.name}`;
+      } else if (autosaveMode !== 'add' && autosaveHandle) {
         await writeProjectToFile(bytes, optimizer);
         wroteFile = true;
+        fileDescription = autosaveHandle.name;
       }
       console.info(
         `[scriptonait] auto-saved at step ${step.toLocaleString()} ` +
-          `(${formatCount(bytes.byteLength)} bytes${wroteFile ? ', to your file' : ''}) in ` +
+          `(${formatCount(bytes.byteLength)} bytes${wroteFile ? `, to ${fileDescription}` : ''}) in ` +
           `${(performance.now() - started).toFixed(0)} ms`,
       );
       $('autosave-status').textContent =
         `Last save: step ${step.toLocaleString()}` +
-        (wroteFile ? ` — ${autosaveHandle.name} and this browser.` : ' — this browser.');
+        (wroteFile ? ` — ${fileDescription} and this browser.` : ' — this browser.');
       flushSourceSampleCounts();
       return `Auto-saved at step ${step.toLocaleString()}`;
     });
@@ -2854,6 +2909,19 @@ async function autosave(step, { force = false, bytes: given = null } = {}) {
     console.warn('[scriptonait] auto-save failed', error);
   } finally {
     autosaveInFlight = false;
+    // A fast machine can reach the next scheduled autosave before this
+    // one's file write has finished — see the guard at the top of this
+    // function. Rather than silently dropping every save that arrives
+    // while one is in flight (which, on a machine where writes routinely
+    // take longer than the interval between them, would mean autosave
+    // never actually progresses past the first one), run exactly one
+    // catch-up save for whatever the most recent overlapping call asked
+    // for.
+    if (autosavePending) {
+      const pending = autosavePending;
+      autosavePending = null;
+      autosave(pending.step, { force: pending.force, bytes: pending.given });
+    }
   }
 }
 
@@ -2893,6 +2961,33 @@ document.addEventListener('visibilitychange', () => {
 window.addEventListener('pagehide', saveBeforeTabDisappears);
 
 $('autosave-file-btn').addEventListener('click', async () => {
+  if (autosaveMode === 'add') {
+    if (!autosaveDirectorySupported()) {
+      notice(
+        'This browser cannot write to a folder on its own (Chrome and Edge can). The browser ' +
+          'copy still saves; "Save" on the Overview tab works anywhere.',
+        'error',
+      );
+      return;
+    }
+    let handle;
+    try {
+      handle = await window.showDirectoryPicker({ mode: 'readwrite' });
+    } catch (error) {
+      // A cancelled picker is not an error, and not something to notify
+      // about either.
+      if (error && error.name !== 'AbortError') showError(error);
+      return;
+    }
+    await withNotice('Choosing autosave folder', 'Autosave folder set', async () => {
+      await establishAutosaveDirectory(handle);
+      // Write immediately, so the folder gets its first file now rather
+      // than in six hours when it matters.
+      if (model) await autosave(model.step, { force: true });
+      return `Autosave folder set to ${handle.name}`;
+    });
+    return;
+  }
   if (!autosaveSupported()) {
     notice(
       'This browser cannot write to a file on its own (Chrome and Edge can). The browser ' +
@@ -2936,6 +3031,7 @@ $('autosave-file-btn').addEventListener('click', async () => {
 async function establishProjectFile(handle) {
   autosaveHandle = handle;
   autosaveFileName = handle.name;
+  $('autosave-filename').value = autosaveBaseName();
   $('autosave-status').textContent = `File: ${handle.name}.`;
   // The handle for this browser (can't travel — see putAutosaveFileHandle);
   // the name through persistAutosaveConfig, since that's the part that
@@ -2946,6 +3042,38 @@ async function establishProjectFile(handle) {
   await persistAutosaveConfig().catch((error) => {
     console.warn('[scriptonait] could not remember the project file name', error);
   });
+}
+
+/// The directory-handle counterpart of `establishProjectFile`, for Add
+/// mode — same idea (this is where the Settings "Choose…" button's
+/// grant becomes "the folder auto-save writes into from now on"), a
+/// separate function because a folder and a single file need different
+/// live-handle state (`autosaveDirHandle` vs `autosaveHandle`) and a
+/// different status line.
+async function establishAutosaveDirectory(handle) {
+  autosaveDirHandle = handle;
+  $('autosave-status').textContent = `Folder: ${handle.name} (files named ${autosaveBaseName()}-step<N>.snp).`;
+  await db.putAutosaveDirectoryHandle(handle).catch((error) => {
+    console.warn('[scriptonait] could not remember the auto-save folder', error);
+  });
+  await persistAutosaveConfig().catch((error) => {
+    console.warn('[scriptonait] could not remember the auto-save settings', error);
+  });
+}
+
+/// Forget whatever file or folder autosave was pointed at, in this
+/// session and in storage. Used when a project that owned that target
+/// is going away (New Project without a completed picker) — the point
+/// is that nothing new can inherit it and overwrite what it points to.
+async function clearAutosaveTarget() {
+  autosaveHandle = null;
+  autosaveDirHandle = null;
+  autosaveFileName = null;
+  $('autosave-filename').value = '';
+  refreshAutosaveTargetDisplay();
+  await db.putAutosaveFileHandle(null).catch(() => {});
+  await db.putAutosaveDirectoryHandle(null).catch(() => {});
+  await persistAutosaveConfig().catch(() => {});
 }
 
 /// The one place that writes autosaveConfig, so the file name never
@@ -2969,8 +3097,31 @@ $('autosave-frequency').addEventListener('change', async (event) => {
   await withNotice('Saving setting', 'Setting saved', () => persistAutosaveConfig());
 });
 
+/// Overwrite writes into a single file, Add into a chosen folder — two
+/// different kinds of grant, so switching modes shows what's actually
+/// set for the mode now selected rather than leaving the other mode's
+/// status line on screen.
+function refreshAutosaveTargetDisplay() {
+  $('autosave-file-btn').textContent = autosaveMode === 'add' ? 'Choose folder…' : 'Choose file…';
+  if (autosaveMode === 'add') {
+    $('autosave-status').textContent = autosaveDirHandle
+      ? `Folder: ${autosaveDirHandle.name} (files named ${autosaveBaseName()}-step<N>.snp).`
+      : 'Folder: not set.';
+  } else {
+    $('autosave-status').textContent = autosaveHandle ? `File: ${autosaveHandle.name}.` : 'File: not set.';
+  }
+}
+
 $('autosave-mode').addEventListener('change', async (event) => {
   autosaveMode = event.target.value === 'add' ? 'add' : 'overwrite';
+  refreshAutosaveTargetDisplay();
+  await withNotice('Saving setting', 'Setting saved', () => persistAutosaveConfig());
+});
+
+$('autosave-filename').addEventListener('change', async (event) => {
+  autosaveFileName = event.target.value.trim() || 'scriptonait';
+  event.target.value = autosaveFileName;
+  refreshAutosaveTargetDisplay();
   await withNotice('Saving setting', 'Setting saved', () => persistAutosaveConfig());
 });
 
@@ -3026,13 +3177,17 @@ async function applyLoadedSettings() {
       $('autosave-mode').value = autosaveMode;
       // The name travels with the project even where the handle can't —
       // shown provisionally here so it's never blank after an import;
-      // the file-handle check right below overrides it with a confirmed
+      // the handle checks right below override it with a confirmed
       // "connected" status when a live, permitted handle also exists.
-      if (autosaveConfig.fileName) {
-        autosaveFileName = autosaveConfig.fileName;
-        $('autosave-status').textContent = `File: ${autosaveFileName} (not connected — choose it to resume auto-save-to-file).`;
-      }
+      if (autosaveConfig.fileName) autosaveFileName = autosaveConfig.fileName;
+      $('autosave-filename').value = autosaveBaseName();
+      $('autosave-status').textContent = autosaveMode === 'add'
+        ? 'Folder: not set.'
+        : autosaveFileName
+          ? `File: ${autosaveFileName} (not connected — choose it to resume auto-save-to-file).`
+          : 'File: not set.';
     }
+    $('autosave-file-btn').textContent = autosaveMode === 'add' ? 'Choose folder…' : 'Choose file…';
   } catch (error) {
     console.warn('[scriptonait] could not read auto-save settings', error);
   }
@@ -3048,13 +3203,30 @@ async function applyLoadedSettings() {
       autosaveFileName = handle.name;
       if (permission === 'granted') {
         autosaveHandle = handle;
-        $('autosave-status').textContent = `File: ${handle.name}.`;
-      } else {
+        if (autosaveMode !== 'add') $('autosave-status').textContent = `File: ${handle.name}.`;
+      } else if (autosaveMode !== 'add') {
         $('autosave-status').textContent = `File: ${handle.name} (permission needed — choose it again).`;
       }
     }
   } catch (error) {
     console.warn('[scriptonait] could not restore the auto-save file', error);
+  }
+  try {
+    const dirHandle = autosaveDirectorySupported() ? await db.getAutosaveDirectoryHandle() : null;
+    if (dirHandle) {
+      const permission = await dirHandle.queryPermission({ mode: 'readwrite' });
+      if (permission === 'granted') {
+        autosaveDirHandle = dirHandle;
+        if (autosaveMode === 'add') {
+          $('autosave-status').textContent =
+            `Folder: ${dirHandle.name} (files named ${autosaveBaseName()}-step<N>.snp).`;
+        }
+      } else if (autosaveMode === 'add') {
+        $('autosave-status').textContent = `Folder: ${dirHandle.name} (permission needed — choose it again).`;
+      }
+    }
+  } catch (error) {
+    console.warn('[scriptonait] could not restore the auto-save folder', error);
   }
   try {
     const devicePref = await db.getDevicePreference();
