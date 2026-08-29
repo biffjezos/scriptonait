@@ -995,16 +995,32 @@ function recordEvent(step, kind, text, extra = {}) {
   post('train-record', { runId, step, kind, text, at: Date.now(), ...extra });
 }
 
-/// Everything a run in flight reads on every cycle rather than once at
-/// the top of `train()` — the settings a page control can change while
-/// training is already going (autosave/metrics cadence, the sample
-/// prompt and its length and sampling knobs). `update-training-settings`
-/// writes into this object; `train()`'s loop only ever reads from it, so
-/// a change lands on the very next check rather than waiting for the
-/// next Train click. Batch size, effort and the initial learning rate
-/// stay one-shot `train()` parameters instead — they size GPU buffers or
-/// set the loop's own pacing at start, not something safe to swap mid-run.
+/// How long one slice of training runs before the worker checks in
+/// (progress, autosave, samples) and, on Auto effort, hands the GPU
+/// back for a beat. Fixed — the thing effort actually tunes is the
+/// pause between slices, not the slice length itself.
+const SLICE_MS = 120;
+
+/// Every setting a run in flight can react to without a fresh model —
+/// the same ground `train()` starts from and `update-training-settings`
+/// changes mid-run, through the one function below that both call. Model
+/// shape (layers/hidden/heads/context/window) is deliberately not here:
+/// changing that only ever takes effect on a newly built model, there is
+/// no "live" version of it.
+///
+/// Two kinds of field live in here. Most (`autosaveEvery`, `sampleEvery`,
+/// the sample prompt/length/sampling, `batchSize`, `maxSteps`, `pauseMs`)
+/// are plain data the training loop rereads every cycle — a change just
+/// lands on the next check. `peakLearningRate` and `boundarySampleRate`
+/// are different: the model itself owns that state (the schedule, the
+/// corpus), so applying one of those means calling into `llm` right
+/// here rather than only writing a JS-side variable — see
+/// `applyLiveSettings` below.
 const live = {
+  batchSize: 1,
+  maxSteps: 0,
+  effort: 1,
+  pauseMs: 0,
   autosaveEvery: AUTOSAVE_EVERY_STEPS,
   validateEvery: VALIDATE_EVERY,
   sampleEvery: 0,
@@ -1016,10 +1032,43 @@ const live = {
 /// One place both `train()` (seeding from the settings a run started
 /// with) and the `update-training-settings` handler (applying a change
 /// mid-run) go through, so the two can never disagree about what "0" or
-/// "missing" falls back to.
+/// "missing" falls back to, or drift into two different ideas of what a
+/// setting means. Every field is optional — only what's present is
+/// touched, so a partial push from one changed control never resets
+/// anything else.
 function applyLiveSettings({
+  batchSize, maxSteps, effort, peakLearningRate, boundarySampleRate,
   autosaveFrequencySteps, metricsEvery, sampleEvery, samplePrompt, sampleMaxTokens, sampling,
 } = {}) {
+  if (typeof batchSize === 'number' && batchSize > 0) live.batchSize = batchSize;
+  if (typeof maxSteps === 'number') {
+    live.maxSteps = maxSteps;
+    // The whole project's planned length, not just this sitting —
+    // idempotent and a no-op at 0, so this is safe to call on every
+    // settings push, not just the first.
+    if (llm) llm.set_project_plan(maxSteps);
+  }
+  if (typeof effort === 'number') {
+    live.effort = effort;
+    live.pauseMs = Math.max(0, Math.round(SLICE_MS * (1 - effort) / Math.max(effort, 0.05)));
+  }
+  if (typeof peakLearningRate === 'number' && peakLearningRate > 0 && llm) {
+    const before = JSON.parse(llm.training_plan()).peakLr;
+    llm.set_learning_rate(peakLearningRate);
+    const plan = JSON.parse(llm.training_plan());
+    if (plan.peakLr !== before) {
+      log(
+        `peak learning rate changed from ${before.toExponential(2)} to ` +
+          `${plan.peakLr.toExponential(2)}; the rate in force is now ${plan.lrNow.toExponential(2)}`,
+      );
+      recordEvent(plan.step, 'rate-changed',
+        `peak learning rate changed by hand from ${before.toExponential(2)} to ` +
+        `${plan.peakLr.toExponential(2)} (in force: ${plan.lrNow.toExponential(2)})`);
+    }
+  }
+  if (typeof boundarySampleRate === 'number' && boundarySampleRate >= 0 && llm) {
+    llm.set_boundary_sample_rate(boundarySampleRate);
+  }
   if (typeof autosaveFrequencySteps === 'number') {
     live.autosaveEvery = autosaveFrequencySteps > 0 ? autosaveFrequencySteps : AUTOSAVE_EVERY_STEPS;
   }
@@ -1033,54 +1082,56 @@ function applyLiveSettings({
 }
 
 async function train({
-  batchSize, learningRate, maxSteps, effort, sampleEvery, samplePrompt, sampleMaxTokens, sampling,
-  autosaveFrequencySteps, metricsEvery,
+  batchSize, peakLearningRate, maxSteps, effort, sampleEvery, samplePrompt, sampleMaxTokens, sampling,
+  autosaveFrequencySteps, metricsEvery, boundarySampleRate,
 }) {
-  applyLiveSettings({ autosaveFrequencySteps, metricsEvery, sampleEvery, samplePrompt, sampleMaxTokens, sampling });
+  // The exact same call a mid-run settings change makes — see
+  // `applyLiveSettings`'s own doc comment. Starting a run is that
+  // function's seed case, not a second code path.
+  applyLiveSettings({
+    batchSize, maxSteps, effort, peakLearningRate, boundarySampleRate,
+    autosaveFrequencySteps, metricsEvery, sampleEvery, samplePrompt, sampleMaxTokens, sampling,
+  });
   stopRequested = false;
   training = true;
   runId = `run-${Date.now().toString(36)}`;
-  if (learningRate > 0) llm.set_learning_rate(learningRate);
-  // Steps is the whole project's planned length, not just this sitting —
-  // set_project_plan is idempotent and a no-op at 0, so leaving Steps at
-  // 0 (train until Stop) neither resets an existing plan nor blocks one:
-  // a model that has never had a plan set falls back to TrainConfig's own
-  // default (10,000) until Steps is actually typed in.
-  llm.set_project_plan(maxSteps);
+  // Steps, learning rate, batch size and effort were all just applied
+  // above, the same way a change to any of them mid-run is — this is
+  // the "start" case of that one path, not a second one.
 
   const info = llm.info();
   const startingPlan = JSON.parse(llm.training_plan());
-  if (batchSize <= 1) {
+  if (live.batchSize <= 1) {
     log(
-      `training at batch size ${batchSize}: ${batchSize * info.context_len} tokens per step. ` +
-        'That is the smallest batch there is — if this was not deliberate, the machine ' +
+      `training at batch size ${live.batchSize}: ${live.batchSize * info.context_len} tokens per ` +
+        'step. That is the smallest batch there is — if this was not deliberate, the machine ' +
         'benchmark has not run for this model shape and the page fell back to it.',
     );
   }
   log('training run starting', {
     device: llm.device_summary(),
     softwareRenderer: llm.gpu_is_software(),
-    batchSize,
+    batchSize: live.batchSize,
     contextLen: info.context_len,
-    tokensPerStep: batchSize * info.context_len,
+    tokensPerStep: live.batchSize * info.context_len,
     dispatchesPerSubmit: llm.dispatches_per_submit(),
-    maxSteps: maxSteps || `until stopped (schedule shaped for ${startingPlan.plannedSteps})`,
+    maxSteps: live.maxSteps || `until stopped (schedule shaped for ${startingPlan.plannedSteps})`,
     startingAtStep: llm.step(),
     peakLearningRate: startingPlan.peakLr,
-    effort,
-    learningRate: learningRate > 0 ? learningRate : 'automatic',
+    effort: live.effort,
+    learningRate: peakLearningRate > 0 ? peakLearningRate : 'automatic',
     plateauScale: llm.plateau_scale(),
     params: info.params,
   });
 
-  const sliceMs = 120;
-  const pauseMs = Math.max(0, Math.round(sliceMs * (1 - effort) / Math.max(effort, 0.05)));
-  const tokensPerStep = batchSize * info.context_len;
   const startedAt = performance.now();
   let steps = 0;
   let tokens = 0;
   let lastPost = 0;
   let smoothedLoss = null;
+  // Reread every slice — a batch-size change mid-run should show up in
+  // the plan/ETA math within one slice, not only on the next Train click.
+  let tokensPerStep = live.batchSize * info.context_len;
   // First sample after the first interval, not immediately: a sample at
   // step 0 is noise from an untouched model.
   let nextSampleAt = llm.step() + (live.sampleEvery || 0);
@@ -1134,12 +1185,12 @@ async function train({
   {
     const plan = JSON.parse(llm.training_plan());
     recordEvent(llm.step(), 'run-started',
-      `run started: ${plan.plannedSteps.toLocaleString()} steps, batch ${batchSize}, ` +
+      `run started: ${plan.plannedSteps.toLocaleString()} steps, batch ${live.batchSize}, ` +
       `${tokensPerStep.toLocaleString()} tokens/step, peak rate ${plan.peakLr.toExponential(2)}, ` +
-      `warm-up ${plan.warmupSteps}, effort ${effort}`,
+      `warm-up ${plan.warmupSteps}, effort ${live.effort}`,
       {
         settings: {
-          plannedSteps: plan.plannedSteps, batchSize, tokensPerStep, effort,
+          plannedSteps: plan.plannedSteps, batchSize: live.batchSize, tokensPerStep, effort: live.effort,
           peakLr: plan.peakLr, warmupSteps: plan.warmupSteps,
           minLrRatio: plan.minLrRatio, weightDecay: plan.weightDecay,
           gradClip: plan.gradClip, plateauScale: plan.plateauScale,
@@ -1189,14 +1240,16 @@ async function train({
     log(`sample generated in ${(performance.now() - sampleStart).toFixed(0)} ms`);
   }
 
-  while (!stopRequested && (maxSteps <= 0 || steps < maxSteps)) {
+  while (!stopRequested && (live.maxSteps <= 0 || steps < live.maxSteps)) {
     const sliceStart = performance.now();
+    // Reread every slice, same as tokensPerStep above.
+    tokensPerStep = live.batchSize * info.context_len;
     // Work for a slice...
-    while (performance.now() - sliceStart < sliceMs) {
+    while (performance.now() - sliceStart < SLICE_MS) {
       const stepStart = performance.now();
       let report;
       try {
-        report = await llm.train_step(batchSize);
+        report = await llm.train_step(live.batchSize);
       } catch (error) {
         // A step that is refused must not end the run in silence.
         //
@@ -1259,13 +1312,13 @@ async function train({
           gradNorm: report.grad_norm,
           elapsedSeconds: elapsed,
           tokensPerSecond: elapsed > 0 ? tokens / elapsed : 0,
-          fractionDone: maxSteps > 0 ? steps / maxSteps : 0,
+          fractionDone: live.maxSteps > 0 ? steps / live.maxSteps : 0,
           // This step's batch, in draw order — {id, excerpt} per window.
           // `id`, not a title: the page (not the worker) knows those.
           sources: JSON.parse(report.sources),
         });
       }
-      if (stopRequested || (maxSteps > 0 && steps >= maxSteps)) break;
+      if (stopRequested || (live.maxSteps > 0 && steps >= live.maxSteps)) break;
     }
 
     // Held-out loss, between slices for the same reason sampling is.
@@ -1386,7 +1439,7 @@ async function train({
               tokensPerSecond: recentStepMs > 0 ? tokensPerStep / (recentStepMs / 1000) : 0,
               msPerStep: recentStepMs,
               elapsedSeconds: (performance.now() - startedAt) / 1000,
-              batchSize,
+              batchSize: live.batchSize,
               tokensPerStep,
               phase: lastPhase,
               quality: lastQuality,
@@ -1470,7 +1523,7 @@ async function train({
     // where the pause is zero: this is the only point in the loop where
     // the worker's message queue gets a turn, so skipping it means a
     // `stop` message sits unread until training ends on its own.
-    await new Promise((resolve) => setTimeout(resolve, pauseMs));
+    await new Promise((resolve) => setTimeout(resolve, live.pauseMs));
   }
 
   training = false;
@@ -1662,13 +1715,6 @@ const handlers = {
     return {};
   },
 
-  /// The fraction of sampled windows that start exactly at a source's
-  /// beginning, live — see `Corpus::boundary_sample_rate`.
-  async 'set-boundary-sample-rate'({ rate }) {
-    llm.set_boundary_sample_rate(rate);
-    return { rate: llm.boundary_sample_rate() };
-  },
-
   async 'upsert-source'(payload) {
     // More text is a different problem from the one the last plateau
     // was found on: whatever cut the rate then does not apply now.
@@ -1855,34 +1901,28 @@ const handlers = {
   },
 
   /// Apply a Settings/Inference-tab change to the run in flight, whether
-  /// one is going or not — the same values a training run's own settings
-  /// take, updated here instead of only ever being read once when Train
-  /// is pressed. Harmless before any run exists: it just updates `live`,
-  /// which the next run also starts from.
+  /// one is going or not — every field `applyLiveSettings` understands,
+  /// through the one function `train()` itself seeds from. Harmless
+  /// before any run exists: it just updates `live` (and, for the fields
+  /// the model owns — peak rate, boundary-sample rate, planned steps —
+  /// the model itself), which the next run also starts from.
+  ///
+  /// The model is the source of truth for anything it owns, so the
+  /// reply reads it back rather than echoing what was sent — a value
+  /// the model clamped or refused shows up here as what actually took,
+  /// not as an intent that was merely logged.
   async 'update-training-settings'(settings) {
     applyLiveSettings(settings);
-    return { ok: true };
-  },
-
-  /// Change the peak learning rate while a run is in flight.
-  ///
-  /// The schedule keeps its shape — this moves the peak the cosine
-  /// decays from, so a rate raised at step 2,000 still decays over the
-  /// rest of the run rather than sitting flat. Recorded, because a loss
-  /// curve with an unexplained bend in it is worse than no curve.
-  async 'set-learning-rate'({ learningRate }) {
-    const before = JSON.parse(llm.training_plan()).peakLr;
-    if (!(learningRate > 0)) return { peakLr: before, changed: false };
-    llm.set_learning_rate(learningRate);
     const plan = JSON.parse(llm.training_plan());
-    log(
-      `peak learning rate changed from ${before.toExponential(2)} to ` +
-        `${plan.peakLr.toExponential(2)}; the rate in force is now ${plan.lrNow.toExponential(2)}`,
-    );
-    recordEvent(plan.step, 'rate-changed',
-      `peak learning rate changed by hand from ${before.toExponential(2)} to ` +
-      `${plan.peakLr.toExponential(2)} (in force: ${plan.lrNow.toExponential(2)})`);
-    return { peakLr: plan.peakLr, lrNow: plan.lrNow, changed: true };
+    return {
+      peakLr: plan.peakLr,
+      lrNow: plan.lrNow,
+      plannedSteps: plan.plannedSteps,
+      boundarySampleRate: llm.boundary_sample_rate(),
+      batchSize: live.batchSize,
+      maxSteps: live.maxSteps,
+      effort: live.effort,
+    };
   },
 
   /// Put the schedule back to full strength after a plateau cut.

@@ -328,7 +328,7 @@ async function syncAllSources() {
   // reason `set-source-sample-count`/`set-window-progress` below exist.
   const openingRate = Number($('opening-rate').value);
   if (openingRate >= 0) {
-    call('set-boundary-sample-rate', { rate: openingRate / 100 }).catch(() => {});
+    call('update-training-settings', { boundarySampleRate: openingRate / 100 }).catch(() => {});
   }
   // Counted, because syncSource swallows its failures — it has to, since
   // one unreadable record must not stop the other sixty-five. But a
@@ -1702,7 +1702,7 @@ $('live-lr-btn').addEventListener('click', async () => {
   const rate = Number($('live-lr').value);
   if (!(rate > 0)) return;
   try {
-    const result = await call('set-learning-rate', { learningRate: rate });
+    const result = await call('update-training-settings', { peakLearningRate: rate });
     console.info(`[scriptonait] peak learning rate is now ${result.peakLr}`);
   } catch (error) {
     showError(error);
@@ -1921,27 +1921,43 @@ for (const id of [
 ]) {
   $(id).addEventListener('change', persistTrainingPlanSettings);
 }
-// Live, like the peak-learning-rate control: takes effect on the very
-// next window sampled, training already in flight or not.
-$('opening-rate').addEventListener('change', () => {
-  const rate = Number($('opening-rate').value);
-  if (rate >= 0) call('set-boundary-sample-rate', { rate: rate / 100 }).catch(() => {});
-});
 
-/// The rest of what a training run reads from these two tabs, pushed to
-/// a run already in flight the same way peak-learning-rate and
-/// source-opening windows already are — a run started at step 0 should
-/// not have to be stopped and restarted just to pick up a frequency or a
-/// sampling setting changed at step 3,400. Read straight off the
-/// controls rather than any cached copy of them, so this can never race
-/// a listener elsewhere that also reacts to the same change. A no-op
-/// before any model exists — the worker just keeps the values for
-/// whenever Train is next pressed.
-function pushLiveTrainingSettings() {
-  call('update-training-settings', {
+/// Every setting a training run reads off the Training-Settings and
+/// Inference tabs, read fresh off the controls in one place — used both
+/// to start a run (the Train button) and to push a change into one
+/// already going (`pushLiveTrainingSettings`), so the two can never
+/// drift into two different ideas of what a run's settings are. Model
+/// shape (layers/hidden/heads/context/window) is deliberately not here:
+/// it only ever takes effect on a freshly built model, there is no live
+/// version of it.
+function readTrainingSettings() {
+  const fromScratch = model && !model.pretrained;
+  const manualMode = $('train-mode').value === 'manual';
+  return {
+    batchSize: chosenBatchSize(),
+    maxSteps: Number($('train-steps').value) || 0,
+    effort: chosenEffort(),
+    // Manual mode uses the typed rate as-is. Auto picks one: a new model
+    // needs a rate large enough to learn a language from nothing; a
+    // working one needs a small enough rate not to forget it.
+    //
+    // 6e-4 is what nanoGPT uses for a 768-wide GPT-2, and a narrower
+    // model tolerates more rather than less, so it is a conservative
+    // choice at the widths this page builds — and twice the 3e-4 that
+    // was here, which was simply timid. With warm-up, gradient-norm
+    // clipping at 1.0 and the plateau cut watching held-out loss, there
+    // are three separate things that catch a rate that turns out to be
+    // too high; there is nothing that catches one that is too low
+    // except hours of your time.
+    peakLearningRate: manualMode ? Number($('train-lr').value) : (fromScratch ? 6e-4 : 5e-5),
+    boundarySampleRate: Number($('opening-rate').value) / 100,
     autosaveFrequencySteps: Math.max(1, Number($('autosave-frequency').value) || 1000),
     metricsEvery: Number($('metrics-every').value) || 0,
+    // 0 turns sampling off; anything else is a step interval.
     sampleEvery: $('sample-toggle').checked ? Number($('sample-every').value) : 0,
+    // Training samples are generated with the Inference tab's own
+    // prompt, length and sampling settings, not a second hidden set —
+    // the same fields Generate reads.
     samplePrompt: $('prompt-input').value.trim() || 'Write a 40 word scene.',
     sampleMaxTokens: $('opt-length-mode').value === 'limit' ? Number($('opt-max-tokens').value) : 0,
     sampling: {
@@ -1951,9 +1967,21 @@ function pushLiveTrainingSettings() {
       minP: Number($('opt-min-p').value),
       repetitionPenalty: Number($('opt-repetition').value),
     },
-  }).catch(() => {});
+  };
+}
+
+/// Pushed to a run already in flight the moment any of these change —
+/// batch size, learning rate, planned steps, effort, source-opening
+/// windows, autosave/metrics cadence, and the sample prompt/length/
+/// sampling settings. A run started at step 0 should not have to be
+/// stopped and restarted just to pick up a value changed at step 3,400.
+/// A no-op before any model exists — the worker just keeps the values
+/// for whenever Train is next pressed.
+function pushLiveTrainingSettings() {
+  call('update-training-settings', readTrainingSettings()).catch(() => {});
 }
 for (const id of [
+  'train-mode', 'train-steps', 'train-effort', 'train-batch', 'train-lr', 'opening-rate',
   'sample-toggle', 'sample-every', 'metrics-every', 'autosave-frequency', 'prompt-input',
   'opt-temperature', 'opt-top-k', 'opt-top-p', 'opt-min-p', 'opt-repetition',
   'opt-length-mode', 'opt-max-tokens',
@@ -2060,45 +2088,7 @@ $('train-btn').addEventListener('click', async () => {
       });
     }
 
-    const fromScratch = model && !model.pretrained;
-    const manualMode = $('train-mode').value === 'manual';
-    const chosenRate = Number($('train-lr').value);
-    const batchSize = chosenBatchSize();
-    const result = await call('train', {
-      batchSize,
-      // Manual mode uses the typed rate as-is (checked above). Auto
-      // picks one: a new model needs a rate large enough to learn a
-      // language from nothing; a working one needs a small enough rate
-      // not to forget it.
-      //
-      // 6e-4 is what nanoGPT uses for a 768-wide GPT-2, and a narrower
-      // model tolerates more rather than less, so it is a conservative
-      // choice at the widths this page builds — and twice the 3e-4 that
-      // was here, which was simply timid. With warm-up, gradient-norm
-      // clipping at 1.0 and the plateau cut watching held-out loss,
-      // there are three separate things that catch a rate that turns
-      // out to be too high; there is nothing that catches one that is
-      // too low except hours of your time.
-      learningRate: manualMode ? chosenRate : (fromScratch ? 6e-4 : 5e-5),
-      maxSteps: Number($('train-steps').value),
-      effort: chosenEffort(),
-      // 0 turns sampling off; anything else is a step interval.
-      sampleEvery: $('sample-toggle').checked ? Number($('sample-every').value) : 0,
-      // Training samples are generated with the Inference tab's own
-      // prompt, length and sampling settings, not a second hidden set —
-      // the same fields Generate reads.
-      samplePrompt: $('prompt-input').value.trim() || 'Write a 40 word scene.',
-      sampleMaxTokens: $('opt-length-mode').value === 'limit' ? Number($('opt-max-tokens').value) : 0,
-      sampling: {
-        temperature: Number($('opt-temperature').value),
-        topK: Number($('opt-top-k').value),
-        topP: Number($('opt-top-p').value),
-        minP: Number($('opt-min-p').value),
-        repetitionPenalty: Number($('opt-repetition').value),
-      },
-      autosaveFrequencySteps,
-      metricsEvery: Number($('metrics-every').value) || 0,
-    }, [], 0);
+    const result = await call('train', readTrainingSettings(), [], 0);
 
     if (result.stopReason === 'already-training') {
       showError('A training run is already going. Press Stop first if you want to change it.');
