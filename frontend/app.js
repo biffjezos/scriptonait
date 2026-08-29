@@ -2414,6 +2414,17 @@ $('import-project-input').addEventListener('change', async (event) => {
     if (settings.benchmarkConfig) await db.putBenchmarkConfig(settings.benchmarkConfig);
     if (settings.trainingPlan) await db.putTrainingPlanSettings(settings.trainingPlan);
 
+    // Before the corpus gets rebuilt, not after: syncAllSources (called
+    // below, both directly and inside restoreModel-shaped paths) reads
+    // #opening-rate straight off the DOM to push the boundary-sample
+    // rate to the freshly created corpus. Restoring settings afterward
+    // meant that read still saw whatever was on screen before the
+    // import — so a project's own opening-window rate (and every other
+    // field this restores) never actually reached the rebuilt corpus,
+    // even though it was sitting correctly in IndexedDB and the field
+    // itself updated a moment later.
+    await applyLoadedSettings();
+
     if (checkpointBytes) {
       notice('Restoring model…', 'info');
       renderModel(await call('import-checkpoint', { bytes: checkpointBytes }, [checkpointBytes]));
@@ -2445,7 +2456,6 @@ $('import-project-input').addEventListener('change', async (event) => {
     history.push(...(await db.listHistory()));
     renderHistory();
     rebuildChartFromHistory();
-    await applyLoadedSettings();
     updateGuidance();
     notice(`Imported ${file.name}.`, 'success');
   } catch (error) {
