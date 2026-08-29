@@ -388,13 +388,14 @@ async function reportDuplicates() {
   if (!model) return;
   try {
     const { ids } = await call('duplicate-sources');
+    $('remove-duplicates-btn').hidden = !ids || ids.length === 0;
     if (!ids || ids.length === 0) return;
     const titles = ids
       .map((id) => (sources.find((s) => s.id === id) || {}).title || id)
       .slice(0, 3);
     showError(
       `${ids.length} source${ids.length === 1 ? ' is a copy' : 's are copies'} of another ` +
-        `(${titles.join(', ')}${ids.length > 3 ? ', …' : ''}). Remove the copies in Corpus.`,
+        `(${titles.join(', ')}${ids.length > 3 ? ', …' : ''}). Remove Copies in Corpus.`,
     );
   } catch (error) {
     console.warn('[scriptonait] duplicate check failed:', error);
@@ -901,6 +902,26 @@ $('remove-all-btn').addEventListener('click', async () => {
     }
   }
   await refreshPlan();
+});
+
+$('remove-duplicates-btn').addEventListener('click', async () => {
+  let ids;
+  try {
+    ({ ids } = await call('duplicate-sources'));
+  } catch (error) {
+    showError(error);
+    return;
+  }
+  if (!ids || ids.length === 0) {
+    $('remove-duplicates-btn').hidden = true;
+    return;
+  }
+  if (!confirm(`Remove ${ids.length.toLocaleString()} duplicate source${ids.length === 1 ? '' : 's'}? This can't be undone.`)) {
+    return;
+  }
+  for (const id of ids) await removeSource(id);
+  $('remove-duplicates-btn').hidden = true;
+  notice(`Removed ${ids.length.toLocaleString()} duplicate source${ids.length === 1 ? '' : 's'}.`, 'success');
 });
 
 async function removeSource(id) {
