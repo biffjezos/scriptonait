@@ -617,14 +617,18 @@ onStream('gpu-status', ({ available, device, reason, report }) => {
     loadMachineProfile().catch((error) => console.warn('[scriptonait]', error));
     console.info(`[scriptonait] device: ${device}`, report || {});
     if (report && report.isSoftware) {
-      console.warn(
-        '[scriptonait] this is a software renderer, not your GPU — training will be slow',
-      );
+      console.warn('[scriptonait] this is a software renderer, not your GPU — training will be slow');
+      notice('This browser gave the page a software renderer, not your GPU — training will be slow.', 'info');
     }
   } else {
     console.warn(
       `[scriptonait] no WebGPU (${reason || 'unavailable'}): generation runs on the CPU, ` +
         'and training cannot run at all',
+    );
+    notice(
+      `No WebGPU device (${reason || 'unavailable'}): generation runs on the CPU, and training ` +
+        'cannot run at all.',
+      'error',
     );
   }
 });
@@ -700,6 +704,7 @@ $('generate-btn').addEventListener('click', async () => {
       `${result.tokensPerSecond.toFixed(0)} tokens/s · ${why}`;
     renderNotes(result.notes);
     notify('Your piece is ready', `${result.wordCount} words — ${why}.`);
+    notice(`Generated ${result.wordCount} words — ${why}.`, 'success');
     // Measure what came out, to the console. Not on the page: the piece
     // is the point, and a person reading it does not need a score
     // stapled to it — but "37% of those words are not in your corpus"
@@ -1260,7 +1265,10 @@ function renderPlan(plan) {
   // in two of them, and nobody watches a tab for twenty minutes to find
   // out which.
   if (plan.phase.key !== lastPhaseKey) {
-    if (lastPhaseKey !== null) notify(`Training: ${plan.phase.title}`, plan.phase.detail);
+    if (lastPhaseKey !== null) {
+      notify(`Training: ${plan.phase.title}`, plan.phase.detail);
+      notice(`${plan.phase.title} — ${plan.phase.detail}`, 'info');
+    }
     console.info(`[scriptonait] phase: ${plan.phase.title} — ${plan.phase.detail}`, n);
     lastPhaseKey = plan.phase.key;
   }
@@ -1317,6 +1325,7 @@ onStream('train-advice', ({ advice, step }) => {
   const box = $('train-advice');
   box.textContent = `At step ${step.toLocaleString()}: ${advice}`;
   box.hidden = false;
+  notice(advice, 'info');
   console.info(`[scriptonait] advice: ${advice}`);
   notify('Your model has stopped improving', advice);
 });
@@ -1634,6 +1643,7 @@ onStream('train-record', async (record) => {
     await db.appendHistory(row);
   } catch (error) {
     console.warn('[scriptonait] could not store a history record', error);
+    notice(`Could not save a history record: ${(error && error.message) || error}.`, 'error');
   }
 });
 
@@ -1667,6 +1677,7 @@ $('history-clear-btn').addEventListener('click', async () => {
     await db.clearHistory();
   } catch (error) {
     console.warn('[scriptonait] could not clear the history', error);
+    notice(`Could not clear the stored history: ${(error && error.message) || error}.`, 'error');
   }
 });
 
@@ -1689,9 +1700,10 @@ $('sample-next').addEventListener('click', () => {
 $('reset-schedule-btn').addEventListener('click', async () => {
   try {
     const result = await call('reset-schedule');
-    console.info(
-      `[scriptonait] schedule restored from ${result.was.toFixed(2)}x to full strength; ` +
-        `rate in force ${result.lrNow.toExponential(2)}`,
+    notice(
+      `Schedule restored from ${result.was.toFixed(2)}x to full strength — rate in force ` +
+        `${result.lrNow.toExponential(2)}.`,
+      'success',
     );
   } catch (error) {
     showError(error);
@@ -1703,7 +1715,7 @@ $('live-lr-btn').addEventListener('click', async () => {
   if (!(rate > 0)) return;
   try {
     const result = await call('update-training-settings', { peakLearningRate: rate });
-    console.info(`[scriptonait] peak learning rate is now ${result.peakLr}`);
+    notice(`Peak learning rate is now ${result.peakLr}.`, 'success');
   } catch (error) {
     showError(error);
   }
@@ -1814,6 +1826,7 @@ async function runBenchmark() {
     const result = await call('benchmark', {}, [], 0);
     if (result.error) {
       console.warn(`[scriptonait] benchmark: ${result.error}`);
+      notice(`Machine benchmark failed: ${result.error}. Falling back to safe defaults.`, 'error');
       return machineProfile;
     }
     machineProfile = await db.putMachineProfile(result.profile);
@@ -2107,6 +2120,7 @@ $('train-btn').addEventListener('click', async () => {
         `${result.steps} steps in ${formatDuration(result.elapsedSeconds)} · loss ${loss}` +
         ' · press Train again to continue';
       notify('Training finished', `${result.steps} steps, loss ${loss}.`);
+      notice(`Training finished — ${result.steps} steps, loss ${loss}.`, 'success');
     }
     if (result.model) renderModel(result.model);
     await saveModel();
@@ -2656,7 +2670,10 @@ async function autosave(step, { force = false, bytes: given = null } = {}) {
     flushSourceSampleCounts();
   } catch (error) {
     console.warn('[scriptonait] auto-save failed', error);
-    $('autosave-status').textContent = `Save failed at step ${step.toLocaleString()}: ${(error && error.message) || error}`;
+    // The status line keeps showing the last save that actually
+    // succeeded — overwriting it with the failure would bury that fact
+    // the moment the next save works and the line moves on.
+    showError(`Auto-save failed at step ${step.toLocaleString()}: ${(error && error.message) || error}`);
   } finally {
     autosaveInFlight = false;
   }
@@ -2749,6 +2766,7 @@ async function restoreModel() {
     stored = await db.getModel();
   } catch (error) {
     console.warn('[scriptonait] could not read the saved model:', error);
+    notice(`Could not read your saved model: ${(error && error.message) || error}.`, 'error');
     return;
   }
   if (!stored || !stored.bytes) return;
@@ -2764,10 +2782,12 @@ async function restoreModel() {
         console.info('[scriptonait] restored the optimizer state with the model');
       } catch (error) {
         console.warn('[scriptonait] optimizer state did not fit this model:', error);
+        notice('Momentum from your last session did not fit this model — resuming without it.', 'info');
       }
     }
   } catch (error) {
     console.warn('[scriptonait] the saved model would not load:', error);
+    notice(`Your saved model would not load: ${(error && error.message) || error}.`, 'error');
     setModelStatus('absent', 'No model yet.');
   }
 }
