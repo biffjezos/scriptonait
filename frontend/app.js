@@ -2308,11 +2308,12 @@ $('import-input').addEventListener('change', async (event) => {
   const file = event.target.files[0];
   if (!file) return;
   clearError();
-  setModelStatus('loading', `Loading ${file.name}…`);
+  notice(`Loading ${file.name}…`, 'info');
   try {
     const buffer = await file.arrayBuffer();
     renderModel(await call('import-checkpoint', { bytes: buffer }, [buffer]));
     await syncAllSources();
+    notice(`Loaded ${file.name}.`, 'success');
     } catch (error) {
     showError(`that file didn't load: ${error.message}`);
     setModelStatus('absent', 'No model loaded.');
@@ -2390,7 +2391,6 @@ $('import-project-input').addEventListener('change', async (event) => {
     return;
   }
   clearError();
-  setModelStatus('loading', `Loading ${file.name}…`);
   // The same staged progress the page's own startup restore shows —
   // several real seconds of work (parsing the file, then the model,
   // corpus and history each round-tripping through the worker and
@@ -2776,7 +2776,6 @@ async function restoreModel() {
     return;
   }
   if (!stored || !stored.bytes) return;
-  setModelStatus('loading', 'Loading your saved model…');
   try {
     renderModel(await call('load-model', { bytes: stored.bytes }, [], 0));
     await syncAllSources();
