@@ -1117,6 +1117,11 @@ function describeBatchSources(draws, maxChars) {
 }
 
 onStream('train-progress', (progress) => {
+  // Kept live so the model's own step count never lags behind what the
+  // worker is reporting — a stale step here is what made every history
+  // row look orphaned mid-run (row.step compared against a step frozen
+  // at whenever the run started).
+  if (model) model.step = progress.step;
   setProgress('train-progress-bar', progress.fractionDone);
   const on = model && model.device ? ` on ${model.device}` : '';
   // Held-out loss is the one that says whether it is learning the
