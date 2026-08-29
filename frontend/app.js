@@ -10,93 +10,29 @@
 
 import * as db from './db.js';
 import * as project from './project.js';
+import { LocalWasmBackend } from './backend/local-wasm-backend.js';
 
-const worker = new Worker('./worker.js', { type: 'module' });
+// --- Compute backend -----------------------------------------------------
+// `app.js` never touches the worker (or, later, a remote server) directly
+// — only this backend's call()/onStream(), the interface every backend
+// implements (see backend/backend.js). `showError` isn't defined yet at
+// this point in the file, but the arrow function below only resolves the
+// name when the worker actually reports a fatal error, well after the
+// whole module (including `showError`'s own declaration) has run.
+const backend = new LocalWasmBackend({ onFatalError: (error) => showError(error) });
 
-// --- Worker plumbing ---------------------------------------------------
-// Requests are promise-shaped; streaming updates arrive out-of-band and
-// are dispatched to whatever handler is currently interested.
+function call(type, payload = {}, transfer = [], timeoutMs) {
+  return backend.call(type, payload, transfer, timeoutMs);
+}
 
-let nextRequestId = 1;
-const pending = new Map();
-const streamHandlers = new Map();
-
-// Long jobs (generation, fine-tuning) legitimately run for minutes and
-// opt out with `timeoutMs: 0`. Everything else gets a deadline, because
-// a request that never settles is the worst possible failure: the UI
-// waits forever, shows nothing, and says nothing. That is exactly what
-// happened when the worker's own fetch hung — the page sat on "Loading
-// the model..." and every subsequent action queued up behind it in
-// silence.
-const DEFAULT_TIMEOUT_MS = 60000;
+function onStream(type, handler) {
+  backend.onStream(type, handler);
+}
 
 /// Matches worker.js. A stored profile from an older benchmark measured
 /// something the current one does not, so it is discarded rather than
 /// trusted.
 const BENCH_VERSION = 1;
-
-function call(type, payload = {}, transfer = [], timeoutMs = DEFAULT_TIMEOUT_MS) {
-  const id = nextRequestId++;
-  return new Promise((resolve, reject) => {
-    let timer = null;
-    const settle = (fn) => (value) => {
-      if (timer) clearTimeout(timer);
-      pending.delete(id);
-      fn(value);
-    };
-    pending.set(id, { resolve: settle(resolve), reject: settle(reject) });
-    if (timeoutMs > 0) {
-      timer = setTimeout(() => {
-        pending.delete(id);
-        reject(new Error(`the worker didn't answer "${type}" within ${Math.round(timeoutMs / 1000)}s`));
-      }, timeoutMs);
-    }
-    // The payload goes in its own field rather than being spread
-    // alongside the request id. It used to be `{ id, type, ...payload }`,
-    // and a payload carrying its own `id` — every upsert-source does —
-    // overwrote the request id with it. The worker then took that as the
-    // request id, so the source id vanished ("the source id was
-    // missing"), and the reply came back under an id no caller
-    // recognised, so that call never settled. One key collision, three
-    // symptoms.
-    worker.postMessage({ rid: id, type, payload }, transfer);
-  });
-}
-
-function onStream(type, handler) {
-  streamHandlers.set(type, handler);
-}
-
-worker.onmessage = (event) => {
-  const { type, rid: id } = event.data;
-  if (type === 'result') {
-    const entry = pending.get(id);
-    if (entry) {
-      pending.delete(id);
-      entry.resolve(event.data.result);
-    }
-    return;
-  }
-  if (type === 'error') {
-    const error = new Error(event.data.message);
-    if (event.data.stack) error.stack = event.data.stack;
-    const entry = pending.get(id);
-    if (entry) {
-      pending.delete(id);
-      entry.reject(error);
-    } else {
-      showError(error);
-    }
-    return;
-  }
-  const handler = streamHandlers.get(type);
-  if (handler) handler(event.data);
-};
-
-worker.onerror = (event) =>
-  showError(
-    `${event.message || 'the worker failed'} (${event.filename || 'worker'}:${event.lineno || '?'})`,
-  );
 
 // Anything that escapes a handler lands here rather than only in the
 // console. An error nobody sees is a page that "does nothing"; an error
@@ -618,16 +554,9 @@ let targetWords = 0;
 
 // The worker's log, mirrored into the page's console so both are in one
 // place: which device was acquired, what each training step cost, and
-// why a run refused to start.
-// A worker that fails to parse or throws outside a handler used to be
-// invisible: no reply, no error, every call timing out after a minute.
-// It reports itself now, and the page says so.
-worker.addEventListener('error', (event) => {
-  const detail = (event && (event.message || String(event.error))) || 'unknown error';
-  console.error('[scriptonait] worker failed to load or crashed:', detail, event);
-  showError(`the background worker failed: ${detail}`);
-});
-
+// why a run refused to start. The worker failing to parse or throwing
+// outside a handler entirely is LocalWasmBackend's concern (see its
+// onFatalError), not this file's.
 onStream('worker-error', ({ message, stack }) => {
   console.error(`[scriptonait] worker error: ${message}`, stack || '');
   showError(`worker error: ${message}`);
