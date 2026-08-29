@@ -57,15 +57,17 @@ async fn health(State(state): State<AppState>) -> Response {
 }
 
 async fn create_session(State(state): State<AppState>, Json(req): Json<CreateSessionRequest>) -> Response {
-    let mut new_session = if let Some(checkpoint_b64) = &req.checkpoint_base64 {
+    // Only plain, `Send`-safe data gets built here — the actual
+    // `Corpus`/`ModelWeights` construction happens on the GPU actor
+    // thread itself (see `gpu_actor::build_session`), since
+    // `llm_core::corpus::Corpus` is `!Send` and must never cross the
+    // actor's channel.
+    let origin = if let Some(checkpoint_b64) = &req.checkpoint_base64 {
         let bytes = match base64::engine::general_purpose::STANDARD.decode(checkpoint_b64) {
             Ok(bytes) => bytes,
             Err(err) => return error_response(StatusCode::BAD_REQUEST, format!("bad base64: {err}")),
         };
-        match gpu_actor::build_session_from_checkpoint(&bytes) {
-            Ok(session) => session,
-            Err(err) => return error_response(StatusCode::BAD_REQUEST, err),
-        }
+        gpu_actor::SessionOrigin::Checkpoint { bytes }
     } else if let Some(cfg) = &req.config {
         let vocab_size = Tokenizer::byte_level().vocab_size();
         let config = ModelConfig {
@@ -81,7 +83,7 @@ async fn create_session(State(state): State<AppState>, Json(req): Json<CreateSes
         if let Err(err) = config.validate() {
             return error_response(StatusCode::BAD_REQUEST, err.to_string());
         }
-        gpu_actor::build_session_from_config(config, cfg.seed)
+        gpu_actor::SessionOrigin::Fresh { config, seed: cfg.seed }
     } else {
         return error_response(
             StatusCode::BAD_REQUEST,
@@ -89,11 +91,14 @@ async fn create_session(State(state): State<AppState>, Json(req): Json<CreateSes
         );
     };
 
-    for source in &req.sources {
-        new_session.corpus.upsert(&source.id, &source.text, source.is_html);
-    }
+    let sources = req
+        .sources
+        .into_iter()
+        .map(|s| gpu_actor::SourceSpec { id: s.id, text: s.text, is_html: s.is_html })
+        .collect();
+    let spec = gpu_actor::SessionSpec { origin, sources };
 
-    match state.gpu.create_session(new_session).await {
+    match state.gpu.create_session(spec).await {
         Ok(created) => Json(CreateSessionResponse {
             session_id: created.session_id,
             vocab_size: created.vocab_size,

@@ -75,12 +75,37 @@ pub struct HealthInfo {
     pub is_software: bool,
 }
 
-pub struct NewSession {
-    pub config: ModelConfig,
-    pub weights: ModelWeights,
-    pub corpus: Corpus,
-    pub step: u64,
-    pub tokens_seen: u64,
+/// One corpus source, plain enough to cross the actor channel — see the
+/// module doc on `SessionSpec` for why this can't carry a built `Corpus`
+/// instead.
+pub struct SourceSpec {
+    pub id: String,
+    pub text: String,
+    pub is_html: bool,
+}
+
+/// Either shape a session can start from: a fresh model at some config,
+/// or an existing checkpoint to resume. Kept as plain data (a `Copy`
+/// config/seed, or raw checkpoint bytes) rather than the `ModelWeights`/
+/// `Corpus` those actually build, for the same reason `SessionSpec`
+/// itself is plain data.
+pub enum SessionOrigin {
+    Fresh { config: ModelConfig, seed: u64 },
+    Checkpoint { bytes: Vec<u8> },
+}
+
+/// What `POST /session` hands the actor: everything needed to build a
+/// session, but nothing that isn't `Send`. `llm_core::corpus::Corpus`
+/// holds an `Rc<HashSet<String>>` (its cached word vocabulary) and so is
+/// itself `!Send` — a `Command` carrying a built `Corpus` would make
+/// `Command`, and therefore this whole actor's channel, `!Send` too,
+/// which axum's handlers need transitively through `AppState`. So a
+/// `Corpus` is never built until it's already on the actor thread:
+/// `handle()`'s `CreateSession` arm builds one from this spec's plain
+/// strings, it never crosses the channel.
+pub struct SessionSpec {
+    pub origin: SessionOrigin,
+    pub sources: Vec<SourceSpec>,
 }
 
 pub struct SessionCreated {
@@ -94,7 +119,7 @@ enum Command {
         reply: oneshot::Sender<HealthInfo>,
     },
     CreateSession {
-        session: NewSession,
+        spec: SessionSpec,
         reply: oneshot::Sender<Result<SessionCreated, String>>,
     },
     StartTraining {
@@ -173,8 +198,8 @@ impl GpuActorHandle {
         self.call(|reply| Command::Health { reply }).await
     }
 
-    pub async fn create_session(&self, session: NewSession) -> Result<SessionCreated, String> {
-        self.call(|reply| Command::CreateSession { session, reply }).await?
+    pub async fn create_session(&self, spec: SessionSpec) -> Result<SessionCreated, String> {
+        self.call(|reply| Command::CreateSession { spec, reply }).await?
     }
 
     pub async fn start_training(&self, session_id: SessionId, settings: TrainSettings) -> Result<(), String> {
@@ -255,22 +280,29 @@ fn handle(
             });
         }
 
-        Command::CreateSession { session, reply } => {
+        Command::CreateSession { spec, reply } => {
+            let built = match build_session(spec) {
+                Ok(built) => built,
+                Err(err) => {
+                    let _ = reply.send(Err(err));
+                    return;
+                }
+            };
             let id = format!("s{}", *next_id);
             *next_id += 1;
-            let vocab_size = session.config.vocab_size as u32;
-            let params = session.config.param_count() as f64;
+            let vocab_size = built.config.vocab_size as u32;
+            let params = built.config.param_count() as f64;
             let rng = Rng::seed_from_u64(1);
             sessions.insert(
                 id.clone(),
                 Session {
-                    config: session.config,
-                    weights: session.weights,
-                    corpus: session.corpus,
+                    config: built.config,
+                    weights: built.weights,
+                    corpus: built.corpus,
                     rng,
                     trainer: None,
-                    step: session.step,
-                    tokens_seen: session.tokens_seen,
+                    step: built.step,
+                    tokens_seen: built.tokens_seen,
                 },
             );
             let _ = reply.send(Ok(SessionCreated { session_id: id, vocab_size, params }));
@@ -454,28 +486,44 @@ fn run_training(
     });
 }
 
-/// Build a fresh model from an uploaded shape, seeded with a
-/// freshly-built byte-level tokenizer — the only kind this server
-/// builds a from-scratch model with today, matching `wasm-app`'s own
-/// `WasmLLM::new`.
-pub fn build_session_from_config(config: ModelConfig, seed: u64) -> NewSession {
-    let weights = ModelWeights::init(&config, seed);
-    NewSession {
-        config,
-        weights,
-        corpus: Corpus::with_tokenizer(Tokenizer::byte_level()),
-        step: 0,
-        tokens_seen: 0,
-    }
+struct BuiltSession {
+    config: ModelConfig,
+    weights: ModelWeights,
+    corpus: Corpus,
+    step: u64,
+    tokens_seen: u64,
 }
 
-pub fn build_session_from_checkpoint(bytes: &[u8]) -> Result<NewSession, String> {
-    let checkpoint = Checkpoint::from_bytes(bytes)?;
-    Ok(NewSession {
-        config: checkpoint.config,
-        weights: checkpoint.weights,
-        corpus: Corpus::with_tokenizer(checkpoint.tokenizer),
-        step: checkpoint.step,
-        tokens_seen: checkpoint.tokens_seen,
-    })
+/// Turns a `SessionSpec` into an actual session — including the `Corpus`
+/// it holds. Called only from `handle()`, on the actor thread, which is
+/// the whole point: this is where a `Corpus` is allowed to come into
+/// existence, never before crossing the channel from `routes.rs`.
+fn build_session(spec: SessionSpec) -> Result<BuiltSession, String> {
+    let mut built = match spec.origin {
+        // A from-scratch model always starts from a freshly-built
+        // byte-level tokenizer — the only kind this server builds a
+        // from-scratch model with today, matching `wasm-app`'s own
+        // `WasmLLM::new`.
+        SessionOrigin::Fresh { config, seed } => BuiltSession {
+            weights: ModelWeights::init(&config, seed),
+            config,
+            corpus: Corpus::with_tokenizer(Tokenizer::byte_level()),
+            step: 0,
+            tokens_seen: 0,
+        },
+        SessionOrigin::Checkpoint { bytes } => {
+            let checkpoint = Checkpoint::from_bytes(&bytes)?;
+            BuiltSession {
+                config: checkpoint.config,
+                weights: checkpoint.weights,
+                corpus: Corpus::with_tokenizer(checkpoint.tokenizer),
+                step: checkpoint.step,
+                tokens_seen: checkpoint.tokens_seen,
+            }
+        }
+    };
+    for source in &spec.sources {
+        built.corpus.upsert(&source.id, &source.text, source.is_html);
+    }
+    Ok(built)
 }
