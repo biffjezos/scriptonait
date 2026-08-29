@@ -2642,11 +2642,16 @@ let autosaveEnabled = true;
 let autosaveFrequencySteps = 1000;
 let autosaveMode = 'overwrite';
 
-/// The file the run writes itself to, once somebody has chosen one. Held
-/// only for this session — a handle can be stored, but re-permissioning
-/// it needs a click anyway, so asking once per session is honest about
-/// what is actually happening.
+/// The file the run writes itself to, once somebody has chosen one. The
+/// handle itself is restored across reloads from IndexedDB when the
+/// browser still grants it (see applyLoadedSettings) — it can't travel
+/// in the project file, since it only ever means anything on the
+/// machine and origin that granted it. The name can, and does: kept
+/// here so "Choose…" can offer it back as the suggested name (picking
+/// up where a project's own auto-save name left off) even before
+/// there's a live handle to match it to.
 let autosaveHandle = null;
+let autosaveFileName = null;
 let lastAutosaveStep = 0;
 let autosaveInFlight = false;
 
@@ -2827,14 +2832,24 @@ $('autosave-file-btn').addEventListener('click', async () => {
   }
   try {
     autosaveHandle = await window.showSaveFilePicker({
-      suggestedName: 'scriptonait.snp',
+      // Whatever this project's own autosave name already was — from an
+      // imported project's settings, or from earlier this session —
+      // rather than always the generic default, so reconnecting after
+      // an import or a lost permission is one click to the right name.
+      suggestedName: autosaveFileName || 'scriptonait.snp',
       types: [{ description: 'scriptonait project', accept: { 'application/octet-stream': ['.snp'] } }],
     });
+    autosaveFileName = autosaveHandle.name;
     $('autosave-status').textContent = `File: ${autosaveHandle.name}.`;
     // Stored so a reload doesn't forget which file this is and silently
-    // fall back to browser-only saves — see putAutosaveFileHandle.
+    // fall back to browser-only saves — see putAutosaveFileHandle. The
+    // name goes through persistAutosaveConfig instead, since that's the
+    // part that travels in the project file; the handle can't.
     db.putAutosaveFileHandle(autosaveHandle).catch((error) => {
       console.warn('[scriptonait] could not remember the autosave file', error);
+    });
+    persistAutosaveConfig().catch((error) => {
+      console.warn('[scriptonait] could not remember the autosave file name', error);
     });
     // Write immediately, so the file exists and the permission is proven
     // now rather than in six hours when it matters.
@@ -2845,25 +2860,30 @@ $('autosave-file-btn').addEventListener('click', async () => {
   }
 });
 
+/// The one place that writes autosaveConfig, so the file name never
+/// gets silently dropped by a handler that only meant to change one of
+/// the other three fields — putAutosaveConfig replaces the whole
+/// record, it doesn't merge.
+function persistAutosaveConfig() {
+  return db.putAutosaveConfig({
+    enabled: autosaveEnabled, frequencySteps: autosaveFrequencySteps, mode: autosaveMode,
+    fileName: autosaveFileName,
+  });
+}
+
 $('autosave-enabled').addEventListener('change', async (event) => {
   autosaveEnabled = event.target.value !== 'off';
-  await db.putAutosaveConfig({
-    enabled: autosaveEnabled, frequencySteps: autosaveFrequencySteps, mode: autosaveMode,
-  });
+  await persistAutosaveConfig();
 });
 
 $('autosave-frequency').addEventListener('change', async (event) => {
   autosaveFrequencySteps = Math.max(1, Number(event.target.value) || 1000);
-  await db.putAutosaveConfig({
-    enabled: autosaveEnabled, frequencySteps: autosaveFrequencySteps, mode: autosaveMode,
-  });
+  await persistAutosaveConfig();
 });
 
 $('autosave-mode').addEventListener('change', async (event) => {
   autosaveMode = event.target.value === 'add' ? 'add' : 'overwrite';
-  await db.putAutosaveConfig({
-    enabled: autosaveEnabled, frequencySteps: autosaveFrequencySteps, mode: autosaveMode,
-  });
+  await persistAutosaveConfig();
 });
 
 /// Load the model saved by an earlier visit, if there is one.
@@ -2916,6 +2936,14 @@ async function applyLoadedSettings() {
       $('autosave-enabled').value = autosaveEnabled ? 'on' : 'off';
       $('autosave-frequency').value = String(autosaveFrequencySteps);
       $('autosave-mode').value = autosaveMode;
+      // The name travels with the project even where the handle can't —
+      // shown provisionally here so it's never blank after an import;
+      // the file-handle check right below overrides it with a confirmed
+      // "connected" status when a live, permitted handle also exists.
+      if (autosaveConfig.fileName) {
+        autosaveFileName = autosaveConfig.fileName;
+        $('autosave-status').textContent = `File: ${autosaveFileName} (not connected — choose it to resume auto-save-to-file).`;
+      }
     }
   } catch (error) {
     console.warn('[scriptonait] could not read auto-save settings', error);
@@ -2929,6 +2957,7 @@ async function applyLoadedSettings() {
       // one that didn't gets told to pick the file again rather than
       // silently falling back to browser-only saves.
       const permission = await handle.queryPermission({ mode: 'readwrite' });
+      autosaveFileName = handle.name;
       if (permission === 'granted') {
         autosaveHandle = handle;
         $('autosave-status').textContent = `File: ${handle.name}.`;
