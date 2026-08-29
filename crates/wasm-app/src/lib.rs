@@ -62,10 +62,14 @@ fn js_err(msg: impl std::fmt::Display) -> JsValue {
     JsValue::from_str(&msg.to_string())
 }
 
-/// A `Vec<String>` as a JSON array of strings, `{:?}` handling the quoting
-/// and escaping of each element.
-fn json_string_array(items: &[String]) -> String {
-    let rows = items.iter().map(|s| format!("{s:?}")).collect::<Vec<_>>().join(",");
+/// The most recent batch's draws as a JSON array of `{"id":..,"excerpt":..}`
+/// objects, `{:?}` handling the quoting and escaping of each string.
+fn json_batch_draws(draws: &[llm_core::corpus::BatchDraw]) -> String {
+    let rows = draws
+        .iter()
+        .map(|d| format!("{{\"id\":{:?},\"excerpt\":{:?}}}", d.source_id, d.excerpt))
+        .collect::<Vec<_>>()
+        .join(",");
     format!("[{rows}]")
 }
 
@@ -217,18 +221,18 @@ pub struct StepReport {
     /// Compute dispatches and command-buffer submissions this step made.
     pub dispatches: u32,
     pub submits: u32,
-    /// The source ids this step's batch actually drew windows from, in
-    /// draw order, as a JSON array — not a `pub` field, since
-    /// wasm-bindgen only auto-generates a JS property for `Copy` fields;
-    /// see `sources()` below.
+    /// This step's batch, in draw order, as a JSON array of
+    /// `{"id":..,"excerpt":..}` — not a `pub` field, since wasm-bindgen
+    /// only auto-generates a JS property for `Copy` fields; see
+    /// `sources()` below.
     sources_json: String,
 }
 
 #[wasm_bindgen]
 impl StepReport {
-    /// Which sources this step actually trained on — a JSON array of
-    /// ids, in draw order (repeats mean more than one window of this
-    /// step's batch came from that source).
+    /// What this step actually trained on: a JSON array of
+    /// `{"id":..,"excerpt":..}`, one per window drawn, in draw order —
+    /// which source, and a short excerpt of that window's own text.
     #[wasm_bindgen(getter)]
     pub fn sources(&self) -> String {
         self.sources_json.clone()
@@ -1188,7 +1192,7 @@ impl WasmLLM {
             else {
                 return Ok(None);
             };
-            let sources_json = json_string_array(inner.corpus.last_batch_sources());
+            let sources_json = json_batch_draws(inner.corpus.last_batch_draws());
             (inner.config, inner.train, inner.step, batch, sources_json)
         };
         let lr = train.lr_at(step);

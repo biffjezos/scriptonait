@@ -97,12 +97,11 @@ pub struct Corpus {
     /// be nudged away from starting with the same one the last pass just
     /// ended on.
     last_source: Option<String>,
-    /// The source id each window in the most recent `sample_batch` call
-    /// came from, in draw order — so the page can show what a step
-    /// actually just trained on, not just that a step happened. Replaced
-    /// wholesale at the start of every `sample_batch` call, not
-    /// accumulated.
-    last_batch_sources: Vec<String>,
+    /// Each window drawn by the most recent `sample_batch` call, in draw
+    /// order — so the page can show what a step actually just trained
+    /// on: not just which source, the text itself. Replaced wholesale at
+    /// the start of every `sample_batch` call, not accumulated.
+    last_batch_draws: Vec<BatchDraw>,
     /// See `DEFAULT_BOUNDARY_SAMPLE_RATE` and `set_boundary_sample_rate`.
     boundary_sample_rate: f32,
     /// Every distinct word the sources use, built once and thrown away
@@ -151,7 +150,7 @@ impl Corpus {
             window_cursors: HashMap::new(),
             rotation: VecDeque::new(),
             last_source: None,
-            last_batch_sources: Vec::new(),
+            last_batch_draws: Vec::new(),
             boundary_sample_rate: DEFAULT_BOUNDARY_SAMPLE_RATE,
             word_vocab: None,
             dirty: true,
@@ -632,9 +631,14 @@ impl Corpus {
         // never drawn and never replaced.
         self.rotation.retain(|id| usable.contains_key(id));
 
+        // How much of a window's own text to keep as an excerpt — enough
+        // to actually read what it's training on, short enough that it's
+        // cheap to decode and cheap to hand to the page every step.
+        const EXCERPT_TOKENS: usize = 48;
+
         let mut inputs = Vec::with_capacity(batch_size * context_len);
         let mut targets = Vec::with_capacity(batch_size * context_len);
-        self.last_batch_sources.clear();
+        self.last_batch_draws.clear();
         for _ in 0..batch_size {
             if self.rotation.is_empty() {
                 self.refill_rotation(&usable, rng);
@@ -660,7 +664,9 @@ impl Corpus {
                 continue;
             }
             *self.sample_counts.entry(id.clone()).or_default() += 1;
-            self.last_batch_sources.push(id.clone());
+            let excerpt_len = EXCERPT_TOKENS.min(context_len);
+            let excerpt = self.tokenizer.decode(&self.flat_cache[start..start + excerpt_len]);
+            self.last_batch_draws.push(BatchDraw { source_id: id.clone(), excerpt });
             inputs.extend_from_slice(&self.flat_cache[start..start + context_len]);
             targets.extend_from_slice(&self.flat_cache[start + 1..start + 1 + context_len]);
             self.last_source = Some(id);
@@ -694,10 +700,10 @@ impl Corpus {
         self.rotation = ids.into();
     }
 
-    /// The source id each window in the most recent `sample_batch` call
-    /// came from, in draw order.
-    pub fn last_batch_sources(&self) -> &[String] {
-        &self.last_batch_sources
+    /// Each window drawn by the most recent `sample_batch` call, in draw
+    /// order — source id and a short text excerpt.
+    pub fn last_batch_draws(&self) -> &[BatchDraw] {
+        &self.last_batch_draws
     }
 
     /// This source's progress through its own shuffled pass over its
@@ -844,6 +850,14 @@ pub struct Batch {
     pub targets: Vec<u32>,
     pub batch_size: usize,
     pub context_len: usize,
+}
+
+/// One window `sample_batch` drew: which source it came from, and a
+/// short decoded excerpt of its actual text. See
+/// [`Corpus::last_batch_draws`].
+pub struct BatchDraw {
+    pub source_id: String,
+    pub excerpt: String,
 }
 
 /// One source's share of the corpus, and how much of it training has
@@ -1310,16 +1324,17 @@ mod tests {
     }
 
     #[test]
-    fn last_batch_sources_names_where_each_window_of_the_latest_batch_came_from() {
+    fn last_batch_draws_names_where_each_window_of_the_latest_batch_came_from() {
         let mut c = Corpus::new();
         for letter in ["a", "b", "c"] {
             c.upsert(letter, &format!("{letter} ").repeat(4000), false);
         }
         let mut rng = Rng::seed_from_u64(3);
         let batch = c.sample_batch(3, 16, &mut rng).expect("should sample");
-        assert_eq!(c.last_batch_sources().len(), batch.batch_size);
+        assert_eq!(c.last_batch_draws().len(), batch.batch_size);
+        assert!(c.last_batch_draws().iter().all(|d| !d.excerpt.is_empty()));
         // Replaced wholesale, not accumulated across calls.
         let second = c.sample_batch(2, 16, &mut rng).expect("should sample");
-        assert_eq!(c.last_batch_sources().len(), second.batch_size);
+        assert_eq!(c.last_batch_draws().len(), second.batch_size);
     }
 }

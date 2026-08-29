@@ -295,9 +295,7 @@ function updateGuidance() {
     ? 'Training needs WebGPU. This browser did not give the page a GPU.'
     : !model
       ? 'New model, from scratch, trained on your GPU.'
-      : model.pretrained
-        ? ''
-        : 'Continues where it stopped.';
+      : '';
 
   if (training) {
     step.textContent = 'Training on your GPU. Stop any time — progress is kept.';
@@ -330,7 +328,7 @@ async function syncAllSources() {
   // reason `set-source-sample-count`/`set-window-progress` below exist.
   const openingRate = Number($('opening-rate').value);
   if (openingRate >= 0) {
-    call('set-boundary-sample-rate', { rate: openingRate / 100 }).catch(() => {});
+    call('update-training-settings', { boundarySampleRate: openingRate / 100 }).catch(() => {});
   }
   // Counted, because syncSource swallows its failures — it has to, since
   // one unreadable record must not stop the other sixty-five. But a
@@ -1100,22 +1098,30 @@ const probeHistory = [];
 /// itself by drawLossChart rather than kept as separate DOM text.
 let chartStats = '';
 
-/// What the most recent step's batch actually trained on, by title —
-/// which sources, since a batch can (and, thanks to the source rotation,
-/// usually does) draw from several different ones per step, not the same
-/// document run after run.
-function describeBatchSources(ids) {
-  if (!ids || ids.length === 0) return '';
-  const titles = [...new Set(ids)].map((id) => {
-    const source = sources.find((s) => s.id === id);
-    return source ? source.title : id;
+/// What the most recent step's batch actually trained on — the text
+/// itself, not just which document, since a batch can (and, thanks to
+/// the source rotation, usually does) draw from several different ones
+/// per step, not the same document run after run.
+function describeBatchSources(draws, maxChars) {
+  if (!draws || draws.length === 0) return '';
+  const limit = maxChars > 0 ? maxChars : 200;
+  const shown = draws.slice(0, 3).map((draw) => {
+    const source = sources.find((s) => s.id === draw.id);
+    const title = source ? source.title : draw.id;
+    let excerpt = (draw.excerpt || '').replace(/\s+/g, ' ').trim();
+    if (excerpt.length > limit) excerpt = `${excerpt.slice(0, limit)}…`;
+    return `${title}: "${excerpt}"`;
   });
-  const shown = titles.slice(0, 3).join(', ');
-  const rest = titles.length > 3 ? ` +${titles.length - 3} more` : '';
-  return `Training on: ${shown}${rest}`;
+  const rest = draws.length > 3 ? ` +${draws.length - 3} more` : '';
+  return `Training on: ${shown.join(' | ')}${rest}`;
 }
 
 onStream('train-progress', (progress) => {
+  // Kept live so the model's own step count never lags behind what the
+  // worker is reporting — a stale step here is what made every history
+  // row look orphaned mid-run (row.step compared against a step frozen
+  // at whenever the run started).
+  if (model) model.step = progress.step;
   setProgress('train-progress-bar', progress.fractionDone);
   const on = model && model.device ? ` on ${model.device}` : '';
   // Held-out loss is the one that says whether it is learning the
@@ -1134,7 +1140,10 @@ onStream('train-progress', (progress) => {
   // last one-off status message ("Starting…") sitting above it would
   // just be a stale leftover.
   $('train-stats').textContent = '';
-  $('train-window').textContent = describeBatchSources(progress.sources);
+  $('train-window').textContent =
+    $('show-training-window').value === 'off'
+      ? ''
+      : describeBatchSources(progress.sources, Number($('training-window-chars').value));
   setTitleProgress('Fine-tuning', progress.fractionDone);
   lossHistory.push(progress.smoothedLoss);
   if (
@@ -1693,7 +1702,7 @@ $('live-lr-btn').addEventListener('click', async () => {
   const rate = Number($('live-lr').value);
   if (!(rate > 0)) return;
   try {
-    const result = await call('set-learning-rate', { learningRate: rate });
+    const result = await call('update-training-settings', { peakLearningRate: rate });
     console.info(`[scriptonait] peak learning rate is now ${result.peakLr}`);
   } catch (error) {
     showError(error);
@@ -1902,20 +1911,83 @@ async function persistTrainingPlanSettings() {
     sampleEvery: Number($('sample-every').value) || 0,
     boundarySampleRate: Number($('opening-rate').value) / 100,
     metricsEvery: Number($('metrics-every').value) || 0,
+    showTrainingWindow: $('show-training-window').value !== 'off',
+    trainingWindowChars: Number($('training-window-chars').value) || 0,
   });
 }
 for (const id of [
   'train-mode', 'train-steps', 'train-effort', 'sample-toggle', 'sample-every',
-  'opening-rate', 'metrics-every',
+  'opening-rate', 'metrics-every', 'show-training-window', 'training-window-chars',
 ]) {
   $(id).addEventListener('change', persistTrainingPlanSettings);
 }
-// Live, like the peak-learning-rate control: takes effect on the very
-// next window sampled, training already in flight or not.
-$('opening-rate').addEventListener('change', () => {
-  const rate = Number($('opening-rate').value);
-  if (rate >= 0) call('set-boundary-sample-rate', { rate: rate / 100 }).catch(() => {});
-});
+
+/// Every setting a training run reads off the Training-Settings and
+/// Inference tabs, read fresh off the controls in one place — used both
+/// to start a run (the Train button) and to push a change into one
+/// already going (`pushLiveTrainingSettings`), so the two can never
+/// drift into two different ideas of what a run's settings are. Model
+/// shape (layers/hidden/heads/context/window) is deliberately not here:
+/// it only ever takes effect on a freshly built model, there is no live
+/// version of it.
+function readTrainingSettings() {
+  const fromScratch = model && !model.pretrained;
+  const manualMode = $('train-mode').value === 'manual';
+  return {
+    batchSize: chosenBatchSize(),
+    maxSteps: Number($('train-steps').value) || 0,
+    effort: chosenEffort(),
+    // Manual mode uses the typed rate as-is. Auto picks one: a new model
+    // needs a rate large enough to learn a language from nothing; a
+    // working one needs a small enough rate not to forget it.
+    //
+    // 6e-4 is what nanoGPT uses for a 768-wide GPT-2, and a narrower
+    // model tolerates more rather than less, so it is a conservative
+    // choice at the widths this page builds — and twice the 3e-4 that
+    // was here, which was simply timid. With warm-up, gradient-norm
+    // clipping at 1.0 and the plateau cut watching held-out loss, there
+    // are three separate things that catch a rate that turns out to be
+    // too high; there is nothing that catches one that is too low
+    // except hours of your time.
+    peakLearningRate: manualMode ? Number($('train-lr').value) : (fromScratch ? 6e-4 : 5e-5),
+    boundarySampleRate: Number($('opening-rate').value) / 100,
+    autosaveFrequencySteps: Math.max(1, Number($('autosave-frequency').value) || 1000),
+    metricsEvery: Number($('metrics-every').value) || 0,
+    // 0 turns sampling off; anything else is a step interval.
+    sampleEvery: $('sample-toggle').checked ? Number($('sample-every').value) : 0,
+    // Training samples are generated with the Inference tab's own
+    // prompt, length and sampling settings, not a second hidden set —
+    // the same fields Generate reads.
+    samplePrompt: $('prompt-input').value.trim() || 'Write a 40 word scene.',
+    sampleMaxTokens: $('opt-length-mode').value === 'limit' ? Number($('opt-max-tokens').value) : 0,
+    sampling: {
+      temperature: Number($('opt-temperature').value),
+      topK: Number($('opt-top-k').value),
+      topP: Number($('opt-top-p').value),
+      minP: Number($('opt-min-p').value),
+      repetitionPenalty: Number($('opt-repetition').value),
+    },
+  };
+}
+
+/// Pushed to a run already in flight the moment any of these change —
+/// batch size, learning rate, planned steps, effort, source-opening
+/// windows, autosave/metrics cadence, and the sample prompt/length/
+/// sampling settings. A run started at step 0 should not have to be
+/// stopped and restarted just to pick up a value changed at step 3,400.
+/// A no-op before any model exists — the worker just keeps the values
+/// for whenever Train is next pressed.
+function pushLiveTrainingSettings() {
+  call('update-training-settings', readTrainingSettings()).catch(() => {});
+}
+for (const id of [
+  'train-mode', 'train-steps', 'train-effort', 'train-batch', 'train-lr', 'opening-rate',
+  'sample-toggle', 'sample-every', 'metrics-every', 'autosave-frequency', 'prompt-input',
+  'opt-temperature', 'opt-top-k', 'opt-top-p', 'opt-min-p', 'opt-repetition',
+  'opt-length-mode', 'opt-max-tokens',
+]) {
+  $(id).addEventListener('change', pushLiveTrainingSettings);
+}
 
 onStream('bench-progress', ({ stage, dispatchesPerSubmit }) => {
   if (!benchmarking || stage !== 'chunk') return;
@@ -2016,45 +2088,7 @@ $('train-btn').addEventListener('click', async () => {
       });
     }
 
-    const fromScratch = model && !model.pretrained;
-    const manualMode = $('train-mode').value === 'manual';
-    const chosenRate = Number($('train-lr').value);
-    const batchSize = chosenBatchSize();
-    const result = await call('train', {
-      batchSize,
-      // Manual mode uses the typed rate as-is (checked above). Auto
-      // picks one: a new model needs a rate large enough to learn a
-      // language from nothing; a working one needs a small enough rate
-      // not to forget it.
-      //
-      // 6e-4 is what nanoGPT uses for a 768-wide GPT-2, and a narrower
-      // model tolerates more rather than less, so it is a conservative
-      // choice at the widths this page builds — and twice the 3e-4 that
-      // was here, which was simply timid. With warm-up, gradient-norm
-      // clipping at 1.0 and the plateau cut watching held-out loss,
-      // there are three separate things that catch a rate that turns
-      // out to be too high; there is nothing that catches one that is
-      // too low except hours of your time.
-      learningRate: manualMode ? chosenRate : (fromScratch ? 6e-4 : 5e-5),
-      maxSteps: Number($('train-steps').value),
-      effort: chosenEffort(),
-      // 0 turns sampling off; anything else is a step interval.
-      sampleEvery: $('sample-toggle').checked ? Number($('sample-every').value) : 0,
-      // Training samples are generated with the Inference tab's own
-      // prompt, length and sampling settings, not a second hidden set —
-      // the same fields Generate reads.
-      samplePrompt: $('prompt-input').value.trim() || 'Write a 40 word scene.',
-      sampleMaxTokens: $('opt-length-mode').value === 'limit' ? Number($('opt-max-tokens').value) : 0,
-      sampling: {
-        temperature: Number($('opt-temperature').value),
-        topK: Number($('opt-top-k').value),
-        topP: Number($('opt-top-p').value),
-        minP: Number($('opt-min-p').value),
-        repetitionPenalty: Number($('opt-repetition').value),
-      },
-      autosaveFrequencySteps,
-      metricsEvery: Number($('metrics-every').value) || 0,
-    }, [], 0);
+    const result = await call('train', readTrainingSettings(), [], 0);
 
     if (result.stopReason === 'already-training') {
       showError('A training run is already going. Press Stop first if you want to change it.');
@@ -2223,6 +2257,25 @@ $('new-project-btn').addEventListener('click', async () => {
 $('export-btn').addEventListener('click', async () => {
   const { bytes } = await call('export-checkpoint');
   const blob = new Blob([bytes], { type: 'application/octet-stream' });
+  if (typeof window.showSaveFilePicker === 'function') {
+    try {
+      const handle = await window.showSaveFilePicker({
+        suggestedName: 'scriptonait.ckpt',
+        types: [{ description: 'scriptonait checkpoint', accept: { 'application/octet-stream': ['.ckpt'] } }],
+      });
+      const writable = await handle.createWritable();
+      try {
+        await writable.write(blob);
+      } finally {
+        await writable.close();
+      }
+      return;
+    } catch (error) {
+      if (error && error.name === 'AbortError') return;
+      showError(error);
+      return;
+    }
+  }
   const url = URL.createObjectURL(blob);
   const link = document.createElement('a');
   link.href = url;
@@ -2279,6 +2332,25 @@ $('export-project-btn').addEventListener('click', async () => {
         `checkpoint ${checkpointBytes ? `${checkpointBytes.byteLength} bytes` : 'none (no model)'}, ` +
         `${blob.size} bytes total`,
     );
+    if (typeof window.showSaveFilePicker === 'function') {
+      try {
+        const handle = await window.showSaveFilePicker({
+          suggestedName: 'scriptonait.snp',
+          types: [{ description: 'scriptonait project', accept: { 'application/octet-stream': ['.snp'] } }],
+        });
+        const writable = await handle.createWritable();
+        try {
+          await writable.write(blob);
+        } finally {
+          await writable.close();
+        }
+        return;
+      } catch (error) {
+        // A cancelled picker is not an error.
+        if (error && error.name === 'AbortError') return;
+        throw error;
+      }
+    }
     const url = URL.createObjectURL(blob);
     const link = document.createElement('a');
     link.href = url;
@@ -2745,6 +2817,12 @@ async function applyLoadedSettings() {
         $('opening-rate').value = String(Math.round(planSettings.boundarySampleRate * 100));
       }
       if (planSettings.metricsEvery > 0) $('metrics-every').value = String(planSettings.metricsEvery);
+      if (typeof planSettings.showTrainingWindow === 'boolean') {
+        $('show-training-window').value = planSettings.showTrainingWindow ? 'on' : 'off';
+      }
+      if (planSettings.trainingWindowChars > 0) {
+        $('training-window-chars').value = String(planSettings.trainingWindowChars);
+      }
     }
   } catch (error) {
     console.warn('[scriptonait] could not read training-plan settings', error);

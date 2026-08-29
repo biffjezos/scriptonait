@@ -157,16 +157,6 @@
         </div>
       </details>
 
-      <details class="advanced" id="live-controls-panel">
-        <summary>Live Controls</summary>
-        <div class="row" id="live-controls">
-          <label>Peak learning rate, live
-            <input type="number" id="live-lr" min="0" max="0.01" step="0.00001" />
-          </label>
-          <button id="live-lr-btn" type="button" class="secondary">Apply</button>
-          <button id="reset-schedule-btn" type="button" class="secondary">Undo Plateau Cut</button>
-        </div>
-      </details>
     </section>
 
     <section class="tab-panel" id="tab-inference" hidden>
@@ -228,9 +218,17 @@
           <label>Source-opening windows
             <input type="number" id="opening-rate" value="40" min="0" max="100" />%
           </label>
+          <label>Show training window
+            <select id="show-training-window">
+              <option value="on" selected>On</option>
+              <option value="off">Off</option>
+            </select>
+          </label>
+          <label>Max characters
+            <input type="number" id="training-window-chars" value="200" min="10" max="2000" />
+          </label>
         </div>
         <p class="hint" id="batch-hint"></p>
-        <p class="hint">Source-opening windows: how often a sampled window starts exactly at a source's beginning, rather than the next one due in its rotation.</p>
 
         <p class="hint" id="shape-hint">New model shape:</p>
         <p class="hint shape-estimate" id="shape-estimate"></p>
@@ -241,6 +239,14 @@
           <label>KV heads <input type="number" id="cfg-kv-heads" value="2" min="1" max="16" /></label>
           <label>Context <input type="number" id="cfg-context" value="512" min="32" max="2048" step="32" /></label>
           <label>Attention window <input type="number" id="cfg-window" value="256" min="32" max="2048" step="32" /></label>
+        </div>
+
+        <div class="row" id="live-controls">
+          <label>Peak learning rate, live
+            <input type="number" id="live-lr" min="0" max="0.01" step="0.00001" />
+          </label>
+          <button id="live-lr-btn" type="button" class="secondary">Apply</button>
+          <button id="reset-schedule-btn" type="button" class="secondary">Undo Plateau Cut</button>
         </div>
       </details>
 

@@ -781,6 +781,4 @@ select {
    run appears to go backwards. */
 .history-table tbody tr.orphan {
   opacity: 0.45;
-  text-decoration: line-through;
-  text-decoration-thickness: 1px;
 }
