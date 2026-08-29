@@ -2334,6 +2334,22 @@ $('new-project-btn').addEventListener('click', async () => {
   if (!confirm('Start a new project? This clears the current model, corpus and history.')) {
     return;
   }
+  // Asked for before any await, same reason Save/Export Project do —
+  // the browser only honors showSaveFilePicker while it can still trace
+  // the call back to this click. Cancelling or a browser without the
+  // API isn't fatal to starting the project; it just starts without an
+  // auto-save file set yet, same as it always could.
+  if (autosaveSupported()) {
+    try {
+      const handle = await window.showSaveFilePicker({
+        suggestedName: autosaveFileName || 'scriptonait.snp',
+        types: [{ description: 'scriptonait project', accept: { 'application/octet-stream': ['.snp'] } }],
+      });
+      await establishProjectFile(handle);
+    } catch (error) {
+      /* cancelled — proceed without one */
+    }
+  }
   try {
     await db.replaceAllSources([]);
     await db.replaceAllHistory([]);
@@ -2416,9 +2432,17 @@ $('export-project-btn').addEventListener('click', async () => {
   if (typeof window.showSaveFilePicker === 'function') {
     try {
       handle = await window.showSaveFilePicker({
-        suggestedName: 'scriptonait.snp',
+        // Whatever the project's file is already called, so saving
+        // again offers the same name back instead of the generic
+        // default — this is one of the three places (with New Project
+        // and "Choose…") that can set it.
+        suggestedName: autosaveFileName || 'scriptonait.snp',
         types: [{ description: 'scriptonait project', accept: { 'application/octet-stream': ['.snp'] } }],
       });
+      // Saving a project this way establishes it as the file auto-save
+      // continues writing into — the whole point of asking "what is the
+      // project's file" once instead of separately in Settings.
+      await establishProjectFile(handle);
     } catch (error) {
       // A cancelled picker is not an error.
       if (error && error.name === 'AbortError') return;
@@ -2838,26 +2862,16 @@ $('autosave-file-btn').addEventListener('click', async () => {
     return;
   }
   try {
-    autosaveHandle = await window.showSaveFilePicker({
-      // Whatever this project's own autosave name already was — from an
-      // imported project's settings, or from earlier this session —
-      // rather than always the generic default, so reconnecting after
-      // an import or a lost permission is one click to the right name.
+    const handle = await window.showSaveFilePicker({
+      // Whatever the project's file is already called — from an
+      // imported project's settings, an earlier Export/New Project, or
+      // earlier this session — rather than always the generic default,
+      // so reconnecting after an import or a lost permission is one
+      // click to the right name.
       suggestedName: autosaveFileName || 'scriptonait.snp',
       types: [{ description: 'scriptonait project', accept: { 'application/octet-stream': ['.snp'] } }],
     });
-    autosaveFileName = autosaveHandle.name;
-    $('autosave-status').textContent = `File: ${autosaveHandle.name}.`;
-    // Stored so a reload doesn't forget which file this is and silently
-    // fall back to browser-only saves — see putAutosaveFileHandle. The
-    // name goes through persistAutosaveConfig instead, since that's the
-    // part that travels in the project file; the handle can't.
-    db.putAutosaveFileHandle(autosaveHandle).catch((error) => {
-      console.warn('[scriptonait] could not remember the autosave file', error);
-    });
-    persistAutosaveConfig().catch((error) => {
-      console.warn('[scriptonait] could not remember the autosave file name', error);
-    });
+    await establishProjectFile(handle);
     // Write immediately, so the file exists and the permission is proven
     // now rather than in six hours when it matters.
     if (model) await autosave(model.step, { force: true });
@@ -2866,6 +2880,27 @@ $('autosave-file-btn').addEventListener('click', async () => {
     if (error && error.name !== 'AbortError') showError(error);
   }
 });
+
+/// Wherever a project's file gets chosen — New Project, Export
+/// Project's own picker, or this "Choose…" button — it becomes the
+/// same thing: the file auto-save writes into from now on. One
+/// function so all three agree on what "the project's file" means,
+/// instead of each keeping its own idea of it and "scriptonait.snp"
+/// resurfacing anywhere a name was already set.
+async function establishProjectFile(handle) {
+  autosaveHandle = handle;
+  autosaveFileName = handle.name;
+  $('autosave-status').textContent = `File: ${handle.name}.`;
+  // The handle for this browser (can't travel — see putAutosaveFileHandle);
+  // the name through persistAutosaveConfig, since that's the part that
+  // does travel, in the project file.
+  await db.putAutosaveFileHandle(handle).catch((error) => {
+    console.warn('[scriptonait] could not remember the project file', error);
+  });
+  await persistAutosaveConfig().catch((error) => {
+    console.warn('[scriptonait] could not remember the project file name', error);
+  });
+}
 
 /// The one place that writes autosaveConfig, so the file name never
 /// gets silently dropped by a handler that only meant to change one of
