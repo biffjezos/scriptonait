@@ -149,7 +149,7 @@ impl ModelWeights {
         for t in self.tensors() {
             for v in t.iter() {
                 if bf16 {
-                    out.extend_from_slice(&crate::checkpoint::to_bf16(*v).to_le_bytes());
+                    out.extend_from_slice(&crate::bf16::to_bf16(*v).to_le_bytes());
                 } else {
                     out.extend_from_slice(&v.to_le_bytes());
                 }

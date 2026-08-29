@@ -3,7 +3,7 @@
 //!
 //! Both training and generation run here.
 //!
-//! `trainer.rs` is the training loop: forward, backward and AdamW as WGSL
+//! `trainer/` is the training loop: forward, backward and AdamW as WGSL
 //! kernels, with the weights, gradients and Adam moments resident in GPU
 //! memory. A step reads back one small buffer — the loss and the
 //! gradient norm — and nothing else.
@@ -29,6 +29,8 @@ mod context;
 mod model;
 mod trainer;
 
-pub use context::{GpuContext, Kernel, ParamsPool};
-pub use model::{supports, GpuModel, MAX_HEAD_DIM};
+pub use context::GpuContext;
+pub(crate) use context::{Kernel, ParamsPool};
+pub use model::{supports, GpuModel};
+pub(crate) use model::MAX_HEAD_DIM;
 pub use trainer::{supports_training, GpuStepReport, GpuTrainer};
