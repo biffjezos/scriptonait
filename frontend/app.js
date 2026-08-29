@@ -2786,6 +2786,11 @@ $('autosave-file-btn').addEventListener('click', async () => {
       types: [{ description: 'scriptonait project', accept: { 'application/octet-stream': ['.snp'] } }],
     });
     $('autosave-status').textContent = `File: ${autosaveHandle.name}.`;
+    // Stored so a reload doesn't forget which file this is and silently
+    // fall back to browser-only saves — see putAutosaveFileHandle.
+    db.putAutosaveFileHandle(autosaveHandle).catch((error) => {
+      console.warn('[scriptonait] could not remember the autosave file', error);
+    });
     // Write immediately, so the file exists and the permission is proven
     // now rather than in six hours when it matters.
     if (model) await autosave(model.step, { force: true });
@@ -2869,6 +2874,25 @@ async function applyLoadedSettings() {
     }
   } catch (error) {
     console.warn('[scriptonait] could not read auto-save settings', error);
+  }
+  try {
+    const handle = autosaveSupported() ? await db.getAutosaveFileHandle() : null;
+    if (handle) {
+      // queryPermission only checks, it never prompts — safe to call
+      // without a click behind it, unlike requestPermission. A browser
+      // that already granted readwrite here keeps it across reloads;
+      // one that didn't gets told to pick the file again rather than
+      // silently falling back to browser-only saves.
+      const permission = await handle.queryPermission({ mode: 'readwrite' });
+      if (permission === 'granted') {
+        autosaveHandle = handle;
+        $('autosave-status').textContent = `File: ${handle.name}.`;
+      } else {
+        $('autosave-status').textContent = `File: ${handle.name} (permission needed — choose it again).`;
+      }
+    }
+  } catch (error) {
+    console.warn('[scriptonait] could not restore the auto-save file', error);
   }
   try {
     const devicePref = await db.getDevicePreference();
