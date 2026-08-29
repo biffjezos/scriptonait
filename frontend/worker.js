@@ -1251,7 +1251,22 @@ async function train({
       try {
         report = await llm.train_step(live.batchSize);
       } catch (error) {
-        // A step that is refused must not end the run in silence.
+        // A CPU-preferred sample's own GPU sync (worker.js's
+        // sync_from_gpu call below, fire-and-forget so it can never
+        // block training) briefly holds the same guard a training step
+        // needs — an expected, occasional collision now that sampling
+        // and training genuinely run concurrently, not the kind of
+        // refusal that means something is actually wrong. Skip this
+        // attempt and let the slice after next retry, rather than
+        // ending the run over a lock a training sample was always
+        // going to let go of on its own.
+        const message = (error && error.message) || String(error);
+        if (/already busy/i.test(message)) {
+          log(`step refused (GPU busy with a training sample's sync) — retrying next slice`);
+          break;
+        }
+        // Anything else refusing a step must not end the run in
+        // silence.
         //
         // It used to: the guard that stops two GPU operations
         // overlapping returns an error, nothing caught it, the promise
