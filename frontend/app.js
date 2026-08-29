@@ -716,7 +716,14 @@ $('generate-btn').addEventListener('click', async () => {
       repetitionPenalty: Number($('opt-repetition').value),
       seed: Number($('opt-seed').value) || Math.floor(Math.random() * 1e9),
       maxTokens: $('opt-length-mode').value === 'limit' ? Number($('opt-max-tokens').value) : 0,
-    }, [], 0);
+    // A bounded deadline instead of none: the GPU readback generate does
+    // before its first token (sync_from_gpu_inner) has no cancellation
+    // point wgpu exposes — Stop can't reach it, and neither can anything
+    // else short of this timing out. Without one, a stuck readback left
+    // `generating` true and both buttons disabled forever, with no way
+    // back except reloading the page. Long enough that a real, slow
+    // generation is never mistaken for a hang.
+    }, [], 5 * 60 * 1000);
     setProgress('generate-progress-bar', 1);
     const why = {
       'end-of-text': 'the model ended the piece',
