@@ -373,15 +373,14 @@ async function generate({ prompt, extraContext, temperature, topK, topP, minP, r
 /// Generate uses, not a second hidden set tucked away in here.
 /// `maxTokens` is that tab's own length setting too (0 = Continuous).
 async function trainingSample(prompt, maxTokens, sampling) {
-  const s = sampling || { temperature: 0.9, topK: 40, topP: 0.95, minP: 0.05, repetitionPenalty: 1.1 };
   const result = await llm.generate(
     prompt,
     '',
-    s.temperature,
-    s.topK,
-    s.topP,
-    s.minP,
-    s.repetitionPenalty,
+    sampling.temperature,
+    sampling.topK,
+    sampling.topP,
+    sampling.minP,
+    sampling.repetitionPenalty,
     Math.floor(Math.random() * 1e9),
     // The Inference tab's own device choice. GPU here runs on the same
     // device training does, so it still serializes with it (see the
@@ -551,7 +550,7 @@ function trainingPhase(plan, { heldOut, trainingLoss }) {
 /// trained the corpus cannot be what is limiting it. The corpus second,
 /// and only once there is enough training behind it for the claim to
 /// mean anything.
-function planActions(plan, phase, { heldOut, trainingLoss, tokensSeen, tokensPerSecond }) {
+function planActions(plan, phase, { heldOut, trainingLoss, tokensSeen, tokensPerSecond, tokensPerStep }) {
   const actions = [];
   const { params, trainingTokens, validationTokens, contextLen } = plan;
   const round = (n) => Math.round(n).toLocaleString();
@@ -1636,6 +1635,7 @@ const handlers = {
   },
 
   async 'import-checkpoint'({ bytes }) {
+    if (training) return { error: 'a training run is in flight - press Stop, then import a checkpoint' };
     await ensureWasm();
     if (!llm) {
       llm = wasm.WasmLLM.from_checkpoint(new Uint8Array(bytes));
@@ -1781,10 +1781,15 @@ const handlers = {
     return { rows };
   },
 
-  async 'learn-vocabulary'({ maxVocabSize = 8192 }) {
+  async 'learn-vocabulary'({ maxVocabSize } = {}) {
+    if (training) return { error: 'a training run is in flight - press Stop, then learn a vocabulary' };
+    // No UI control owns this ceiling; the wasm side exports the one it
+    // and its own shape-estimate agree on, rather than the page
+    // re-declaring the same number as a fallback here.
+    const cap = maxVocabSize > 0 ? maxVocabSize : wasm.max_vocab_size();
     const before = llm.vocab_size();
     const started = performance.now();
-    const size = llm.learn_vocabulary(maxVocabSize);
+    const size = llm.learn_vocabulary(cap);
     if (size === before) {
       log(`vocabulary unchanged (${size} tokens) - a trained model keeps the one it learned with`);
       return { vocabSize: size, changed: false };

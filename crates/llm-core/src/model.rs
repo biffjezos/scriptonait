@@ -1,32 +1,30 @@
 //! Model weights, forward pass, and backward pass. See `config.rs` for the
-//! architecture description and `ops.rs` for the underlying math; this
-//! module is mostly bookkeeping that wires those primitives together
-//! per-layer and keeps the activation cache backward needs.
+//! architecture description and `ops.rs` for the underlying math.
+//!
+//! [`layer`] holds one transformer layer's weights and its own
+//! forward/backward methods; [`forward`]/[`backward_into`] below are
+//! thin loops over those, plus the embedding/output-head and final-norm
+//! work that sits outside any one layer. [`optimizer`] holds AdamW and
+//! gradient clipping.
 //!
 //! Everything here operates on a single sequence (no batch dimension) —
 //! `train.rs` loops over the batch and accumulates gradients, which keeps
 //! every index expression in this file about as simple as this kind of
 //! model allows.
 
+mod layer;
+mod optimizer;
+
+pub use layer::LayerWeights;
+pub use optimizer::{clip_global_norm, AdamState};
+
+use layer::LayerCache;
+
 use crate::config::ModelConfig;
 use crate::ops;
 use crate::rng::Rng;
 
 const RMS_EPS: f32 = 1e-6;
-
-#[derive(Clone)]
-pub struct LayerWeights {
-    pub ple: Vec<f32>,            // [vocab, hidden]
-    pub attn_norm_gain: Vec<f32>, // [hidden]
-    pub wq: Vec<f32>,             // [hidden, hidden]
-    pub wk: Vec<f32>,             // [hidden, hidden]
-    pub wv: Vec<f32>,             // [hidden, hidden]
-    pub wo: Vec<f32>,             // [hidden, hidden]
-    pub mlp_norm_gain: Vec<f32>,  // [hidden]
-    pub w_gate: Vec<f32>,         // [ffn, hidden]
-    pub w_up: Vec<f32>,           // [ffn, hidden]
-    pub w_down: Vec<f32>,         // [hidden, ffn]
-}
 
 #[derive(Clone)]
 pub struct ModelWeights {
@@ -37,90 +35,6 @@ pub struct ModelWeights {
 
 /// Gradients mirror `ModelWeights` field-for-field, same shapes.
 pub type Gradients = ModelWeights;
-
-impl LayerWeights {
-    fn zeros(config: &ModelConfig) -> Self {
-        let (hidden, ffn, kv) = (config.hidden_dim, config.ffn_dim(), config.kv_dim());
-        let ple_len = if config.use_ple { config.vocab_size() * hidden } else { 0 };
-        Self {
-            ple: vec![0.0; ple_len],
-            attn_norm_gain: vec![0.0; hidden],
-            wq: vec![0.0; hidden * hidden],
-            wk: vec![0.0; kv * hidden],
-            wv: vec![0.0; kv * hidden],
-            wo: vec![0.0; hidden * hidden],
-            mlp_norm_gain: vec![0.0; hidden],
-            w_gate: vec![0.0; ffn * hidden],
-            w_up: vec![0.0; ffn * hidden],
-            w_down: vec![0.0; hidden * ffn],
-        }
-    }
-
-    fn init(config: &ModelConfig, num_layers: usize, rng: &mut Rng) -> Self {
-        let (hidden, ffn, kv) = (config.hidden_dim, config.ffn_dim(), config.kv_dim());
-        let linear = |out_dim: usize, in_dim: usize, rng: &mut Rng| -> Vec<f32> {
-            let std = 1.0 / (in_dim as f32).sqrt();
-            (0..out_dim * in_dim).map(|_| rng.next_gaussian() * std).collect()
-        };
-        // The two projections that write *into* the residual stream get
-        // their initial scale divided by sqrt(2 * num_layers). Every
-        // layer adds into the same stream, so without this the stream's
-        // variance grows with depth and the first few hundred steps are
-        // spent undoing that instead of learning (GPT-2's initialization,
-        // and the reason deep stacks train stably from step one).
-        let residual_scale = 1.0 / (2.0 * num_layers as f32).sqrt();
-        let scaled = |out_dim: usize, in_dim: usize, rng: &mut Rng| -> Vec<f32> {
-            let std = residual_scale / (in_dim as f32).sqrt();
-            (0..out_dim * in_dim).map(|_| rng.next_gaussian() * std).collect()
-        };
-        let ple_len = if config.use_ple { config.vocab_size() * hidden } else { 0 };
-        Self {
-            ple: (0..ple_len).map(|_| rng.next_gaussian() * 0.02).collect(),
-            attn_norm_gain: vec![1.0; hidden],
-            wq: linear(hidden, hidden, rng),
-            wk: linear(kv, hidden, rng),
-            wv: linear(kv, hidden, rng),
-            wo: scaled(hidden, hidden, rng),
-            mlp_norm_gain: vec![1.0; hidden],
-            w_gate: linear(ffn, hidden, rng),
-            w_up: linear(ffn, hidden, rng),
-            w_down: scaled(hidden, ffn, rng),
-        }
-    }
-
-    /// All buffers as `(name, slice)` pairs, in a fixed order shared by
-    /// every `LayerWeights` — used to zip weights/grads/optimizer state
-    /// together generically instead of repeating field lists everywhere.
-    fn tensors_mut(&mut self) -> Vec<&mut Vec<f32>> {
-        vec![
-            &mut self.ple,
-            &mut self.attn_norm_gain,
-            &mut self.wq,
-            &mut self.wk,
-            &mut self.wv,
-            &mut self.wo,
-            &mut self.mlp_norm_gain,
-            &mut self.w_gate,
-            &mut self.w_up,
-            &mut self.w_down,
-        ]
-    }
-
-    fn tensors(&self) -> Vec<&Vec<f32>> {
-        vec![
-            &self.ple,
-            &self.attn_norm_gain,
-            &self.wq,
-            &self.wk,
-            &self.wv,
-            &self.wo,
-            &self.mlp_norm_gain,
-            &self.w_gate,
-            &self.w_up,
-            &self.w_down,
-        ]
-    }
-}
 
 impl ModelWeights {
     pub fn zeros(config: &ModelConfig) -> Self {
@@ -262,136 +176,6 @@ impl ModelWeights {
     }
 }
 
-/// Rescale `grads` in place so its global L2 norm is at most
-/// `max_norm`, and return the norm it had before clipping.
-///
-/// One bad batch — an unusual run of tokens, a rare character — can
-/// produce a gradient orders of magnitude larger than typical, and Adam
-/// happily takes a full-size step along it, which is what a loss curve
-/// that suddenly jumps and never recovers actually is. Clipping the
-/// whole gradient as one vector (rather than per tensor) keeps its
-/// direction and only limits how far the step goes.
-pub fn clip_global_norm(grads: &mut Gradients, max_norm: f32) -> f32 {
-    let mut sum_sq = 0.0f64;
-    for t in grads.tensors() {
-        for &g in t.iter() {
-            sum_sq += (g as f64) * (g as f64);
-        }
-    }
-    let norm = sum_sq.sqrt() as f32;
-    if norm > max_norm && norm.is_finite() && norm > 0.0 {
-        let scale = max_norm / norm;
-        grads.scale_(scale);
-    }
-    norm
-}
-
-/// AdamW optimizer state, shaped like the model.
-pub struct AdamState {
-    m: ModelWeights,
-    v: ModelWeights,
-    t: i32,
-    /// Which tensors weight decay applies to, in `tensors()` order.
-    decay: Vec<bool>,
-}
-
-impl AdamState {
-    pub fn new(config: &ModelConfig) -> Self {
-        let template = ModelWeights::zeros(config);
-        let decay = template.decay_flags();
-        Self { m: ModelWeights::zeros(config), v: ModelWeights::zeros(config), t: 0, decay }
-    }
-
-    /// One AdamW step.
-    ///
-    /// Decoupled weight decay, not L2 added to the gradient: with Adam
-    /// the two are not the same thing, because an L2 term goes through
-    /// the same per-parameter normalization as the gradient and so decays
-    /// rarely-updated parameters far less than often-updated ones.
-    /// Decoupling it (`w -= lr * wd * w`, applied directly) is what
-    /// "AdamW" means, and it's the version that actually regularizes.
-    ///
-    /// Decay is skipped for the RMSNorm gains: they're scale parameters
-    /// initialized at 1, and pulling them toward 0 shrinks the whole
-    /// residual stream for no benefit.
-    pub fn step(&mut self, weights: &mut ModelWeights, grads: &Gradients, lr: f32, weight_decay: f32) {
-        self.t += 1;
-        let (beta1, beta2, eps) = (0.9f32, 0.95f32, 1e-8f32);
-        let bias1 = 1.0 - beta1.powi(self.t);
-        let bias2 = 1.0 - beta2.powi(self.t);
-
-        let w_tensors = weights.tensors_mut().into_iter();
-        let g_tensors = grads.tensors().into_iter();
-        let m_tensors = self.m.tensors_mut().into_iter();
-        let v_tensors = self.v.tensors_mut().into_iter();
-
-        for (idx, (((w, g), m), v)) in
-            w_tensors.zip(g_tensors).zip(m_tensors).zip(v_tensors).enumerate()
-        {
-            let wd = if self.decay.get(idx).copied().unwrap_or(true) { weight_decay } else { 0.0 };
-            for i in 0..w.len() {
-                m[i] = beta1 * m[i] + (1.0 - beta1) * g[i];
-                v[i] = beta2 * v[i] + (1.0 - beta2) * g[i] * g[i];
-                let m_hat = m[i] / bias1;
-                let v_hat = v[i] / bias2;
-                w[i] -= lr * (m_hat / (v_hat.sqrt() + eps) + wd * w[i]);
-            }
-        }
-    }
-}
-
-impl AdamState {
-    /// Serialize the moment buffers and the step counter.
-    ///
-    /// Three times the size of the weights, which is why this is a
-    /// separate file from the checkpoint rather than part of it — but a
-    /// pretraining run that spans several CI jobs has to carry it, or
-    /// every resume throws away Adam's momentum and the loss visibly
-    /// jumps at each restart.
-    pub fn to_bytes(&self) -> Vec<u8> {
-        let m = self.m.to_bytes();
-        let v = self.v.to_bytes();
-        let mut out = Vec::with_capacity(8 + m.len() + v.len());
-        out.extend_from_slice(&(self.t as u32).to_le_bytes());
-        out.extend_from_slice(&(m.len() as u32).to_le_bytes());
-        out.extend_from_slice(&m);
-        out.extend_from_slice(&v);
-        out
-    }
-
-    /// Build the state from moment buffers held elsewhere — the GPU
-    /// trainer keeps its own on the device and downloads them to save.
-    pub fn from_parts(m: ModelWeights, v: ModelWeights, t: i32) -> Self {
-        let decay = m.decay_flags();
-        Self { m, v, t, decay }
-    }
-
-    /// The moment buffers and the step count, for a caller that has to
-    /// upload them somewhere.
-    pub fn parts(&self) -> (&ModelWeights, &ModelWeights, i32) {
-        (&self.m, &self.v, self.t)
-    }
-
-    pub fn from_bytes(bytes: &[u8], config: &ModelConfig) -> Result<Self, String> {
-        if bytes.len() < 8 {
-            return Err("optimizer state truncated".to_string());
-        }
-        let t = u32::from_le_bytes(bytes[0..4].try_into().unwrap()) as i32;
-        let len = u32::from_le_bytes(bytes[4..8].try_into().unwrap()) as usize;
-        if bytes.len() != 8 + 2 * len {
-            return Err(format!(
-                "optimizer state is {} bytes, expected {} for this model shape",
-                bytes.len(),
-                8 + 2 * len
-            ));
-        }
-        let m = ModelWeights::from_bytes(&bytes[8..8 + len], config)?;
-        let v = ModelWeights::from_bytes(&bytes[8 + len..], config)?;
-        let decay = m.decay_flags();
-        Ok(Self { m, v, t, decay })
-    }
-}
-
 fn gather_rows(table: &[f32], ids: &[u32], hidden: usize) -> Vec<f32> {
     let mut out = vec![0.0f32; ids.len() * hidden];
     for (t, &id) in ids.iter().enumerate() {
@@ -411,22 +195,6 @@ fn scatter_add_rows(table_grad: &mut [f32], ids: &[u32], d_rows: &[f32], hidden:
     }
 }
 
-struct LayerCache {
-    h_after_ple: Vec<f32>,   // input to attn rmsnorm
-    normed1: Vec<f32>,
-    inv_rms1: Vec<f32>,
-    q: Vec<f32>, // post-RoPE
-    k: Vec<f32>, // post-RoPE
-    v: Vec<f32>,
-    probs: Vec<f32>,
-    concat: Vec<f32>, // pre-Wo attention output
-    h_after_attn: Vec<f32>,
-    normed2: Vec<f32>,
-    inv_rms2: Vec<f32>,
-    gate: Vec<f32>,
-    up: Vec<f32>,
-}
-
 pub struct Cache {
     tokens: Vec<u32>,
     layers: Vec<LayerCache>,
@@ -440,65 +208,12 @@ pub struct Cache {
 pub fn forward(weights: &ModelWeights, config: &ModelConfig, tokens: &[u32]) -> (Vec<f32>, Cache) {
     let t_len = tokens.len();
     let h = config.hidden_dim;
-    let heads = config.num_heads;
-    let kv_heads = config.num_kv_heads;
-    let kv = config.kv_dim();
-    let head_dim = config.head_dim();
-    let window = config.effective_window();
     let vocab = config.vocab_size();
 
     let mut hidden = gather_rows(&weights.embed, tokens, h);
     let mut layer_caches = Vec::with_capacity(weights.layers.len());
-
     for layer in &weights.layers {
-        if config.use_ple {
-            let ple = gather_rows(&layer.ple, tokens, h);
-            for i in 0..hidden.len() {
-                hidden[i] += ple[i];
-            }
-        }
-        let h_after_ple = hidden.clone();
-
-        let (normed1, inv_rms1) = ops::rmsnorm_fwd(&hidden, &layer.attn_norm_gain, t_len, h, RMS_EPS);
-        let mut q = ops::linear_fwd(&normed1, &layer.wq, t_len, h, h);
-        let mut k = ops::linear_fwd(&normed1, &layer.wk, t_len, h, kv);
-        let v = ops::linear_fwd(&normed1, &layer.wv, t_len, h, kv);
-        ops::rope_apply(&mut q, t_len, heads, head_dim, config.rope_theta, false);
-        ops::rope_apply(&mut k, t_len, kv_heads, head_dim, config.rope_theta, false);
-        let (concat, probs) =
-            ops::attention_fwd(&q, &k, &v, t_len, heads, kv_heads, head_dim, window);
-        let attn_out = ops::linear_fwd(&concat, &layer.wo, t_len, h, h);
-
-        for i in 0..hidden.len() {
-            hidden[i] += attn_out[i];
-        }
-        let h_after_attn = hidden.clone();
-
-        let (normed2, inv_rms2) = ops::rmsnorm_fwd(&hidden, &layer.mlp_norm_gain, t_len, h, RMS_EPS);
-        let gate = ops::linear_fwd(&normed2, &layer.w_gate, t_len, h, config.ffn_dim());
-        let up = ops::linear_fwd(&normed2, &layer.w_up, t_len, h, config.ffn_dim());
-        let act = ops::swiglu_fwd(&gate, &up);
-        let mlp_out = ops::linear_fwd(&act, &layer.w_down, t_len, config.ffn_dim(), h);
-
-        for i in 0..hidden.len() {
-            hidden[i] += mlp_out[i];
-        }
-
-        layer_caches.push(LayerCache {
-            h_after_ple,
-            normed1,
-            inv_rms1,
-            q,
-            k,
-            v,
-            probs,
-            concat,
-            h_after_attn,
-            normed2,
-            inv_rms2,
-            gate,
-            up,
-        });
+        layer_caches.push(layer.forward(&mut hidden, tokens, config, t_len));
     }
 
     let h_final = hidden.clone();
@@ -714,11 +429,6 @@ pub fn backward_into(
 ) {
     let t_len = cache.tokens.len();
     let h = config.hidden_dim;
-    let heads = config.num_heads;
-    let kv_heads = config.num_kv_heads;
-    let kv = config.kv_dim();
-    let head_dim = config.head_dim();
-    let window = config.effective_window();
     let vocab = config.vocab_size();
 
     // Output head (tied with embed): logits = final_normed @ embed^T.
@@ -740,88 +450,18 @@ pub fn backward_into(
         grads.final_norm_gain[i] += d_final_gain[i];
     }
 
-    for (layer_idx, layer) in weights.layers.iter().enumerate().rev() {
-        let lc = &cache.layers[layer_idx];
-        let lg = &mut grads.layers[layer_idx];
-
-        // --- MLP branch (residual: h_after_attn + mlp_out) ---
-        let d_mlp_out = d_hidden.clone(); // gradient splits equally into both residual branches
-        let (d_act, d_w_down) =
-            ops::linear_bwd(&d_mlp_out, &lc.up_act_input(), &layer.w_down, t_len, config.ffn_dim(), h);
-        lg.w_down.iter_mut().zip(&d_w_down).for_each(|(g, d)| *g += d);
-        let (d_gate, d_up) = ops::swiglu_bwd(&d_act, &lc.gate, &lc.up);
-        let (d_normed2_from_gate, d_w_gate) =
-            ops::linear_bwd(&d_gate, &lc.normed2, &layer.w_gate, t_len, h, config.ffn_dim());
-        let (d_normed2_from_up, d_w_up) =
-            ops::linear_bwd(&d_up, &lc.normed2, &layer.w_up, t_len, h, config.ffn_dim());
-        lg.w_gate.iter_mut().zip(&d_w_gate).for_each(|(g, d)| *g += d);
-        lg.w_up.iter_mut().zip(&d_w_up).for_each(|(g, d)| *g += d);
-        let mut d_normed2 = vec![0.0f32; t_len * h];
-        for i in 0..d_normed2.len() {
-            d_normed2[i] = d_normed2_from_gate[i] + d_normed2_from_up[i];
-        }
-
-        let (d_h_after_attn_from_norm, d_mlp_gain) =
-            ops::rmsnorm_bwd(&d_normed2, &lc.h_after_attn, &layer.mlp_norm_gain, &lc.inv_rms2, t_len, h);
-        lg.mlp_norm_gain.iter_mut().zip(&d_mlp_gain).for_each(|(g, d)| *g += d);
-
-        // d_hidden at "h_after_attn" = contribution from residual pass-through (d_hidden itself) + from norm branch.
-        let mut d_h_after_attn = d_hidden.clone();
-        for i in 0..d_h_after_attn.len() {
-            d_h_after_attn[i] += d_h_after_attn_from_norm[i];
-        }
-
-        // --- Attention branch (residual: h_after_ple + attn_out) ---
-        let d_attn_out = d_h_after_attn.clone();
-        let (d_concat, d_wo) = ops::linear_bwd(&d_attn_out, &lc.concat, &layer.wo, t_len, h, h);
-        lg.wo.iter_mut().zip(&d_wo).for_each(|(g, d)| *g += d);
-
-        let (mut d_q, mut d_k, d_v) = ops::attention_bwd(
-            &d_concat, &lc.q, &lc.k, &lc.v, &lc.probs, t_len, heads, kv_heads, head_dim, window,
-        );
-        ops::rope_apply(&mut d_q, t_len, heads, head_dim, config.rope_theta, true);
-        ops::rope_apply(&mut d_k, t_len, kv_heads, head_dim, config.rope_theta, true);
-
-        let (d_normed1_q, d_wq) = ops::linear_bwd(&d_q, &lc.normed1, &layer.wq, t_len, h, h);
-        let (d_normed1_k, d_wk) = ops::linear_bwd(&d_k, &lc.normed1, &layer.wk, t_len, h, kv);
-        let (d_normed1_v, d_wv) = ops::linear_bwd(&d_v, &lc.normed1, &layer.wv, t_len, h, kv);
-        lg.wq.iter_mut().zip(&d_wq).for_each(|(g, d)| *g += d);
-        lg.wk.iter_mut().zip(&d_wk).for_each(|(g, d)| *g += d);
-        lg.wv.iter_mut().zip(&d_wv).for_each(|(g, d)| *g += d);
-        let mut d_normed1 = vec![0.0f32; t_len * h];
-        for i in 0..d_normed1.len() {
-            d_normed1[i] = d_normed1_q[i] + d_normed1_k[i] + d_normed1_v[i];
-        }
-
-        let (d_h_after_ple_from_norm, d_attn_gain) =
-            ops::rmsnorm_bwd(&d_normed1, &lc.h_after_ple, &layer.attn_norm_gain, &lc.inv_rms1, t_len, h);
-        lg.attn_norm_gain.iter_mut().zip(&d_attn_gain).for_each(|(g, d)| *g += d);
-
-        let mut d_h_after_ple = d_h_after_attn;
-        for i in 0..d_h_after_ple.len() {
-            d_h_after_ple[i] += d_h_after_ple_from_norm[i];
-        }
-
-        // PLE residual add: gradient passes through unchanged, and also
-        // scatters into this layer's PLE table at the token positions.
-        if config.use_ple {
-            scatter_add_rows(&mut lg.ple, &cache.tokens, &d_h_after_ple, h);
-        }
-        d_hidden = d_h_after_ple;
+    // Zipped rather than indexed: `weights.layers`, `cache.layers` and
+    // `grads.layers` are always constructed at the same length (one
+    // entry per model layer), and a `zip` can't walk them out of step
+    // with each other the way three parallel `[layer_idx]` lookups could.
+    for ((layer, lc), lg) in
+        weights.layers.iter().zip(cache.layers.iter()).zip(grads.layers.iter_mut()).rev()
+    {
+        d_hidden = layer.backward(lc, &cache.tokens, config, t_len, d_hidden, lg);
     }
 
     // Input embedding gather (the other half of the tied embed/head gradient).
     scatter_add_rows(&mut grads.embed, &cache.tokens, &d_hidden, h);
-}
-
-impl LayerCache {
-    /// The MLP down-projection's input is the SwiGLU activation, which
-    /// isn't stored directly (only its `gate`/`up` inputs are) — recompute
-    /// it, which is exact (not an approximation) since SwiGLU is a pure
-    /// function of the cached `gate`/`up`.
-    fn up_act_input(&self) -> Vec<f32> {
-        ops::swiglu_fwd(&self.gate, &self.up)
-    }
 }
 
 #[cfg(test)]

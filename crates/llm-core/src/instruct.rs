@@ -156,7 +156,12 @@ const TOKENS_PER_WORD: f32 = 1.6;
 /// subject.
 pub fn parse_prompt(prompt: &str) -> Request {
     let text = prompt.trim();
-    let lower = text.to_lowercase();
+    // ASCII-only casing, not `to_lowercase()`: every marker below is
+    // ASCII, and unlike full Unicode case-folding this never changes a
+    // character's byte length (e.g. 'İ' U+0130 grows from 2 to 3 UTF-8
+    // bytes under `to_lowercase()`), so byte offsets found in `lower`
+    // stay valid indices into `text`.
+    let lower = text.to_ascii_lowercase();
 
     let form = detect_form(&lower);
     let target_words = detect_word_count(&lower);
@@ -423,6 +428,137 @@ pub fn generate_response(
     }
 }
 
+/// `generate_response`, driven one token at a time instead of in a
+/// single call.
+///
+/// `generate_response` cannot be interrupted between tokens — a caller
+/// on a single-threaded host (wasm in a browser tab) that needs to yield
+/// control back to its event loop mid-generation has no way to do that
+/// inside one blocking call. `ResponseSession` exposes the same
+/// generator/length-guard machinery through repeated `step()` calls, so
+/// a host can await a yield between them, and produces the exact same
+/// `Response` `generate_response` would have, via `finish()`.
+pub struct ResponseSession<'a> {
+    generator: generate::Generator<'a>,
+    tokenizer: &'a Tokenizer,
+    sampling: SamplingConfig,
+    guard: LengthGuard,
+    max_new_tokens: usize,
+    /// Bytes decoded so far that don't yet form a complete UTF-8
+    /// character — see `generate::take_complete_chars`.
+    pending: Vec<u8>,
+    out: Vec<u32>,
+    tokens_this_far: usize,
+    reason: StopReason,
+    done: bool,
+}
+
+impl<'a> ResponseSession<'a> {
+    pub fn new(
+        weights: &'a ModelWeights,
+        config: &'a ModelConfig,
+        tokenizer: &'a Tokenizer,
+        request: &Request,
+        sampling: SamplingConfig,
+        max_tokens_override: Option<usize>,
+    ) -> Self {
+        let prompt_tokens = request.to_prompt_tokens(tokenizer);
+        let guard = LengthGuard::new(request.target_words);
+        let max_new_tokens = max_tokens_override.unwrap_or_else(|| guard.token_budget());
+        let generator = generate::Generator::new(weights, config, &prompt_tokens, sampling.seed);
+        Self {
+            generator,
+            tokenizer,
+            sampling,
+            guard,
+            max_new_tokens,
+            pending: Vec::new(),
+            out: Vec::new(),
+            tokens_this_far: 0,
+            reason: StopReason::Budget,
+            done: false,
+        }
+    }
+
+    /// Bytes left over from the last token that don't yet complete a
+    /// character, rendered the same lossy way `Tokenizer::decode` would —
+    /// so text streamed piece-by-piece agrees with `finish()`'s `text`.
+    fn flush_pending(&mut self) -> String {
+        if self.pending.is_empty() {
+            return String::new();
+        }
+        let tail = String::from_utf8_lossy(&self.pending).into_owned();
+        self.pending.clear();
+        tail
+    }
+
+    /// Advance by one token. Returns any newly-complete text and, once
+    /// the generation has finished (length target, EOS, or `cancel()`),
+    /// the reason why — after which further calls keep returning that
+    /// same reason with no new text.
+    pub fn step(&mut self) -> (String, Option<StopReason>) {
+        if self.done {
+            return (String::new(), Some(self.reason));
+        }
+        if self.tokens_this_far >= self.max_new_tokens {
+            self.done = true;
+            self.reason = StopReason::Budget;
+            let flushed = self.flush_pending();
+            self.guard.observe(&flushed);
+            return (flushed, Some(self.reason));
+        }
+        let Some(token) = self.generator.step(&self.sampling) else {
+            self.done = true;
+            self.reason = StopReason::EndOfText;
+            let flushed = self.flush_pending();
+            self.guard.observe(&flushed);
+            return (flushed, Some(self.reason));
+        };
+        self.out.push(token);
+        self.pending.extend_from_slice(self.tokenizer.piece(token));
+        let piece = generate::take_complete_chars(&mut self.pending);
+        self.tokens_this_far += 1;
+        if !self.guard.observe(&piece) {
+            self.done = true;
+            self.reason = StopReason::Caller;
+            let flushed = self.flush_pending();
+            self.guard.observe(&flushed);
+            let mut combined = piece;
+            combined.push_str(&flushed);
+            return (combined, Some(self.reason));
+        }
+        (piece, None)
+    }
+
+    /// Stop early — the CPU-side equivalent of `generate_response`'s
+    /// `on_progress` callback returning `false` (a Stop button).
+    pub fn cancel(&mut self) -> String {
+        if self.done {
+            return String::new();
+        }
+        self.done = true;
+        self.reason = StopReason::Caller;
+        self.flush_pending()
+    }
+
+    pub fn words(&self) -> usize {
+        self.guard.words()
+    }
+
+    /// The same `Response` `generate_response` would have returned, built
+    /// from every token `step()` produced. Call once `step()` has
+    /// reported a stop reason, or after `cancel()`.
+    pub fn finish(self) -> Response {
+        let text = self.tokenizer.decode(&self.out);
+        Response {
+            word_count: text.split_whitespace().count(),
+            tokens_generated: self.tokenizer.encode(&text).len(),
+            stop_reason: if self.guard.stopped_by_length() { StopReason::Caller } else { self.reason },
+            text,
+        }
+    }
+}
+
 /// Words starting in `piece`, given whether the previous piece ended
 /// mid-word. Returns `(new words, ends mid-word)`.
 fn count_words(piece: &str, continues_a_word: bool) -> (usize, bool) {
@@ -518,7 +654,7 @@ fn subject_from_text(text: &str) -> String {
         "what", "when", "will", "would", "there", "their", "which", "about", "into", "than",
         "then", "them", "these", "those", "your", "you", "her", "his", "she", "him", "had",
         "has", "was", "are", "not", "but", "all", "one", "out", "who", "get", "got", "can",
-        "him", "its", "our", "himself", "herself", "just", "like", "only", "over", "some",
+        "could", "its", "our", "himself", "herself", "just", "like", "only", "over", "some",
         "such", "very", "well", "back", "down", "here",
     ];
     let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
@@ -550,6 +686,21 @@ mod tests {
         assert_eq!(request.target_words, Some(700));
         assert_eq!(request.subject, "two people in space");
         assert_eq!(request.reference.as_deref(), Some("Plato's allegory of the cave"));
+    }
+
+    #[test]
+    fn does_not_panic_on_unicode_that_changes_length_when_lowercased() {
+        // 'İ' (U+0130) is 2 UTF-8 bytes but its full-Unicode lowercase
+        // mapping "i̇" is 3 bytes — `to_lowercase()` would desync the
+        // byte offsets `split_subject_and_reference` reuses across
+        // `text` and its lowercased copy, panicking on a non-boundary
+        // slice. Regression for that: must not panic, and must not
+        // silently misalign the split either.
+        let request = parse_prompt("İ");
+        assert_eq!(request.subject, "İ");
+
+        let request = parse_prompt("İ story about love");
+        assert_eq!(request.subject, "love");
     }
 
     #[test]
@@ -811,5 +962,87 @@ mod tests {
         );
         assert!(pieces <= 3);
         assert!(response.tokens_generated < 100);
+    }
+
+    #[test]
+    fn response_session_matches_generate_response_step_for_step() {
+        // ResponseSession exists so a caller can yield between tokens;
+        // it must still produce exactly what one uninterrupted
+        // `generate_response` call would, both in the pieces streamed
+        // and in the final `Response`.
+        let config = ModelConfig {
+            num_layers: 1,
+            hidden_dim: 16,
+            num_heads: 2,
+            num_kv_heads: 1,
+            context_len: 64,
+            local_window: 32,
+            ..Default::default()
+        };
+        let weights = ModelWeights::init(&config, 3);
+        let t = Tokenizer::byte_level();
+        let request = Request {
+            form: Form::Novel,
+            target_words: Some(20),
+            subject: "space".to_string(),
+            reference: None,
+        };
+        let sampling = SamplingConfig { seed: 1, ..Default::default() };
+
+        let mut expected_pieces = Vec::new();
+        let expected = generate_response(&weights, &config, &t, &request, &sampling, None, &mut |piece, _| {
+            expected_pieces.push(piece.to_string());
+            true
+        });
+
+        let mut session = ResponseSession::new(&weights, &config, &t, &request, sampling, None);
+        let mut actual_pieces = Vec::new();
+        loop {
+            let (piece, reason) = session.step();
+            actual_pieces.push(piece);
+            if reason.is_some() {
+                break;
+            }
+        }
+        let actual = session.finish();
+
+        assert_eq!(actual_pieces, expected_pieces);
+        assert_eq!(actual.text, expected.text);
+        assert_eq!(actual.word_count, expected.word_count);
+        assert_eq!(actual.tokens_generated, expected.tokens_generated);
+        assert_eq!(actual.stop_reason, expected.stop_reason);
+    }
+
+    #[test]
+    fn response_session_cancel_matches_a_progress_callback_stopping_early() {
+        let config = ModelConfig {
+            num_layers: 1,
+            hidden_dim: 8,
+            num_heads: 2,
+            num_kv_heads: 2,
+            context_len: 32,
+            local_window: 32,
+            ..Default::default()
+        };
+        let weights = ModelWeights::init(&config, 2);
+        let request = parse_prompt("a 500 word story about rain");
+        let t = Tokenizer::byte_level();
+        let mut session =
+            ResponseSession::new(&weights, &config, &t, &request, SamplingConfig::default(), None);
+        let mut pieces = 0;
+        loop {
+            let (_, reason) = session.step();
+            pieces += 1;
+            if reason.is_some() {
+                break;
+            }
+            if pieces >= 3 {
+                session.cancel();
+                break;
+            }
+        }
+        let response = session.finish();
+        assert!(pieces <= 4, "3 steps plus at most one cancel-flush piece");
+        assert_eq!(response.stop_reason, StopReason::Caller);
     }
 }
