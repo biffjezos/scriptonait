@@ -388,13 +388,14 @@ async function reportDuplicates() {
   if (!model) return;
   try {
     const { ids } = await call('duplicate-sources');
+    $('remove-duplicates-btn').hidden = !ids || ids.length === 0;
     if (!ids || ids.length === 0) return;
     const titles = ids
       .map((id) => (sources.find((s) => s.id === id) || {}).title || id)
       .slice(0, 3);
     showError(
       `${ids.length} source${ids.length === 1 ? ' is a copy' : 's are copies'} of another ` +
-        `(${titles.join(', ')}${ids.length > 3 ? ', …' : ''}). Remove the copies in Corpus.`,
+        `(${titles.join(', ')}${ids.length > 3 ? ', …' : ''}). Remove Copies in Corpus.`,
     );
   } catch (error) {
     console.warn('[scriptonait] duplicate check failed:', error);
@@ -643,6 +644,7 @@ onStream('generate-piece', ({ piece }) => {
 });
 
 onStream('generate-progress', ({ words, tokens, elapsedSeconds, tokensPerSecond }) => {
+  stopGenerateTicker();
   const fraction = targetWords > 0 ? words / targetWords : 0;
   setProgress('generate-progress-bar', fraction);
   const of = targetWords > 0 ? ` of ${targetWords}` : '';
@@ -661,6 +663,22 @@ function applyLengthMode() {
 $('opt-length-mode').addEventListener('change', applyLengthMode);
 applyLengthMode();
 
+/// generate-piece/generate-progress only start arriving once the model
+/// has produced a first token — parse-prompt and whatever it takes to
+/// get the first token out (a busy GPU, a cold wasm/GPU init) both
+/// happen before that, with nothing to report yet. Left as a frozen
+/// "Starting…" for however long that turns out to take, it reads
+/// identically whether it's been one second or sixty. This ticks the
+/// elapsed time instead, so a long wait still looks like it's doing
+/// something rather than stuck.
+let generateTicker = null;
+function stopGenerateTicker() {
+  if (generateTicker) {
+    clearInterval(generateTicker);
+    generateTicker = null;
+  }
+}
+
 $('generate-btn').addEventListener('click', async () => {
   if (generating) return;
   const prompt = $('prompt-input').value.trim();
@@ -678,6 +696,12 @@ $('generate-btn').addEventListener('click', async () => {
   $('output').textContent = '';
   setProgress('generate-progress-bar', 0);
   $('generate-stats').textContent = 'Starting…';
+  const generateStartedAt = performance.now();
+  stopGenerateTicker();
+  generateTicker = setInterval(() => {
+    $('generate-stats').textContent =
+      `Starting… ${Math.round((performance.now() - generateStartedAt) / 1000)}s`;
+  }, 1000);
 
   try {
     const parsed = await call('parse-prompt', { prompt });
@@ -726,6 +750,7 @@ $('generate-btn').addEventListener('click', async () => {
   } catch (error) {
     showError(error.message);
   } finally {
+    stopGenerateTicker();
     generating = false;
     $('generate-btn').disabled = false;
     $('stop-btn').hidden = true;
@@ -901,6 +926,26 @@ $('remove-all-btn').addEventListener('click', async () => {
     }
   }
   await refreshPlan();
+});
+
+$('remove-duplicates-btn').addEventListener('click', async () => {
+  let ids;
+  try {
+    ({ ids } = await call('duplicate-sources'));
+  } catch (error) {
+    showError(error);
+    return;
+  }
+  if (!ids || ids.length === 0) {
+    $('remove-duplicates-btn').hidden = true;
+    return;
+  }
+  if (!confirm(`Remove ${ids.length.toLocaleString()} duplicate source${ids.length === 1 ? '' : 's'}? This can't be undone.`)) {
+    return;
+  }
+  for (const id of ids) await removeSource(id);
+  $('remove-duplicates-btn').hidden = true;
+  notice(`Removed ${ids.length.toLocaleString()} duplicate source${ids.length === 1 ? '' : 's'}.`, 'success');
 });
 
 async function removeSource(id) {
@@ -2786,6 +2831,11 @@ $('autosave-file-btn').addEventListener('click', async () => {
       types: [{ description: 'scriptonait project', accept: { 'application/octet-stream': ['.snp'] } }],
     });
     $('autosave-status').textContent = `File: ${autosaveHandle.name}.`;
+    // Stored so a reload doesn't forget which file this is and silently
+    // fall back to browser-only saves — see putAutosaveFileHandle.
+    db.putAutosaveFileHandle(autosaveHandle).catch((error) => {
+      console.warn('[scriptonait] could not remember the autosave file', error);
+    });
     // Write immediately, so the file exists and the permission is proven
     // now rather than in six hours when it matters.
     if (model) await autosave(model.step, { force: true });
@@ -2869,6 +2919,25 @@ async function applyLoadedSettings() {
     }
   } catch (error) {
     console.warn('[scriptonait] could not read auto-save settings', error);
+  }
+  try {
+    const handle = autosaveSupported() ? await db.getAutosaveFileHandle() : null;
+    if (handle) {
+      // queryPermission only checks, it never prompts — safe to call
+      // without a click behind it, unlike requestPermission. A browser
+      // that already granted readwrite here keeps it across reloads;
+      // one that didn't gets told to pick the file again rather than
+      // silently falling back to browser-only saves.
+      const permission = await handle.queryPermission({ mode: 'readwrite' });
+      if (permission === 'granted') {
+        autosaveHandle = handle;
+        $('autosave-status').textContent = `File: ${handle.name}.`;
+      } else {
+        $('autosave-status').textContent = `File: ${handle.name} (permission needed — choose it again).`;
+      }
+    }
+  } catch (error) {
+    console.warn('[scriptonait] could not restore the auto-save file', error);
   }
   try {
     const devicePref = await db.getDevicePreference();

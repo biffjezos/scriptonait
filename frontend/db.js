@@ -303,6 +303,27 @@ const AUTOSAVE_CONFIG = 'autosave-config';
 const DEVICE_PREFERENCE = 'device-preference';
 const BENCHMARK_CONFIG = 'benchmark-config';
 const TRAINING_PLAN_SETTINGS = 'training-plan-settings';
+const AUTOSAVE_FILE_HANDLE = 'autosave-file-handle';
+
+/// The `FileSystemFileHandle` the "Choose…" picker returned — not the
+/// name, the live handle, so autosave-to-file survives a reload without
+/// asking again. IndexedDB structured-clones a handle just fine; nothing
+/// else can carry it. Left out of the exported .snp for the same reason
+/// it's browser-local to begin with: a handle from `showSaveFilePicker`
+/// only ever means anything on the machine and origin that granted it —
+/// there is no bytes-on-disk form of "write access to this exact file"
+/// that a project opened somewhere else could use. What the project file
+/// does carry is `autosaveConfig` (enabled/frequency/mode) below, which
+/// is the part that travels.
+export async function putAutosaveFileHandle(handle) {
+  await withStore(SETTINGS_STORE, 'readwrite', (store) =>
+    store.put({ id: AUTOSAVE_FILE_HANDLE, handle, savedAt: Date.now() }));
+}
+
+export async function getAutosaveFileHandle() {
+  const record = await withStore(SETTINGS_STORE, 'readonly', (store) => store.get(AUTOSAVE_FILE_HANDLE));
+  return (record && record.handle) || null;
+}
 
 /// { enabled, frequencySteps, mode: 'overwrite'|'add' }
 export async function putAutosaveConfig(config) {
