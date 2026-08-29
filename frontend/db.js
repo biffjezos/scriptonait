@@ -251,6 +251,7 @@ const DEVICE_PREFERENCE = 'device-preference';
 const BENCHMARK_CONFIG = 'benchmark-config';
 const TRAINING_PLAN_SETTINGS = 'training-plan-settings';
 const AUTOSAVE_FILE_HANDLE = 'autosave-file-handle';
+const REMOTE_SERVER_CONFIG = 'remote-server-config';
 
 /// The `FileSystemFileHandle` the "Choose…" picker returned — not the
 /// name, the live handle, so autosave-to-file survives a reload without
@@ -316,6 +317,20 @@ export async function putDevicePreference(preference) {
 
 export async function getDevicePreference() {
   return withStore(SETTINGS_STORE, 'readonly', (store) => store.get(DEVICE_PREFERENCE));
+}
+
+/// { url, token }. The token travels through IndexedDB in plain text,
+/// same as everything else in this store — this page has no server of
+/// its own to keep a secret from, and the token only ever gets sent
+/// onward to the one remote-training URL the user typed in themselves.
+export async function putRemoteServerConfig(config) {
+  const record = { ...config, id: REMOTE_SERVER_CONFIG, savedAt: Date.now() };
+  await withStore(SETTINGS_STORE, 'readwrite', (store) => store.put(record));
+  return record;
+}
+
+export async function getRemoteServerConfig() {
+  return withStore(SETTINGS_STORE, 'readonly', (store) => store.get(REMOTE_SERVER_CONFIG));
 }
 
 /// { autoEnabled }

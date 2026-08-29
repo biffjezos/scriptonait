@@ -285,6 +285,7 @@
             <select id="training-device">
               <option value="gpu" selected>GPU</option>
               <option value="cpu" disabled>CPU (needs a GPU)</option>
+              <option value="remote">Remote</option>
             </select>
           </label>
           <label>Inference
@@ -320,6 +321,16 @@
           <label>Max tokens
             <input type="number" id="opt-max-tokens" value="200" min="1" max="8192" disabled />
           </label>
+        </div>
+        <div class="row" id="remote-server-settings" hidden>
+          <label>Remote server URL
+            <input type="text" id="remote-server-url" placeholder="http://127.0.0.1:8420" />
+          </label>
+          <label>Remote server token
+            <input type="password" id="remote-server-token" />
+          </label>
+          <button id="remote-test-btn" type="button" class="secondary">Test Connection</button>
+          <span id="remote-server-status" class="hint">Not tested.</span>
         </div>
       </details>
 

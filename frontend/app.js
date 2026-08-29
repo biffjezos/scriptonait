@@ -11,22 +11,99 @@
 import * as db from './db.js';
 import * as project from './project.js';
 import { LocalWasmBackend } from './backend/local-wasm-backend.js';
+import { RemoteBackend } from './backend/remote-backend.js';
 
 // --- Compute backend -----------------------------------------------------
-// `app.js` never touches the worker (or, later, a remote server) directly
-// — only this backend's call()/onStream(), the interface every backend
-// implements (see backend/backend.js). `showError` isn't defined yet at
-// this point in the file, but the arrow function below only resolves the
-// name when the worker actually reports a fatal error, well after the
-// whole module (including `showError`'s own declaration) has run.
-const backend = new LocalWasmBackend({ onFatalError: (error) => showError(error) });
+// `app.js` never touches the worker or a remote server directly — only a
+// backend's call()/onStream(), the interface every backend implements
+// (see backend/backend.js). `showError` isn't defined yet at this point
+// in the file, but the arrow functions below only resolve the name when
+// a backend actually reports a fatal error, well after the whole module
+// (including `showError`'s own declaration) has run.
+//
+// Corpus, model state, checkpoint I/O and inference always run on this
+// browser's own WASM+WebGPU, whichever way Training is set — the model
+// stays real here even when Training is Remote, since the client is
+// always the durable owner (see crates/llm-server's own design note).
+const localBackend = new LocalWasmBackend({ onFatalError: (error) => showError(error) });
+
+/// Whichever backend Training is currently pointed at — `localBackend`
+/// (device 'gpu'/'cpu') or a `RemoteBackend` (device 'remote'), set by
+/// the Settings-tab Training select. Inference has no remote option (see
+/// llm-server's own non-goals), so nothing else ever needs its own
+/// backend variable.
+let trainingBackend = localBackend;
+
+/// Every `onStream` registration so far, replayed onto a new
+/// `trainingBackend` when Settings switches it — every call site in this
+/// file registers once, at module load, so this list only ever grows.
+const streamRegistrations = [];
 
 function call(type, payload = {}, transfer = [], timeoutMs) {
-  return backend.call(type, payload, transfer, timeoutMs);
+  return localBackend.call(type, payload, transfer, timeoutMs);
+}
+
+/// Training-only message types ('train', 'stop', 'update-training-settings',
+/// 'reset-schedule') go to whichever backend Training is set to, instead
+/// of always the local one — the one place local and remote genuinely
+/// diverge.
+function trainCall(type, payload = {}, transfer = [], timeoutMs) {
+  return trainingBackend.call(type, payload, transfer, timeoutMs);
 }
 
 function onStream(type, handler) {
-  backend.onStream(type, handler);
+  streamRegistrations.push({ type, handler });
+  localBackend.onStream(type, handler);
+  if (trainingBackend !== localBackend) trainingBackend.onStream(type, handler);
+}
+
+/// Called whenever Settings swaps in a new Training backend — replays
+/// every handler this file has ever registered onto it, so a stream
+/// event fired by whichever backend is now training still reaches the
+/// same code the local worker's events already do.
+function replayStreamRegistrations(target) {
+  for (const { type, handler } of streamRegistrations) target.onStream(type, handler);
+}
+
+/// Converts a checkpoint's raw bytes to base64 for the one place this
+/// page ever needs it — handing a checkpoint to a remote server as JSON.
+/// Chunked because `btoa(String.fromCharCode(...bytes))` blows the call
+/// stack on a checkpoint of any real size.
+function bytesToBase64(bytes) {
+  const CHUNK = 0x8000;
+  let binary = '';
+  for (let i = 0; i < bytes.length; i += CHUNK) {
+    binary += String.fromCharCode(...bytes.subarray(i, i + CHUNK));
+  }
+  return btoa(binary);
+}
+
+/// The corpus snapshot a remote training session starts from — see the
+/// "snapshot at start, edits wait" design: this is read once, when Train
+/// is pressed, not kept in sync afterward.
+function remoteSourcesPayload() {
+  return sources
+    .filter((s) => s.id && typeof s.rawText === 'string' && s.rawText.length > 0)
+    .map((s) => ({ id: s.id, text: s.rawText, isHtml: s.kind === 'url' }));
+}
+
+/// Exports the local model's current checkpoint and starts a remote
+/// training run from it — always the checkpoint path, never a bare
+/// config, since by the time this is called `readTrainingSettings()`'s
+/// own caller has already ensured a local model exists (Train creates
+/// one first if there wasn't one), carrying the already-learned
+/// vocabulary the remote session has to match.
+async function startRemoteTraining(settings) {
+  const { bytes } = await call('export-checkpoint');
+  const checkpointBase64 = bytesToBase64(new Uint8Array(bytes));
+  return trainCall('train', {
+    checkpointBase64,
+    sources: remoteSourcesPayload(),
+    batchSize: settings.batchSize,
+    peakLearningRate: settings.peakLearningRate,
+    maxSteps: settings.maxSteps,
+    autosaveFrequencySteps: settings.autosaveFrequencySteps,
+  });
 }
 
 /// Matches worker.js. A stored profile from an older benchmark measured
@@ -293,7 +370,7 @@ async function syncAllSources() {
   // reason `set-source-sample-count`/`set-window-progress` below exist.
   const openingRate = Number($('opening-rate').value);
   if (openingRate >= 0) {
-    call('update-training-settings', { boundarySampleRate: openingRate / 100 }).catch(() => {});
+    trainCall('update-training-settings', { boundarySampleRate: openingRate / 100 }).catch(() => {});
   }
   // Counted, because syncSource swallows its failures — it has to, since
   // one unreadable record must not stop the other sixty-five. But a
@@ -1651,6 +1728,24 @@ async function copyToClipboard(text, label) {
 // to end in silence: the page kept showing the last sample it received
 // and nothing said the steps had stopped.
 onStream('train-stopped', ({ step, reason }) => {
+  // A local run's own click handler already does this reset once its
+  // `call('train', ...)` promise settles — this runs again there
+  // (idempotent) and is the only place a remote run's ever gets it,
+  // since nothing awaits a remote run to completion the way the click
+  // handler awaits a local one.
+  training = false;
+  $('train-btn').disabled = false;
+  $('train-stop-btn').hidden = true;
+  $('live-controls').hidden = true;
+  setTitleProgress(null);
+  updateGuidance();
+  refreshPlan().catch(() => {});
+  if (reason === 'finished') {
+    $('train-stats').textContent = `Finished at step ${step.toLocaleString()} — press Train to continue`;
+    notify('Training finished', `${step.toLocaleString()} steps.`);
+    notice(`Training finished at step ${step.toLocaleString()}.`, 'success');
+    return;
+  }
   console.error(`[scriptonait] training stopped at step ${step.toLocaleString()}: ${reason}`);
   showError(
     `Training stopped at step ${step.toLocaleString()}: ${reason}. ` +
@@ -1660,6 +1755,22 @@ onStream('train-stopped', ({ step, reason }) => {
 });
 
 onStream('train-autosave', ({ step, bytes }) => {
+  autosave(step, { bytes });
+});
+
+/// The bridge for "train remote, infer local": a `RemoteBackend`'s own
+/// periodic and end-of-run checkpoint pulls arrive here rather than as
+/// `train-autosave` directly, since a remote run's bytes also need
+/// loading into this browser's own WASM model before anything local
+/// (Generate, a later local Train) sees them — a local run's own worker
+/// already holds that model, so it never needs this step.
+onStream('remote-checkpoint', async ({ step, bytes }) => {
+  try {
+    const info = await call('import-checkpoint', { bytes });
+    if (info && !info.error) renderModel(info);
+  } catch (error) {
+    console.warn('[scriptonait] could not load a synced remote checkpoint locally', error);
+  }
   autosave(step, { bytes });
 });
 
@@ -1740,7 +1851,7 @@ $('sample-next').addEventListener('click', () => {
 
 $('reset-schedule-btn').addEventListener('click', async () => {
   try {
-    const result = await call('reset-schedule');
+    const result = await trainCall('reset-schedule');
     notice(
       `Schedule restored from ${result.was.toFixed(2)}x to full strength — rate in force ` +
         `${result.lrNow.toExponential(2)}.`,
@@ -1755,7 +1866,7 @@ $('live-lr-btn').addEventListener('click', async () => {
   const rate = Number($('live-lr').value);
   if (!(rate > 0)) return;
   try {
-    const result = await call('update-training-settings', { peakLearningRate: rate });
+    const result = await trainCall('update-training-settings', { peakLearningRate: rate });
     notice(`Peak learning rate is now ${result.peakLr}.`, 'success');
   } catch (error) {
     showError(error);
@@ -2026,7 +2137,7 @@ function readTrainingSettings() {
 /// A no-op before any model exists — the worker just keeps the values
 /// for whenever Train is next pressed.
 function pushLiveTrainingSettings() {
-  call('update-training-settings', readTrainingSettings()).catch(() => {});
+  trainCall('update-training-settings', readTrainingSettings()).catch(() => {});
 }
 for (const id of [
   'train-mode', 'train-steps', 'train-effort', 'train-batch', 'train-lr', 'opening-rate',
@@ -2064,15 +2175,99 @@ $('benchmark-enabled').addEventListener('change', async (event) => {
   updateGuidance();
 });
 
-/// Loaded from Settings at startup, and kept live from there. Training
-/// stays GPU-only for now (the CPU option is disabled in the markup),
-/// so only the inference side has anything to wire.
+/// Loaded from Settings at startup, and kept live from there.
 let inferenceDevicePref = 'gpu';
+
+/// 'gpu' | 'remote' — which backend `trainingBackend` currently points
+/// at (the CPU option is disabled in the markup: training has no CPU
+/// path). Loaded from Settings at startup; see the `#training-device`
+/// change handler below for what happens when it changes live.
+let trainingBackendPref = 'gpu';
+
+$('training-device').addEventListener('change', async (event) => {
+  await withNotice('Saving training backend', 'Training backend saved', () =>
+    applyTrainingBackendPref(event.target.value === 'remote' ? 'remote' : 'gpu', { persist: true }),
+  );
+});
+
+async function currentRemoteServerConfig() {
+  return {
+    url: $('remote-server-url').value.trim(),
+    token: $('remote-server-token').value,
+  };
+}
+
+/// Swaps `trainingBackend` to match `pref` ('gpu' or 'remote'), building
+/// a fresh `RemoteBackend` from whatever Server URL/token are currently
+/// in Settings when switching to remote, and replaying every stream
+/// handler this file has registered onto it — see `onStream` above.
+/// Refuses while a run is in flight, the same guard every other
+/// training-affecting Settings change would need.
+async function applyTrainingBackendPref(pref, { persist } = {}) {
+  if (persist && training) {
+    $('training-device').value = trainingBackendPref;
+    throw new Error('a training run is going — press Stop first');
+  }
+  trainingBackendPref = pref;
+  $('remote-server-settings').hidden = pref !== 'remote';
+  if (pref === 'remote') {
+    const { url, token } = await currentRemoteServerConfig();
+    trainingBackend = new RemoteBackend({ baseUrl: url, token, onFatalError: (error) => showError(error) });
+    replayStreamRegistrations(trainingBackend);
+  } else {
+    trainingBackend = localBackend;
+  }
+  if (persist) {
+    await db.putDevicePreference({ trainingDevice: pref, inferenceDevice: inferenceDevicePref });
+  }
+}
+
+$('remote-server-url').addEventListener('change', async (event) => {
+  const url = event.target.value.trim();
+  event.target.value = url;
+  await withNotice('Saving remote server setting', 'Remote server setting saved', async () => {
+    if (trainingBackendPref === 'remote' && training) {
+      throw new Error('a remote training run is going — press Stop first');
+    }
+    const { token } = await currentRemoteServerConfig();
+    await db.putRemoteServerConfig({ url, token });
+    if (trainingBackendPref === 'remote') await applyTrainingBackendPref('remote');
+  });
+});
+
+$('remote-server-token').addEventListener('change', async (event) => {
+  await withNotice('Saving remote server setting', 'Remote server setting saved', async () => {
+    if (trainingBackendPref === 'remote' && training) {
+      throw new Error('a remote training run is going — press Stop first');
+    }
+    const { url } = await currentRemoteServerConfig();
+    await db.putRemoteServerConfig({ url, token: event.target.value });
+    if (trainingBackendPref === 'remote') await applyTrainingBackendPref('remote');
+  });
+});
+
+$('remote-test-btn').addEventListener('click', async () => {
+  $('remote-test-btn').disabled = true;
+  $('remote-server-status').textContent = 'Testing…';
+  try {
+    const { url, token } = await currentRemoteServerConfig();
+    const probe = new RemoteBackend({ baseUrl: url, token });
+    const info = await probe.call('health');
+    $('remote-server-status').textContent =
+      `Connected — ${info.adapter} (${info.backend}${info.isSoftware ? ', software' : ''}).`;
+    notice('Remote server reachable.', 'success');
+  } catch (error) {
+    $('remote-server-status').textContent = `Not connected — ${(error && error.message) || error}.`;
+    showError(error);
+  } finally {
+    $('remote-test-btn').disabled = false;
+  }
+});
 
 $('inference-device').addEventListener('change', async (event) => {
   inferenceDevicePref = event.target.value === 'cpu' ? 'cpu' : 'gpu';
   await withNotice('Saving inference device', 'Inference device saved', async () => {
-    await db.putDevicePreference({ trainingDevice: 'gpu', inferenceDevice: inferenceDevicePref });
+    await db.putDevicePreference({ trainingDevice: trainingBackendPref, inferenceDevice: inferenceDevicePref });
     await call('set-inference-device', { device: inferenceDevicePref });
   });
 });
@@ -2097,6 +2292,7 @@ $('train-btn').addEventListener('click', async () => {
   $('train-stats').textContent = 'Starting…';
   $('train-advice').hidden = true;
 
+  let runningRemotely = false;
   try {
     // One button, two jobs. With no model, make one first — nobody
     // should have to know that "create an untrained model" is a separate
@@ -2143,6 +2339,13 @@ $('train-btn').addEventListener('click', async () => {
       });
     }
 
+    if (trainingBackendPref === 'remote') {
+      await startRemoteTraining(readTrainingSettings());
+      runningRemotely = true;
+      $('train-stats').textContent = 'Started on the remote GPU…';
+      return;
+    }
+
     const result = await call('train', readTrainingSettings(), [], 0);
 
     if (result.stopReason === 'already-training') {
@@ -2171,12 +2374,18 @@ $('train-btn').addEventListener('click', async () => {
   } catch (error) {
     showError(error);
   } finally {
-    training = false;
-    $('train-btn').disabled = false;
-    $('train-stop-btn').hidden = true;
-    $('live-controls').hidden = true;
-    setTitleProgress(null);
-    updateGuidance();
+    // A remote run that has genuinely started keeps `training` true and
+    // the Stop button live — this run isn't over, it just isn't
+    // something this click handler waits on. `onStream('train-stopped',
+    // ...)` below does this same reset once it actually ends.
+    if (!runningRemotely) {
+      training = false;
+      $('train-btn').disabled = false;
+      $('train-stop-btn').hidden = true;
+      $('live-controls').hidden = true;
+      setTitleProgress(null);
+      updateGuidance();
+    }
   }
 });
 
@@ -2190,7 +2399,7 @@ for (const id of ['cfg-layers', 'cfg-hidden', 'cfg-heads', 'cfg-kv-heads', 'cfg-
 $('train-stop-btn').addEventListener('click', () => {
   $('train-stop-btn').disabled = true;
   $('train-stats').textContent = 'Stopping after this step…';
-  call('stop', {}, [], 0).catch(() => {});
+  trainCall('stop', {}, [], 0).catch(() => {});
 });
 
 /// Both curves on one pair of axes: training loss, and the held-out loss
@@ -2445,6 +2654,7 @@ $('export-project-btn').addEventListener('click', async () => {
         devicePreference: await db.getDevicePreference(),
         benchmarkConfig: await db.getBenchmarkConfig(),
         trainingPlan: await db.getTrainingPlanSettings(),
+        remoteServerConfig: await db.getRemoteServerConfig(),
       },
     });
     console.info(
@@ -2501,6 +2711,7 @@ $('import-project-input').addEventListener('change', async (event) => {
     if (settings.devicePreference) await db.putDevicePreference(settings.devicePreference);
     if (settings.benchmarkConfig) await db.putBenchmarkConfig(settings.benchmarkConfig);
     if (settings.trainingPlan) await db.putTrainingPlanSettings(settings.trainingPlan);
+    if (settings.remoteServerConfig) await db.putRemoteServerConfig(settings.remoteServerConfig);
 
     // Before the corpus gets rebuilt, not after: syncAllSources (called
     // below, both directly and inside restoreModel-shaped paths) reads
@@ -2706,6 +2917,7 @@ async function buildProjectBlob(checkpointBytes, optimizerBytes) {
       devicePreference: await db.getDevicePreference(),
       benchmarkConfig: await db.getBenchmarkConfig(),
       trainingPlan: await db.getTrainingPlanSettings(),
+      remoteServerConfig: await db.getRemoteServerConfig(),
     },
   });
 }
@@ -3172,6 +3384,17 @@ async function applyLoadedSettings() {
     }
   } catch (error) {
     console.warn('[scriptonait] could not read device settings', error);
+  }
+  try {
+    const remoteConfig = await db.getRemoteServerConfig();
+    $('remote-server-url').value = (remoteConfig && remoteConfig.url) || '';
+    $('remote-server-token').value = (remoteConfig && remoteConfig.token) || '';
+    const devicePref = await db.getDevicePreference();
+    const pref = devicePref && devicePref.trainingDevice === 'remote' ? 'remote' : 'gpu';
+    $('training-device').value = pref;
+    await applyTrainingBackendPref(pref);
+  } catch (error) {
+    console.warn('[scriptonait] could not read the remote training backend settings', error);
   }
   try {
     const benchmarkConfig = await db.getBenchmarkConfig();
