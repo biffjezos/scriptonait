@@ -644,6 +644,7 @@ onStream('generate-piece', ({ piece }) => {
 });
 
 onStream('generate-progress', ({ words, tokens, elapsedSeconds, tokensPerSecond }) => {
+  stopGenerateTicker();
   const fraction = targetWords > 0 ? words / targetWords : 0;
   setProgress('generate-progress-bar', fraction);
   const of = targetWords > 0 ? ` of ${targetWords}` : '';
@@ -662,6 +663,22 @@ function applyLengthMode() {
 $('opt-length-mode').addEventListener('change', applyLengthMode);
 applyLengthMode();
 
+/// generate-piece/generate-progress only start arriving once the model
+/// has produced a first token — parse-prompt and whatever it takes to
+/// get the first token out (a busy GPU, a cold wasm/GPU init) both
+/// happen before that, with nothing to report yet. Left as a frozen
+/// "Starting…" for however long that turns out to take, it reads
+/// identically whether it's been one second or sixty. This ticks the
+/// elapsed time instead, so a long wait still looks like it's doing
+/// something rather than stuck.
+let generateTicker = null;
+function stopGenerateTicker() {
+  if (generateTicker) {
+    clearInterval(generateTicker);
+    generateTicker = null;
+  }
+}
+
 $('generate-btn').addEventListener('click', async () => {
   if (generating) return;
   const prompt = $('prompt-input').value.trim();
@@ -679,6 +696,12 @@ $('generate-btn').addEventListener('click', async () => {
   $('output').textContent = '';
   setProgress('generate-progress-bar', 0);
   $('generate-stats').textContent = 'Starting…';
+  const generateStartedAt = performance.now();
+  stopGenerateTicker();
+  generateTicker = setInterval(() => {
+    $('generate-stats').textContent =
+      `Starting… ${Math.round((performance.now() - generateStartedAt) / 1000)}s`;
+  }, 1000);
 
   try {
     const parsed = await call('parse-prompt', { prompt });
@@ -727,6 +750,7 @@ $('generate-btn').addEventListener('click', async () => {
   } catch (error) {
     showError(error.message);
   } finally {
+    stopGenerateTicker();
     generating = false;
     $('generate-btn').disabled = false;
     $('stop-btn').hidden = true;
