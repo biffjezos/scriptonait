@@ -1450,6 +1450,7 @@ const HISTORY_COLUMNS = [
   ['gap', (r) => r.gap, (v) => (v === null ? '—' : v.toFixed(3))],
   ['bits/byte', (r) => r.bitsPerByte, (v) => (v > 0 ? v.toFixed(3) : '—')],
   ['lr', (r) => r.lr, (v) => v.toExponential(2)],
+  ['schedule', (r) => r.scheduleMode, (v) => v || '—'],
   ['x sched', (r) => r.plateauScale, (v) => v.toFixed(2)],
   ['|grad|', (r) => r.gradNorm, (v) => v.toFixed(2)],
   ['tok/s', (r) => r.tokensPerSecond, (v) => Math.round(v).toLocaleString()],

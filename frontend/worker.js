@@ -119,6 +119,23 @@ function heldOutNoise(series, window) {
   return Math.max(spread, PLATEAU_MIN_DELTA, mean * PLATEAU_RELATIVE_FLOOR);
 }
 
+/// The next step at which an `interval`-spaced cadence (metrics, samples,
+/// autosave) is due, aligned to absolute step 0 rather than to whenever
+/// this happened to be called from.
+///
+/// A run measuring every 500 steps that gets stopped and restarted at
+/// step 34,334 should still land its next measurement at 34,500 — the
+/// same grid an uninterrupted run would have used — not at 34,834
+/// (34,334 + 500), which is what "call again in one interval" produces
+/// instead of "call again on the grid this cadence has always been on."
+/// Used both to seed a fresh run's first deadline and to reschedule the
+/// next one after each firing, so a slice's overshoot past the exact
+/// aligned step can never knock the grid itself out of alignment.
+function nextOnGrid(step, interval) {
+  if (!(interval > 0)) return Infinity;
+  return (Math.floor(step / interval) + 1) * interval;
+}
+
 /// How many held-out windows the validation set holds, and how often it
 /// is measured.
 ///
@@ -1213,7 +1230,7 @@ async function train({
   let tokensPerStep = live.batchSize * info.context_len;
   // First sample after the first interval, not immediately: a sample at
   // step 0 is noise from an untouched model.
-  let nextSampleAt = llm.step() + (live.sampleEvery || 0);
+  let nextSampleAt = nextOnGrid(llm.step(), live.sampleEvery);
   // Held-out loss on the same cadence as the loss chart's own reporting:
   // often enough to see the two curves separate, rare enough that its
   // forward passes are a rounding error against training. A Settings-tab
@@ -1225,10 +1242,10 @@ async function train({
       `${VALIDATION_WINDOWS} windows (${VALIDATION_WINDOWS * info.context_len} tokens), the ` +
       'same windows each time — so two measurements differ only because the weights differ',
   );
-  let nextValidateAt = llm.step() + live.validateEvery;
+  let nextValidateAt = nextOnGrid(llm.step(), live.validateEvery);
   // Counted from where this run starts, so a model at step 4,441 does
   // not save on its very first progress report.
-  let nextAutosaveAt = llm.step() + live.autosaveEvery;
+  let nextAutosaveAt = nextOnGrid(llm.step(), live.autosaveEvery);
   let validationLoss = null;
   // Held-out losses in order, so the run can say when more text would
   // help more than more steps.
@@ -1437,7 +1454,7 @@ async function train({
 
     // Held-out loss, between slices for the same reason sampling is.
     if (llm.step() >= nextValidateAt) {
-      nextValidateAt = llm.step() + live.validateEvery;
+      nextValidateAt = nextOnGrid(llm.step(), live.validateEvery);
       try {
         const measured = await llm.validation_loss(VALIDATION_WINDOWS);
         // The comparable training number: the same number of windows,
@@ -1564,6 +1581,13 @@ async function train({
               tokensPerStep,
               phase: lastPhase,
               quality: lastQuality,
+              // 'wsd' | 'cosine-cuts' | 'cosine' — see the Settings tab's
+              // Scheduler panel. Recorded per row, not just in the
+              // run-started event, so a row from after a schedule switch
+              // mid-run (this session's own cosine-decay test, for one)
+              // says which mode it was measured under instead of leaving
+              // that only inferable from the event log.
+              scheduleMode: live.scheduleMode,
             });
           }
           const advice = corpusAdvice(heldOut, trainingProbe, JSON.parse(llm.training_plan()).tokensSeen);
@@ -1589,7 +1613,7 @@ async function train({
     // last produced, which looks exactly like a model that stopped
     // getting better.
     if (llm.step() >= nextAutosaveAt) {
-      nextAutosaveAt = llm.step() + live.autosaveEvery;
+      nextAutosaveAt = nextOnGrid(llm.step(), live.autosaveEvery);
       const savedAt = performance.now();
       try {
         const bytes = await llm.export_checkpoint();
@@ -1609,9 +1633,10 @@ async function train({
     // Between slices, never inside one: sampling takes as long as it
     // takes and shouldn't be counted against a slice's time budget.
     // Keyed on the model's own step count, so the interval means the
-    // same thing across stop/resume.
+    // same thing across stop/resume — and on the same absolute grid
+    // nextOnGrid keeps it on, so a restart doesn't shift it either.
     if (live.sampleEvery > 0 && llm.step() >= nextSampleAt) {
-      nextSampleAt = llm.step() + live.sampleEvery;
+      nextSampleAt = nextOnGrid(llm.step(), live.sampleEvery);
       if (inferenceDevice === 'cpu') {
         // CPU generation never pulls weights off the GPU on its own (see
         // WasmLLM::generate) - that's what makes it race-free, but left
