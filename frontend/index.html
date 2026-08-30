@@ -40,6 +40,8 @@
           <div class="col-auto">
             <button id="new-project-btn" type="button" class="btn btn-secondary secondary">New Project</button>
           </div>
+        </div>
+        <div class="row g-2 mb-2">
           <div class="col-auto">
             <button id="export-btn" type="button" class="btn btn-secondary secondary">Save</button>
           </div>
@@ -230,10 +232,6 @@
           <div class="col-auto">
             <button id="stop-btn" type="button" class="btn btn-secondary secondary" hidden>Stop</button>
           </div>
-          <div class="col-auto form-check">
-            <input type="checkbox" id="notify-toggle" class="form-check-input" />
-            <label class="form-check-label" for="notify-toggle">Notify me when it's done</label>
-          </div>
         </div>
 
         <div id="generate-status" class="job-status" hidden>
@@ -329,13 +327,14 @@
                 <label class="form-label" for="training-window-chars">Max characters</label>
                 <input type="number" id="training-window-chars" class="form-control" value="200" min="10" max="2000" />
               </div>
-              <div class="col-sm-6 col-md-4 form-check pt-4">
-                <input type="checkbox" id="sample-toggle" class="form-check-input" />
-                <label class="form-check-label" for="sample-toggle">Sample every</label>
-              </div>
               <div class="col-sm-6 col-md-4">
-                <label class="form-label" for="sample-every">Sample steps</label>
-                <input type="number" id="sample-every" class="form-control" value="50" min="1" max="100000" />
+                <label class="form-label" for="sample-every">Sample every</label>
+                <div class="input-group">
+                  <div class="input-group-text">
+                    <input type="checkbox" id="sample-toggle" class="form-check-input mt-0" aria-label="Sample every, on or off" />
+                  </div>
+                  <input type="number" id="sample-every" class="form-control" value="50" min="1" max="100000" />
+                </div>
               </div>
             </div>
           </div>
@@ -379,51 +378,55 @@
           <summary class="card-header">Auto-save</summary>
           <div class="card-body">
             <div class="settings-grid row g-3">
-              <div class="col-sm-6 col-md-3">
+              <div class="col-sm-6 col-md-4">
                 <label class="form-label" for="autosave-enabled">Auto-save</label>
                 <select id="autosave-enabled" class="form-select">
                   <option value="on" selected>On</option>
                   <option value="off">Off</option>
                 </select>
               </div>
-              <div class="col-sm-6 col-md-3">
+              <div class="col-sm-6 col-md-4">
                 <label class="form-label" for="autosave-frequency">Frequency (steps)</label>
                 <input type="number" id="autosave-frequency" class="form-control" value="1000" min="1" />
               </div>
-              <div class="col-sm-6 col-md-3">
+              <div class="col-sm-6 col-md-4">
                 <label class="form-label" for="autosave-mode">Mode</label>
                 <select id="autosave-mode" class="form-select">
                   <option value="overwrite" selected>Overwrite</option>
                   <option value="add">Add</option>
                 </select>
               </div>
-              <div class="col-sm-6 col-md-3">
-                <label class="form-label" for="autosave-filename">File name</label>
-                <input type="text" id="autosave-filename" class="form-control" placeholder="scriptonait" />
-              </div>
             </div>
-            <p class="hint" id="autosave-mode-hint"></p>
-            <div class="row g-2 align-items-center">
-              <div class="col-auto">
-                <span id="autosave-status" class="hint">File: not set.</span>
-              </div>
-              <div class="col-auto">
+            <div class="mb-2">
+              <label class="form-label" for="autosave-filename">File name</label>
+              <div class="input-group">
+                <input type="text" id="autosave-filename" class="form-control" placeholder="scriptonait" />
                 <button id="autosave-file-btn" type="button" class="btn btn-secondary secondary">Choose…</button>
               </div>
             </div>
+            <p class="hint" id="autosave-mode-hint"></p>
+            <p id="autosave-status" class="hint">File: not set.</p>
           </div>
         </details>
 
-        <details class="advanced card mb-3" id="remote-backend-panel" open>
-          <summary class="card-header">Remote Backend</summary>
+        <details class="advanced card mb-3" id="training-backend-panel" open>
+          <summary class="card-header">Training</summary>
           <div class="card-body">
-            <div class="mb-3">
-              <label class="form-label" for="training-device">Training device</label>
-              <select id="training-device" class="form-select">
-                <option value="gpu" selected>GPU</option>
-                <option value="cpu" disabled>CPU (needs a GPU)</option>
-                <option value="remote">Remote</option>
-              </select>
+            <div class="settings-grid row g-3">
+              <div class="col-sm-6 col-md-4">
+                <label class="form-label" for="training-device">Location</label>
+                <select id="training-device" class="form-select">
+                  <option value="gpu" selected>Local</option>
+                  <option value="remote">Remote</option>
+                </select>
+              </div>
+              <div class="col-sm-6 col-md-4">
+                <label class="form-label" for="training-compute">Device</label>
+                <select id="training-compute" class="form-select">
+                  <option value="gpu" selected>GPU</option>
+                  <option value="cpu" disabled>CPU (needs a GPU)</option>
+                </select>
+              </div>
             </div>
             <div class="row g-2 align-items-center" id="remote-server-settings" hidden>
               <div class="col-auto">
@@ -450,6 +453,13 @@
           <summary class="card-header">Inference</summary>
           <div class="card-body">
             <div class="settings-grid row g-3">
+              <div class="col-sm-6 col-md-4">
+                <label class="form-label" for="inference-location">Location</label>
+                <select id="inference-location" class="form-select">
+                  <option value="local" selected>Local</option>
+                  <option value="remote" disabled>Remote (not available yet)</option>
+                </select>
+              </div>
               <div class="col-sm-6 col-md-4">
                 <label class="form-label" for="inference-device">Device</label>
                 <select id="inference-device" class="form-select">
