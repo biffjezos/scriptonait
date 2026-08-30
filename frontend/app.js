@@ -1262,15 +1262,15 @@ onStream('train-progress', (progress) => {
       ? ''
       : describeBatchSources(progress.sources, Number($('training-window-chars').value));
   setTitleProgress('Fine-tuning', progress.fractionDone);
-  lossHistory.push(progress.smoothedLoss);
+  lossHistory.push({ step: progress.step, loss: progress.smoothedLoss });
   if (
     typeof progress.validationLoss === 'number' &&
     (validationHistory.length === 0 ||
       validationHistory[validationHistory.length - 1].loss !== progress.validationLoss)
   ) {
-    validationHistory.push({ at: lossHistory.length - 1, loss: progress.validationLoss });
+    validationHistory.push({ at: progress.step, loss: progress.validationLoss });
     if (typeof progress.trainingProbe === 'number' && progress.trainingProbe >= 0) {
-      probeHistory.push({ at: lossHistory.length - 1, loss: progress.trainingProbe });
+      probeHistory.push({ at: progress.step, loss: progress.trainingProbe });
     }
   }
   drawLossChart();
@@ -1513,9 +1513,13 @@ const samples = () => history.filter((r) => r.kind === 'sample');
 /// never read back into the arrays drawLossChart reads from.
 ///
 /// Measurements come far sparser than the live per-tick training curve
-/// did (once every `metricsEvery` steps, not every progress tick), so
-/// the restored curve is coarser than what live training draws — but
-/// it is the run's real shape, not a guess at one.
+/// did (once every `metricsEvery` steps, not every progress tick) —
+/// each point here carries its own step number rather than relying on
+/// array position to stand in for one, which is what let a resumed
+/// run's much denser live ticks warp the x-axis against this coarser
+/// rebuilt portion (500 steps per point here, roughly 1 per point once
+/// live training resumed — the same index space, two very different
+/// meanings).
 function rebuildChartFromHistory() {
   lossHistory.length = 0;
   validationHistory.length = 0;
@@ -1524,12 +1528,12 @@ function rebuildChartFromHistory() {
     .filter((r) => typeof r.loss === 'number')
     .sort((a, b) => a.step - b.step);
   for (const row of rows) {
-    lossHistory.push(row.loss);
+    lossHistory.push({ step: row.step, loss: row.loss });
     if (typeof row.heldOut === 'number') {
-      validationHistory.push({ at: lossHistory.length - 1, loss: row.heldOut });
+      validationHistory.push({ at: row.step, loss: row.heldOut });
     }
     if (typeof row.probe === 'number' && row.probe >= 0) {
-      probeHistory.push({ at: lossHistory.length - 1, loss: row.probe });
+      probeHistory.push({ at: row.step, loss: row.probe });
     }
   }
   if (lossHistory.length > 0) $('loss-chart').hidden = false;
@@ -2485,6 +2489,7 @@ function drawLossChart() {
 
   const plotTop = topBand;
   const points = lossHistory
+    .map((p) => p.loss)
     .concat(validationHistory.map((p) => p.loss))
     .concat(probeHistory.map((p) => p.loss));
   const min = Math.min(...points);
@@ -2493,19 +2498,32 @@ function drawLossChart() {
   const plotSpan = height - plotTop - 12;
   const yFor = (loss) => height - ((loss - min) / span) * plotSpan - 6;
 
+  // By step number, not array position: a rebuilt-from-history point
+  // (one every `metricsEvery` steps) and a live progress tick (roughly
+  // one per step) sit at wildly different densities in the same array,
+  // and index-based x-positions stretched whichever portion was denser
+  // across most of the chart's width regardless of how many actual
+  // steps it covered.
+  const steps = lossHistory.map((p) => p.step);
+  const minStep = Math.min(...steps);
+  const maxStep = Math.max(...steps);
+  const stepSpan = maxStep - minStep || 1;
+  const xFor = (step) => ((step - minStep) / stepSpan) * width;
+
   ctx.strokeStyle = '#7aa2f7';
   ctx.lineWidth = 2;
   ctx.beginPath();
-  lossHistory.forEach((loss, i) => {
-    const x = (i / (lossHistory.length - 1)) * width;
-    const y = yFor(loss);
+  lossHistory.forEach((point, i) => {
+    const x = xFor(point.step);
+    const y = yFor(point.loss);
     if (i === 0) ctx.moveTo(x, y);
     else ctx.lineTo(x, y);
   });
   ctx.stroke();
 
-  /// Both fixed-set curves, positioned by where in the run they were
-  /// measured so they line up in time rather than by index.
+  /// Both fixed-set curves, positioned by the step they were measured
+  /// at so they line up in time with the curve above rather than by
+  /// index.
   const drawMeasured = (series, colour, dashed) => {
     if (series.length < 2) return;
     ctx.strokeStyle = colour;
@@ -2513,7 +2531,7 @@ function drawLossChart() {
     ctx.setLineDash(dashed ? [4, 3] : []);
     ctx.beginPath();
     series.forEach((point, i) => {
-      const x = (point.at / Math.max(lossHistory.length - 1, 1)) * width;
+      const x = xFor(point.at);
       const y = yFor(point.loss);
       if (i === 0) ctx.moveTo(x, y);
       else ctx.lineTo(x, y);
