@@ -2034,11 +2034,77 @@ $('train-mode').addEventListener('change', applyTrainMode);
 // every page load. start() calls it once, unconditionally, after every
 // module-level `let` above has run — see applyLoadedSettings().
 
+/// The wire value worker.js/llm.set_schedule_kind still expect — 'wsd'
+/// only for a deferred cooldown, 'cosine-cuts' for reactive plateau-cuts
+/// (which always run against an immediate cooldown; see
+/// applySchedulerCompatibility), 'cosine' otherwise. Kept as one string
+/// rather than widening the wasm/worker protocol, since Rust only ever
+/// distinguishes "wsd" from "not wsd" and worker.js only ever asks "is
+/// this 'cosine-cuts'" — see llm-core::train::ScheduleKind and this
+/// file's own set_schedule_kind doc comment.
+function scheduleModeFromAxes({ stablePhase, cooldownShape }) {
+  if (stablePhase === 'reactive-cuts') return 'cosine-cuts';
+  return cooldownShape === 'deferred' ? 'wsd' : 'cosine';
+}
+
+/// The reverse of scheduleModeFromAxes, for a project saved before the
+/// four axes existed — its only record of the schedule is this string.
+function axesFromScheduleMode(scheduleMode) {
+  if (scheduleMode === 'cosine-cuts') {
+    return { stablePhase: 'reactive-cuts', cooldownShape: 'immediate', cooldownTiming: 'fixed', planLength: 'fixed' };
+  }
+  if (scheduleMode === 'cosine') {
+    return { stablePhase: 'flat', cooldownShape: 'immediate', cooldownTiming: 'fixed', planLength: 'fixed' };
+  }
+  return { stablePhase: 'flat', cooldownShape: 'deferred', cooldownTiming: 'fixed', planLength: 'fixed' };
+}
+
+/// Which of the other Manual-mode scheduler selects a given choice rules
+/// out, and what to coerce them to rather than leave them on a value
+/// that no longer means anything. Reactive plateau-cuts is the one
+/// combination with a documented failure mode when layered on top of a
+/// deferred cooldown or an adaptively-extended plan — this session's own
+/// plateau-cut death spiral — so it forces both back to the simple,
+/// well-tested shape today's "cosine-cuts" already is, rather than
+/// leaving a combination reachable that this app has already seen fail.
+function applySchedulerCompatibility() {
+  const reactive = $('stable-phase').value === 'reactive-cuts';
+
+  $('cooldown-shape').disabled = reactive;
+  if (reactive) $('cooldown-shape').value = 'immediate';
+
+  const deferred = $('cooldown-shape').value === 'deferred' && !reactive;
+  $('cooldown-timing').disabled = !deferred;
+  if (!deferred) $('cooldown-timing').value = 'fixed';
+
+  $('plan-length').disabled = reactive;
+  if (reactive) $('plan-length').value = 'fixed';
+}
+
+/// Auto owns every scheduler axis; Manual hands them back, subject to
+/// applySchedulerCompatibility's rules. Mirrors applyTrainMode exactly.
+function applySchedulerMode() {
+  const manual = $('scheduler-mode').value === 'manual';
+  for (const id of ['warmup-strategy', 'stable-phase', 'cooldown-shape', 'cooldown-timing', 'plan-length']) {
+    $(id).disabled = !manual;
+  }
+  if (manual) applySchedulerCompatibility();
+  updateGuidance();
+}
+$('scheduler-mode').addEventListener('change', applySchedulerMode);
+for (const id of ['stable-phase', 'cooldown-shape']) {
+  $(id).addEventListener('change', applySchedulerCompatibility);
+}
+
 /// Everything on this tab that used to reset to the markup's hardcoded
 /// defaults on every reload. Written through on change, loaded back at
 /// startup (see `start()`) — the same immediately-applied pattern the
 /// other Settings-tab controls already use.
 async function persistTrainingPlanSettings() {
+  const axes = {
+    stablePhase: $('stable-phase').value,
+    cooldownShape: $('cooldown-shape').value,
+  };
   await db.putTrainingPlanSettings({
     mode: $('train-mode').value,
     plannedSteps: Number($('train-steps').value) || 0,
@@ -2051,13 +2117,22 @@ async function persistTrainingPlanSettings() {
     metricsEvery: Number($('metrics-every').value) || 0,
     showTrainingWindow: $('show-training-window').value !== 'off',
     trainingWindowChars: Number($('training-window-chars').value) || 0,
-    scheduleMode: $('schedule-mode').value,
+    schedulerMode: $('scheduler-mode').value,
+    warmupStrategy: $('warmup-strategy').value,
+    stablePhase: axes.stablePhase,
+    cooldownShape: axes.cooldownShape,
+    cooldownTiming: $('cooldown-timing').value,
+    planLength: $('plan-length').value,
+    // Kept alongside the axes above (not only derivable from them) so a
+    // project this file writes still opens correctly in a build from
+    // before the axes existed.
+    scheduleMode: scheduleModeFromAxes(axes),
   });
 }
 for (const id of [
   'train-mode', 'train-steps', 'train-effort', 'train-batch', 'train-lr', 'sample-toggle',
   'sample-every', 'opening-rate', 'metrics-every', 'show-training-window', 'training-window-chars',
-  'schedule-mode',
+  'scheduler-mode', 'warmup-strategy', 'stable-phase', 'cooldown-shape', 'cooldown-timing', 'plan-length',
 ]) {
   $(id).addEventListener('change', () =>
     withNotice('Saving setting', 'Setting saved', persistTrainingPlanSettings));
@@ -2114,7 +2189,11 @@ function readTrainingSettings() {
     // too high; there is nothing that catches one that is too low
     // except hours of your time.
     peakLearningRate: manualMode ? Number($('train-lr').value) : (fromScratch ? 6e-4 : 5e-5),
-    scheduleMode: $('schedule-mode').value,
+    scheduleMode: scheduleModeFromAxes({
+      stablePhase: $('stable-phase').value,
+      cooldownShape: $('cooldown-shape').value,
+    }),
+    warmupVariance: $('warmup-strategy').value === 'variance',
     boundarySampleRate: Number($('opening-rate').value) / 100,
     autosaveFrequencySteps: Math.max(1, Number($('autosave-frequency').value) || 1000),
     metricsEvery: Number($('metrics-every').value) || 0,
@@ -2150,8 +2229,8 @@ function pushLiveTrainingSettings() {
 for (const id of [
   'train-mode', 'train-steps', 'train-effort', 'train-batch', 'train-lr', 'opening-rate',
   'sample-toggle', 'sample-every', 'metrics-every', 'autosave-frequency', 'prompt-input',
-  'schedule-mode', 'opt-temperature', 'opt-top-k', 'opt-top-p', 'opt-min-p', 'opt-repetition',
-  'opt-length-mode', 'opt-max-tokens',
+  'warmup-strategy', 'stable-phase', 'cooldown-shape', 'opt-temperature', 'opt-top-k', 'opt-top-p',
+  'opt-min-p', 'opt-repetition', 'opt-length-mode', 'opt-max-tokens',
 ]) {
   $(id).addEventListener('change', pushLiveTrainingSettings);
 }
@@ -3451,7 +3530,23 @@ async function applyLoadedSettings() {
       if (planSettings.trainingWindowChars > 0) {
         $('training-window-chars').value = String(planSettings.trainingWindowChars);
       }
-      if (planSettings.scheduleMode) $('schedule-mode').value = planSettings.scheduleMode;
+      // The four axes directly, if this project was saved after they
+      // existed; otherwise derived from the old scheduleMode string, so
+      // nothing about the schedule resets on a project saved before them.
+      const axes = planSettings.stablePhase
+        ? {
+            stablePhase: planSettings.stablePhase,
+            cooldownShape: planSettings.cooldownShape,
+            cooldownTiming: planSettings.cooldownTiming || 'fixed',
+            planLength: planSettings.planLength || 'fixed',
+          }
+        : axesFromScheduleMode(planSettings.scheduleMode);
+      $('scheduler-mode').value = planSettings.schedulerMode === 'manual' ? 'manual' : 'auto';
+      $('warmup-strategy').value = planSettings.warmupStrategy === 'variance' ? 'variance' : 'plan';
+      $('stable-phase').value = axes.stablePhase;
+      $('cooldown-shape').value = axes.cooldownShape;
+      $('cooldown-timing').value = axes.cooldownTiming;
+      $('plan-length').value = axes.planLength;
     }
   } catch (error) {
     console.warn('[scriptonait] could not read training-plan settings', error);
@@ -3479,6 +3574,7 @@ async function applyLoadedSettings() {
   // Unconditional: the Batch/Effort/Learning-rate disabled state has to
   // be set correctly on every load, not only when saved settings exist.
   applyTrainMode();
+  applySchedulerMode();
 }
 
 (async function start() {

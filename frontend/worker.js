@@ -1064,6 +1064,10 @@ const live = {
   // same shape and differ only in whether this file reacts to a
   // plateau on top of it.
   scheduleMode: 'wsd',
+  // Which formula `set_project_plan` uses for warmup length — see the
+  // Settings tab's Warm-up control and `set_warmup_strategy`. `false` is
+  // the existing 2%-of-plan heuristic every plan has used until now.
+  warmupVariance: false,
 };
 
 /// One place both `train()` (seeding from the settings a run started
@@ -1076,8 +1080,16 @@ const live = {
 function applyLiveSettings({
   batchSize, maxSteps, effort, peakLearningRate, scheduleMode, boundarySampleRate,
   autosaveFrequencySteps, metricsEvery, sampleEvery, samplePrompt, sampleMaxTokens, sampling,
+  warmupVariance,
 } = {}) {
   if (typeof batchSize === 'number' && batchSize > 0) live.batchSize = batchSize;
+  // Before `maxSteps` below: set_project_plan reads this same strategy
+  // flag to compute warmup_steps, so the plan has to see the flag's new
+  // value, not the one it's about to replace.
+  if (typeof warmupVariance === 'boolean' && llm) {
+    live.warmupVariance = warmupVariance;
+    llm.set_warmup_strategy(warmupVariance);
+  }
   if (typeof maxSteps === 'number') {
     live.maxSteps = maxSteps;
     // The whole project's planned length, not just this sitting —
@@ -1149,6 +1161,7 @@ function applyLiveSettings({
 async function train({
   batchSize, peakLearningRate, maxSteps, effort, scheduleMode, sampleEvery, samplePrompt,
   sampleMaxTokens, sampling, autosaveFrequencySteps, metricsEvery, boundarySampleRate,
+  warmupVariance,
 }) {
   // The exact same call a mid-run settings change makes — see
   // `applyLiveSettings`'s own doc comment. Starting a run is that
@@ -1156,6 +1169,7 @@ async function train({
   applyLiveSettings({
     batchSize, maxSteps, effort, peakLearningRate, scheduleMode, boundarySampleRate,
     autosaveFrequencySteps, metricsEvery, sampleEvery, samplePrompt, sampleMaxTokens, sampling,
+    warmupVariance,
   });
   stopRequested = false;
   training = true;

@@ -283,16 +283,58 @@
           </div>
         </details>
 
-        <details class="advanced card mb-3" id="schedule-panel" open>
-          <summary class="card-header">Schedule <span class="badge text-bg-secondary">live</span></summary>
+        <details class="advanced card mb-3" id="scheduler-mode-panel" open>
+          <summary class="card-header">Scheduler</summary>
           <div class="card-body">
             <div class="mb-0">
-              <label class="form-label" for="schedule-mode">Schedule</label>
-              <select id="schedule-mode" class="form-select">
-                <option value="wsd" selected>Warmup-Stable-Decay</option>
-                <option value="cosine-cuts">Cosine + rate cuts</option>
-                <option value="cosine">Cosine</option>
+              <label class="form-label" for="scheduler-mode">Mode</label>
+              <select id="scheduler-mode" class="form-select">
+                <option value="auto" selected>Auto</option>
+                <option value="manual">Manual</option>
               </select>
+            </div>
+          </div>
+        </details>
+
+        <details class="advanced card mb-3" id="scheduler-manual-panel" open>
+          <summary class="card-header">Scheduler Settings <span class="badge text-bg-secondary">Manual mode only</span></summary>
+          <div class="card-body">
+            <div class="settings-grid row g-3">
+              <div class="col-sm-6 col-md-4">
+                <label class="form-label" for="warmup-strategy">Warm-up</label>
+                <select id="warmup-strategy" class="form-select">
+                  <option value="plan" selected>Plan-based (2% of steps)</option>
+                  <option value="variance">Variance-based (RAdam)</option>
+                </select>
+              </div>
+              <div class="col-sm-6 col-md-4">
+                <label class="form-label" for="stable-phase">Stable phase</label>
+                <select id="stable-phase" class="form-select">
+                  <option value="flat" selected>Flat</option>
+                  <option value="reactive-cuts">Reactive rate cuts</option>
+                </select>
+              </div>
+              <div class="col-sm-6 col-md-4">
+                <label class="form-label" for="cooldown-shape">Cool-down</label>
+                <select id="cooldown-shape" class="form-select">
+                  <option value="deferred" selected>Deferred (Warmup-Stable-Decay)</option>
+                  <option value="immediate">Immediate (Cosine)</option>
+                </select>
+              </div>
+              <div class="col-sm-6 col-md-4">
+                <label class="form-label" for="cooldown-timing">Cool-down timing</label>
+                <select id="cooldown-timing" class="form-select">
+                  <option value="fixed" selected>Fixed fraction</option>
+                  <option value="adaptive">Adaptive</option>
+                </select>
+              </div>
+              <div class="col-sm-6 col-md-4">
+                <label class="form-label" for="plan-length">Plan length</label>
+                <select id="plan-length" class="form-select">
+                  <option value="fixed" selected>Fixed</option>
+                  <option value="adaptive-extend">Adaptive, extends</option>
+                </select>
+              </div>
             </div>
           </div>
         </details>

@@ -147,6 +147,13 @@ struct Inner {
     /// write" and "this model needs training first", which the UI has to
     /// say out loud.
     pretrained: bool,
+    /// Which formula `set_project_plan` uses for `warmup_steps`: the
+    /// existing 2%-of-plan heuristic (`false`, `TrainConfig::warmup_for`)
+    /// or RAdam's own derivation from `beta2` (`true`,
+    /// `TrainConfig::warmup_for_variance`). A session-only preference,
+    /// not part of `TrainConfig` itself — it picks which formula runs,
+    /// it isn't a number the schedule's own math needs at every step.
+    warmup_variance: bool,
 }
 
 #[wasm_bindgen]

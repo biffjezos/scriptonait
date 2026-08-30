@@ -4,6 +4,16 @@ use crate::config::ModelConfig;
 
 use super::{Gradients, ModelWeights};
 
+/// AdamW's exponential-decay rates and numerical floor. Named so a
+/// formula that needs one of them (the RAdam-derived warm-up length in
+/// `train::TrainConfig::warmup_for_variance`, for instance) reads from
+/// here instead of a fourth inline copy — `crates/llm-gpu/src/shaders/
+/// adam_update.wgsl` already mirrors these same three numbers as its own
+/// `BETA1`/`BETA2`/`EPS` consts, since WGSL can't import a Rust constant.
+pub const ADAM_BETA1: f32 = 0.9;
+pub const ADAM_BETA2: f32 = 0.95;
+pub const ADAM_EPS: f32 = 1e-8;
+
 /// Rescale `grads` in place so its global L2 norm is at most
 /// `max_norm`, and return the norm it had before clipping.
 ///
@@ -58,7 +68,7 @@ impl AdamState {
     /// residual stream for no benefit.
     pub fn step(&mut self, weights: &mut ModelWeights, grads: &Gradients, lr: f32, weight_decay: f32) {
         self.t += 1;
-        let (beta1, beta2, eps) = (0.9f32, 0.95f32, 1e-8f32);
+        let (beta1, beta2, eps) = (ADAM_BETA1, ADAM_BETA2, ADAM_EPS);
         let bias1 = 1.0 - beta1.powi(self.t);
         let bias2 = 1.0 - beta2.powi(self.t);
 

@@ -136,6 +136,21 @@ impl TrainConfig {
         (total_steps / 50).clamp(10, 200).min(total_steps.max(1) / 2)
     }
 
+    /// Warmup length from RAdam's own derivation (Liu et al. 2019): the
+    /// point at which Adam's second-moment estimate has taken in enough
+    /// samples for its variance to have settled, `2 / (1 - beta2)`. With
+    /// this crate's own `beta2` (`model::ADAM_BETA2`, 0.95) that's 40
+    /// steps, independent of how long the run is planned to be — unlike
+    /// `warmup_for`'s 2%-of-plan heuristic, which is what this app has
+    /// used until now. Clamped the same way `warmup_for` is (same floor
+    /// and ceiling, never more than half the plan) so the two are
+    /// interchangeable from a caller's point of view; see the Settings
+    /// tab's Warm-up strategy control.
+    pub fn warmup_for_variance(total_steps: u64) -> u64 {
+        let raw = (2.0 / (1.0 - crate::model::ADAM_BETA2)).round() as u64;
+        raw.clamp(10, 200).min(total_steps.max(1) / 2)
+    }
+
     /// Learning rate for `step` (0-based): linear warmup, then cosine
     /// decay to `min_lr_ratio * lr`.
     /// `step` is the model's lifetime step; the schedule is shaped
@@ -750,5 +765,16 @@ mod tests {
         assert_eq!(TrainConfig::warmup_for(5_000), 100, "2% of 5,000");
         assert_eq!(TrainConfig::warmup_for(23_000), 200, "2% of 23,000 is 460, clamped to the ceiling");
         assert_eq!(TrainConfig::warmup_for(15), 7, "never more than half a very short plan");
+    }
+
+    #[test]
+    fn warmup_for_variance_is_a_fixed_length_from_beta2_clamped_the_same_way() {
+        // 2 / (1 - 0.95) = 40, independent of total_steps, for any plan
+        // long enough that half of it isn't the binding constraint.
+        assert_eq!(TrainConfig::warmup_for_variance(0), 0, "a zero-length plan has no room for warmup");
+        assert_eq!(TrainConfig::warmup_for_variance(100), 40);
+        assert_eq!(TrainConfig::warmup_for_variance(5_000), 40);
+        assert_eq!(TrainConfig::warmup_for_variance(23_000), 40, "fixed by beta2, not the plan length");
+        assert_eq!(TrainConfig::warmup_for_variance(15), 7, "never more than half a very short plan");
     }
 }
