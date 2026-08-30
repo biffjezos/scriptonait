@@ -1,0 +1,64 @@
+name: Build llm-server binaries (Windows + Linux)
+
+# crates/llm-server (see its own Cargo.toml/main.rs) is a native binary
+# meant to run on the user's own GPU machine — not something everyone
+# wants to install a Rust toolchain just to build themselves. This
+# workflow builds it in release mode for Windows and Linux on GitHub's
+# own hosted runners (which have a real toolchain and a route to
+# crates.io, unlike this project's own development sandbox) and uploads
+# the result as a downloadable artifact on each run.
+#
+# Like native-probe.yml's Windows build, these runners have no real GPU:
+# this only proves the binary compiles. Whether a real adapter turns up
+# is answered wherever the downloaded binary is actually run — on your
+# own machine, against your own GPU.
+
+on:
+  # Scoped to this branch, where llm-server actually lives right now —
+  # same reasoning as native-probe.yml's own branch scoping. Move this to
+  # wherever llm-server's development settles once it's not this branch.
+  push:
+    branches:
+      - claude/code-review-cleanup-oa20zx
+  workflow_dispatch:
+
+concurrency:
+  group: llm-server-build
+  cancel-in-progress: true
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - os: windows-latest
+            artifact: llm-server-windows
+            binary: llm-server.exe
+          - os: ubuntu-latest
+            artifact: llm-server-linux
+            binary: llm-server
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        # No explicit target: the runner's own host default
+        # (x86_64-pc-windows-msvc / x86_64-unknown-linux-gnu) is exactly
+        # what's wanted here.
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates/llm-server
+
+      - name: Build
+        run: cargo build --release --manifest-path crates/llm-server/Cargo.toml
+
+      - name: Upload the binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: crates/llm-server/target/release/${{ matrix.binary }}
+          if-no-files-found: error
