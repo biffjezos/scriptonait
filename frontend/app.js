@@ -2077,6 +2077,8 @@ async function persistTrainingPlanSettings() {
     mode: $('train-mode').value,
     plannedSteps: Number($('train-steps').value) || 0,
     effort: $('train-effort').value,
+    batchSize: Number($('train-batch').value) || 0,
+    learningRate: Number($('train-lr').value) || 0,
     sampleToggle: $('sample-toggle').checked,
     sampleEvery: Number($('sample-every').value) || 0,
     boundarySampleRate: Number($('opening-rate').value) / 100,
@@ -2087,10 +2089,33 @@ async function persistTrainingPlanSettings() {
   });
 }
 for (const id of [
-  'train-mode', 'train-steps', 'train-effort', 'sample-toggle', 'sample-every',
-  'opening-rate', 'metrics-every', 'show-training-window', 'training-window-chars', 'schedule-mode',
+  'train-mode', 'train-steps', 'train-effort', 'train-batch', 'train-lr', 'sample-toggle',
+  'sample-every', 'opening-rate', 'metrics-every', 'show-training-window', 'training-window-chars',
+  'schedule-mode',
 ]) {
   $(id).addEventListener('change', persistTrainingPlanSettings);
+}
+
+/// Every field the Settings tab's Inference panel owns beyond the two
+/// device selects (inference-device/training-device already have their
+/// own persistence): sampling, seed, and the length-mode/max-tokens pair.
+async function persistInferenceOptions() {
+  await db.putInferenceOptions({
+    temperature: Number($('opt-temperature').value),
+    topK: Number($('opt-top-k').value),
+    topP: Number($('opt-top-p').value),
+    minP: Number($('opt-min-p').value),
+    repetitionPenalty: Number($('opt-repetition').value),
+    seed: Number($('opt-seed').value) || 0,
+    lengthMode: $('opt-length-mode').value,
+    maxTokens: Number($('opt-max-tokens').value) || 0,
+  });
+}
+for (const id of [
+  'opt-temperature', 'opt-top-k', 'opt-top-p', 'opt-min-p', 'opt-repetition', 'opt-seed',
+  'opt-length-mode', 'opt-max-tokens',
+]) {
+  $(id).addEventListener('change', persistInferenceOptions);
 }
 
 /// Every setting a training run reads off the Training-Settings and
@@ -2670,6 +2695,7 @@ $('export-project-btn').addEventListener('click', async () => {
         benchmarkConfig: await db.getBenchmarkConfig(),
         trainingPlan: await db.getTrainingPlanSettings(),
         remoteServerConfig: await db.getRemoteServerConfig(),
+        inferenceOptions: await db.getInferenceOptions(),
       },
     });
     console.info(
@@ -2727,6 +2753,7 @@ $('import-project-input').addEventListener('change', async (event) => {
     if (settings.benchmarkConfig) await db.putBenchmarkConfig(settings.benchmarkConfig);
     if (settings.trainingPlan) await db.putTrainingPlanSettings(settings.trainingPlan);
     if (settings.remoteServerConfig) await db.putRemoteServerConfig(settings.remoteServerConfig);
+    if (settings.inferenceOptions) await db.putInferenceOptions(settings.inferenceOptions);
 
     // Before the corpus gets rebuilt, not after: syncAllSources (called
     // below, both directly and inside restoreModel-shaped paths) reads
@@ -2933,6 +2960,7 @@ async function buildProjectBlob(checkpointBytes, optimizerBytes) {
       benchmarkConfig: await db.getBenchmarkConfig(),
       trainingPlan: await db.getTrainingPlanSettings(),
       remoteServerConfig: await db.getRemoteServerConfig(),
+      inferenceOptions: await db.getInferenceOptions(),
     },
   });
 }
@@ -3426,6 +3454,8 @@ async function applyLoadedSettings() {
       $('train-mode').value = planSettings.mode === 'manual' ? 'manual' : 'auto';
       if (planSettings.plannedSteps > 0) $('train-steps').value = String(planSettings.plannedSteps);
       if (planSettings.effort) $('train-effort').value = planSettings.effort;
+      if (planSettings.batchSize > 0) $('train-batch').value = String(planSettings.batchSize);
+      if (planSettings.learningRate > 0) $('train-lr').value = String(planSettings.learningRate);
       $('sample-toggle').checked = !!planSettings.sampleToggle;
       if (planSettings.sampleEvery > 0) $('sample-every').value = String(planSettings.sampleEvery);
       if (typeof planSettings.boundarySampleRate === 'number') {
@@ -3442,6 +3472,26 @@ async function applyLoadedSettings() {
     }
   } catch (error) {
     console.warn('[scriptonait] could not read training-plan settings', error);
+  }
+  try {
+    const inferenceOptions = await db.getInferenceOptions();
+    if (inferenceOptions) {
+      if (typeof inferenceOptions.temperature === 'number') {
+        $('opt-temperature').value = String(inferenceOptions.temperature);
+      }
+      if (typeof inferenceOptions.topK === 'number') $('opt-top-k').value = String(inferenceOptions.topK);
+      if (typeof inferenceOptions.topP === 'number') $('opt-top-p').value = String(inferenceOptions.topP);
+      if (typeof inferenceOptions.minP === 'number') $('opt-min-p').value = String(inferenceOptions.minP);
+      if (typeof inferenceOptions.repetitionPenalty === 'number') {
+        $('opt-repetition').value = String(inferenceOptions.repetitionPenalty);
+      }
+      if (inferenceOptions.seed > 0) $('opt-seed').value = String(inferenceOptions.seed);
+      if (inferenceOptions.lengthMode) $('opt-length-mode').value = inferenceOptions.lengthMode;
+      if (inferenceOptions.maxTokens > 0) $('opt-max-tokens').value = String(inferenceOptions.maxTokens);
+      applyLengthMode();
+    }
+  } catch (error) {
+    console.warn('[scriptonait] could not read inference options', error);
   }
   // Unconditional: the Batch/Effort/Learning-rate disabled state has to
   // be set correctly on every load, not only when saved settings exist.
