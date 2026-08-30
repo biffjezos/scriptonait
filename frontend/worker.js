@@ -480,8 +480,16 @@ function trainingPhase(plan, { heldOut, trainingLoss }) {
   }
 
   // Trend over the held-out curve, on the same window and against the
-  // same noise floor the corpus advice uses, so the two never disagree
-  // about which way the line is going.
+  // same noise floor the corpus advice uses (heldOutNoise, not a second
+  // copy of its math), so the two never disagree about which way the
+  // line is going. They used to: the plateau detector cut the learning
+  // rate in half at step 3,800 while the phase beside it said "held-out
+  // loss still improving", because each read the curve's own spread
+  // through a different formula. heldOutNoise's relative floor also
+  // matters here specifically — a curve that has gone smooth rather than
+  // actually flat has almost no spread of its own, and a noise floor
+  // built only from that spread is what mistook a still-falling curve
+  // for a plateau before.
   //
   // Both are gated on the model having actually been trained. A curve
   // 250 steps into a run is falling off a cliff; the difference between
@@ -494,18 +502,21 @@ function trainingPhase(plan, { heldOut, trainingLoss }) {
   if (heldOut.length >= WINDOW * 2 && plan.tokensSeen >= TOKENS_BEFORE_JUDGING_HELD_OUT) {
     const mean = (xs) => xs.reduce((a, b) => a + b, 0) / xs.length;
     const recent = heldOut.slice(-WINDOW * 2);
-    const m = mean(recent);
-    noise = Math.max(
-      Math.sqrt(recent.reduce((a, b) => a + (b - m) ** 2, 0) / (recent.length - 1)),
-      0.002,
-    );
+    noise = heldOutNoise(heldOut, WINDOW);
     trend = mean(recent.slice(0, WINDOW)) - mean(recent.slice(WINDOW));
   }
   const gap = trainingLoss === null || heldOut.length === 0
     ? null
     : heldOut[heldOut.length - 1] - trainingLoss;
 
-  if (trend !== null && trend < -noise) {
+  // "Overfitting" means the model is favoring memorized training
+  // examples over generalizing, which cannot yet be true of examples the
+  // run has not been through once — below one pass over the corpus, the
+  // same statistical signal (held-out rising faster than its own noise
+  // floor) falls through to the plateau branch below instead, which
+  // already gives the right answer for it: capacity, not data.
+  const epochs = plan.trainingTokens > 0 ? plan.tokensSeen / plan.trainingTokens : 0;
+  if (trend !== null && trend < -noise && epochs >= 1) {
     return {
       key: 'overfitting',
       title: 'Overfitting',
