@@ -28,6 +28,38 @@ use crate::ops;
 #[cfg(feature = "native-trainer")]
 use crate::rng::Rng;
 
+/// The shape a learning-rate schedule takes across a run, once warmup is
+/// done. Orthogonal to `TrainConfig::plateau_scale`: a caller decides
+/// separately whether to *also* apply reactive plateau cuts on top of
+/// whichever shape this picks (see `decay_on_plateau` in wasm-app) —
+/// this only says what the plan itself looks like.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ScheduleKind {
+    /// Linear warmup, then cosine decay across the whole run (GPT-3,
+    /// Chinchilla, ...). Simple and well understood, but every step of
+    /// decay is a bet on `total_steps` being right — a run that ends up
+    /// shorter or longer than planned spends part of it at the wrong
+    /// point on the curve.
+    #[default]
+    Cosine,
+    /// Linear warmup, a long stable phase at the peak rate, then a short
+    /// cosine decay over the final `WSD_DECAY_FRACTION` of the run (Hu
+    /// et al. 2024 / MiniCPM's "Warmup-Stable-Decay"; Hägele et al.
+    /// 2024). The stable phase doesn't commit to when the run ends —
+    /// extending `total_steps` mid-run (this app's "Planned steps"
+    /// field is live-editable) just extends the stable phase rather
+    /// than continuing to decay a curve that was shaped for a shorter
+    /// run. The current standard answer for a run whose length isn't
+    /// fixed far in advance, which describes this app's own training
+    /// loop far better than a committed-up-front cosine does.
+    Wsd,
+}
+
+/// The fraction of a WSD run's `total_steps` spent decaying, at the end.
+/// 10-20% is the range recent WSD literature converges on; 20% is the
+/// more conservative (slower, gentler) end of it.
+pub const WSD_DECAY_FRACTION: f32 = 0.2;
+
 /// Everything about a training step that isn't the model's shape.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct TrainConfig {
@@ -74,6 +106,8 @@ pub struct TrainConfig {
     /// schedule so both are legible: the cosine says where the plan
     /// expected to be, this says what the run actually needed.
     pub plateau_scale: f32,
+    /// The shape the decay takes; see `ScheduleKind`.
+    pub schedule: ScheduleKind,
 }
 
 impl Default for TrainConfig {
@@ -87,6 +121,7 @@ impl Default for TrainConfig {
             grad_clip: 1.0,
             start_step: 0,
             plateau_scale: 1.0,
+            schedule: ScheduleKind::default(),
         }
     }
 }
@@ -110,15 +145,45 @@ impl TrainConfig {
         // Warmup is deliberately not scaled by `plateau_scale`: a cut
         // made mid-warmup would shrink the ramp the run has not finished
         // climbing, and warmup exists precisely to get past the part of
-        // training where the rate cannot be judged yet.
+        // training where the rate cannot be judged yet. Shared by both
+        // schedule shapes below — they differ only in what happens once
+        // warmup is behind the run.
         if self.warmup_steps > 0 && into_run < self.warmup_steps {
             // +1 so the first step isn't a literal zero-size step.
             return self.lr * (into_run + 1) as f32 / self.warmup_steps as f32;
         }
-        let decay_steps = self.total_steps.saturating_sub(self.warmup_steps).max(1);
-        let progress = ((into_run - self.warmup_steps) as f32 / decay_steps as f32).clamp(0.0, 1.0);
+        match self.schedule {
+            ScheduleKind::Cosine => {
+                let decay_steps = self.total_steps.saturating_sub(self.warmup_steps).max(1);
+                let progress =
+                    ((into_run - self.warmup_steps) as f32 / decay_steps as f32).clamp(0.0, 1.0);
+                self.lr * self.decayed_ratio(progress) * self.plateau_scale
+            }
+            ScheduleKind::Wsd => {
+                // Decay never starts before warmup ends, even on a plan
+                // short enough that WSD_DECAY_FRACTION of it would land
+                // inside warmup.
+                let decay_start = ((self.total_steps as f32 * (1.0 - WSD_DECAY_FRACTION)) as u64)
+                    .max(self.warmup_steps);
+                if into_run < decay_start {
+                    self.lr * self.plateau_scale
+                } else {
+                    let decay_steps = self.total_steps.saturating_sub(decay_start).max(1);
+                    let progress = ((into_run - decay_start) as f32 / decay_steps as f32).clamp(0.0, 1.0);
+                    self.lr * self.decayed_ratio(progress) * self.plateau_scale
+                }
+            }
+        }
+    }
+
+    /// The cosine-shaped fraction of `lr` in force at `progress` (0 at
+    /// the start of a decay window, 1 at its end): `min_lr_ratio` at the
+    /// far end, 1.0 at the near end, cosine-smoothed between. Shared by
+    /// both `ScheduleKind`s' decay windows — they differ in where that
+    /// window starts, not in its shape.
+    fn decayed_ratio(&self, progress: f32) -> f32 {
         let cosine = 0.5 * (1.0 + (std::f32::consts::PI * progress).cos());
-        self.lr * (self.min_lr_ratio + (1.0 - self.min_lr_ratio) * cosine) * self.plateau_scale
+        self.min_lr_ratio + (1.0 - self.min_lr_ratio) * cosine
     }
 
     /// Where in this run a lifetime step falls, as a fraction. Past 1.0
@@ -598,6 +663,84 @@ mod tests {
     fn the_schedule_is_untouched_by_default() {
         assert_eq!(TrainConfig::default().plateau_scale, 1.0);
         assert_eq!(TrainConfig::default().start_step, 0);
+        assert_eq!(TrainConfig::default().schedule, ScheduleKind::Cosine);
+    }
+
+    fn wsd_schedule() -> TrainConfig {
+        TrainConfig {
+            lr: 1e-3,
+            warmup_steps: 100,
+            total_steps: 1000,
+            schedule: ScheduleKind::Wsd,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn wsd_holds_the_peak_rate_through_the_stable_phase() {
+        let cfg = wsd_schedule();
+        // Decay starts at (1 - 0.2) * 1000 = 800; anywhere before that,
+        // once warmup is behind it, the rate should sit exactly at peak.
+        for step in [100, 300, 500, 799] {
+            assert!(
+                (cfg.lr_at(step) - cfg.lr).abs() < 1e-9,
+                "step {step}: expected the peak rate, got {}",
+                cfg.lr_at(step)
+            );
+        }
+    }
+
+    #[test]
+    fn wsd_decays_only_in_the_final_fraction() {
+        let cfg = wsd_schedule();
+        let floor = cfg.lr * cfg.min_lr_ratio;
+        // Just past the decay window opens, still close to peak.
+        assert!(cfg.lr_at(801) < cfg.lr && cfg.lr_at(801) > cfg.lr * 0.9);
+        // Halfway through the decay window (800..1000), roughly halfway
+        // down between peak and floor.
+        let middle = cfg.lr_at(900);
+        assert!(middle < cfg.lr && middle > floor, "{middle}");
+        // On the floor at the end, and staying there past it.
+        assert!((cfg.lr_at(1000) - floor).abs() < 1e-9);
+        assert!((cfg.lr_at(9000) - floor).abs() < 1e-9);
+    }
+
+    #[test]
+    fn wsd_extending_total_steps_extends_the_stable_phase_not_the_decay() {
+        // The whole point of WSD over cosine for this app: growing the
+        // plan (this app's "Planned steps" field is live-editable
+        // mid-run) should not mean "the run that was decaying now decays
+        // over more steps" — it should mean "the stable phase got
+        // longer." A step already past the old decay start, at the old
+        // rate, must land back in the stable phase at the peak rate once
+        // the plan grows.
+        let short = wsd_schedule();
+        let grown = TrainConfig { total_steps: 2000, ..short };
+        assert!(short.lr_at(850) < short.lr, "already decaying under the short plan");
+        assert!(
+            (grown.lr_at(850) - grown.lr).abs() < 1e-9,
+            "should be back in the stable phase once the plan grows, got {}",
+            grown.lr_at(850)
+        );
+    }
+
+    #[test]
+    fn wsd_plateau_cut_and_warmup_behave_like_cosine() {
+        let plain = wsd_schedule();
+        let cut = TrainConfig { plateau_scale: 0.5, ..wsd_schedule() };
+        // Warmup is untouched by the cut, same as the cosine schedule.
+        for step in [0, 1, 50, 99] {
+            assert_eq!(cut.lr_at(step), plain.lr_at(step), "step {step}");
+        }
+        // Once past warmup, the cut scales whatever the shape says.
+        for step in [100, 500, 900, 1000] {
+            let expected = plain.lr_at(step) * 0.5;
+            assert!(
+                (cut.lr_at(step) - expected).abs() < 1e-9,
+                "step {step}: {} vs {expected}",
+                cut.lr_at(step)
+            );
+        }
     }
 
     #[test]

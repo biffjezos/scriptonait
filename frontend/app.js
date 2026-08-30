@@ -1594,8 +1594,10 @@ function renderSampleHistory() {
   const index = sampleCursor < 0 ? all.length - 1 : Math.min(sampleCursor, all.length - 1);
   const sample = all[index];
   const quality = sample.quality;
-  $('sample-position').textContent =
-    `${index + 1} of ${all.length} · step ${Number(sample.step).toLocaleString()}`;
+  $('sample-index').value = String(index + 1);
+  $('sample-index').max = String(all.length);
+  $('sample-total').textContent = String(all.length);
+  $('sample-step').textContent = Number(sample.step).toLocaleString();
   $('sample-history-head').textContent = [
     `step ${Number(sample.step).toLocaleString()}`,
     typeof sample.loss === 'number' ? `loss ${sample.loss.toFixed(3)}` : null,
@@ -1849,6 +1851,17 @@ $('sample-next').addEventListener('click', () => {
   renderSampleHistory();
 });
 
+$('sample-index').addEventListener('change', (event) => {
+  const all = samples();
+  if (all.length === 0) return;
+  const typed = Math.round(Number(event.target.value));
+  const requested = Number.isFinite(typed) ? Math.min(all.length, Math.max(1, typed)) : all.length;
+  // Same convention as "Later": landing on the newest resumes following
+  // it, rather than pinning to whatever index happens to be newest now.
+  sampleCursor = requested >= all.length ? -1 : requested - 1;
+  renderSampleHistory();
+});
+
 $('reset-schedule-btn').addEventListener('click', async () => {
   try {
     const result = await trainCall('reset-schedule');
@@ -2070,11 +2083,12 @@ async function persistTrainingPlanSettings() {
     metricsEvery: Number($('metrics-every').value) || 0,
     showTrainingWindow: $('show-training-window').value !== 'off',
     trainingWindowChars: Number($('training-window-chars').value) || 0,
+    scheduleMode: $('schedule-mode').value,
   });
 }
 for (const id of [
   'train-mode', 'train-steps', 'train-effort', 'sample-toggle', 'sample-every',
-  'opening-rate', 'metrics-every', 'show-training-window', 'training-window-chars',
+  'opening-rate', 'metrics-every', 'show-training-window', 'training-window-chars', 'schedule-mode',
 ]) {
   $(id).addEventListener('change', persistTrainingPlanSettings);
 }
@@ -2107,6 +2121,7 @@ function readTrainingSettings() {
     // too high; there is nothing that catches one that is too low
     // except hours of your time.
     peakLearningRate: manualMode ? Number($('train-lr').value) : (fromScratch ? 6e-4 : 5e-5),
+    scheduleMode: $('schedule-mode').value,
     boundarySampleRate: Number($('opening-rate').value) / 100,
     autosaveFrequencySteps: Math.max(1, Number($('autosave-frequency').value) || 1000),
     metricsEvery: Number($('metrics-every').value) || 0,
@@ -2142,7 +2157,7 @@ function pushLiveTrainingSettings() {
 for (const id of [
   'train-mode', 'train-steps', 'train-effort', 'train-batch', 'train-lr', 'opening-rate',
   'sample-toggle', 'sample-every', 'metrics-every', 'autosave-frequency', 'prompt-input',
-  'opt-temperature', 'opt-top-k', 'opt-top-p', 'opt-min-p', 'opt-repetition',
+  'schedule-mode', 'opt-temperature', 'opt-top-k', 'opt-top-p', 'opt-min-p', 'opt-repetition',
   'opt-length-mode', 'opt-max-tokens',
 ]) {
   $(id).addEventListener('change', pushLiveTrainingSettings);
@@ -3423,6 +3438,7 @@ async function applyLoadedSettings() {
       if (planSettings.trainingWindowChars > 0) {
         $('training-window-chars').value = String(planSettings.trainingWindowChars);
       }
+      if (planSettings.scheduleMode) $('schedule-mode').value = planSettings.scheduleMode;
     }
   } catch (error) {
     console.warn('[scriptonait] could not read training-plan settings', error);

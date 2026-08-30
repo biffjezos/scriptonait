@@ -61,7 +61,17 @@ export class RemoteBackend extends Backend {
     return this.token ? { Authorization: `Bearer ${this.token}` } : {};
   }
 
+  /// Without this, an empty Server URL turns `fetch(\`${this.baseUrl}${path}\`)`
+  /// into a same-origin relative request — against the page's own site,
+  /// not a server at all — which fails with a confusing "not valid
+  /// JSON" error (GitHub Pages' own 404 page starts with `<!DOCTYPE`)
+  /// instead of saying what's actually wrong.
+  ensureConfigured() {
+    if (!this.baseUrl) throw new Error('no remote server URL is set');
+  }
+
   async postJson(path, body) {
+    this.ensureConfigured();
     let res;
     try {
       res = await fetch(`${this.baseUrl}${path}`, {
@@ -77,12 +87,22 @@ export class RemoteBackend extends Backend {
 
   async readJsonResponse(res) {
     const text = await res.text();
-    const json = text ? JSON.parse(text) : {};
+    let json;
+    try {
+      json = text ? JSON.parse(text) : {};
+    } catch {
+      throw new Error(
+        res.ok
+          ? 'the remote server sent back something that was not JSON'
+          : `remote server returned HTTP ${res.status}`,
+      );
+    }
     if (!res.ok) throw new Error(json.error || `remote server returned HTTP ${res.status}`);
     return json;
   }
 
   async health() {
+    this.ensureConfigured();
     let res;
     try {
       res = await fetch(`${this.baseUrl}/health`, { headers: this.authHeaders() });

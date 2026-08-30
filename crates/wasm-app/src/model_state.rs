@@ -204,6 +204,10 @@ impl WasmLLM {
             })
             .collect::<Vec<_>>()
             .join(",");
+        let schedule_kind = match train.schedule {
+            llm_core::train::ScheduleKind::Cosine => "cosine",
+            llm_core::train::ScheduleKind::Wsd => "wsd",
+        };
         format!(
             "{{\"step\":{},\"plannedSteps\":{},\"warmupSteps\":{},\"peakLr\":{},\
              \"minLrRatio\":{},\"lrNow\":{},\"weightDecay\":{},\"gradClip\":{},\
@@ -211,7 +215,7 @@ impl WasmLLM {
              \"contextLen\":{},\"sources\":{},\"corpusTokens\":{},\
              \"trainingTokens\":{},\"validationTokens\":{},\"pretrained\":{},\
              \"plateauScale\":{},\"tokensSeen\":{},\"corpusChars\":{},\"startStep\":{},\
-             \"mix\":[{}]}}",
+             \"scheduleKind\":{},\"mix\":[{}]}}",
             step,
             train.total_steps,
             train.warmup_steps,
@@ -234,6 +238,7 @@ impl WasmLLM {
             inner.tokens_seen,
             corpus_chars,
             train.start_step,
+            json_string(schedule_kind),
             mix,
         )
     }

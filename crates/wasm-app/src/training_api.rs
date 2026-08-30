@@ -8,7 +8,7 @@ use std::rc::Rc;
 use wasm_bindgen::prelude::*;
 
 use llm_core::model::AdamState;
-use llm_core::train::TrainConfig;
+use llm_core::train::{ScheduleKind, TrainConfig};
 
 use crate::dto::{json_batch_draws, StepReport};
 use crate::{js_err, WasmLLM};
@@ -180,6 +180,15 @@ impl WasmLLM {
     /// Override the fine-tuning learning rate.
     pub fn set_learning_rate(&self, lr: f32) {
         self.0.borrow_mut().train.lr = lr;
+    }
+
+    /// Which shape the schedule takes from here on — `"wsd"` selects
+    /// Warmup-Stable-Decay, anything else (including an unrecognized
+    /// string) selects the classic cosine shape. See
+    /// `llm_core::train::ScheduleKind` for what each one means.
+    pub fn set_schedule_kind(&self, kind: &str) {
+        self.0.borrow_mut().train.schedule =
+            if kind == "wsd" { ScheduleKind::Wsd } else { ScheduleKind::Cosine };
     }
 
     pub fn step(&self) -> f64 {
