@@ -252,6 +252,7 @@ const BENCHMARK_CONFIG = 'benchmark-config';
 const TRAINING_PLAN_SETTINGS = 'training-plan-settings';
 const AUTOSAVE_FILE_HANDLE = 'autosave-file-handle';
 const REMOTE_SERVER_CONFIG = 'remote-server-config';
+const INFERENCE_OPTIONS = 'inference-options';
 
 /// The `FileSystemFileHandle` the "Choose…" picker returned — not the
 /// name, the live handle, so autosave-to-file survives a reload without
@@ -331,6 +332,23 @@ export async function putRemoteServerConfig(config) {
 
 export async function getRemoteServerConfig() {
   return withStore(SETTINGS_STORE, 'readonly', (store) => store.get(REMOTE_SERVER_CONFIG));
+}
+
+/// { temperature, topK, topP, minP, repetitionPenalty, seed, lengthMode,
+/// maxTokens } — every field the Settings tab's Inference panel owns
+/// beyond the two device selects (which already have their own
+/// devicePreference record). Both Generate and a training run's own
+/// in-training samples read these live off the DOM rather than this
+/// store directly; this only exists so a reload puts the same values
+/// back in the DOM instead of the markup's hardcoded defaults.
+export async function putInferenceOptions(options) {
+  const record = { ...options, id: INFERENCE_OPTIONS, savedAt: Date.now() };
+  await withStore(SETTINGS_STORE, 'readwrite', (store) => store.put(record));
+  return record;
+}
+
+export async function getInferenceOptions() {
+  return withStore(SETTINGS_STORE, 'readonly', (store) => store.get(INFERENCE_OPTIONS));
 }
 
 /// { autoEnabled }

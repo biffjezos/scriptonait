@@ -4,6 +4,7 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Scriptonait</title>
+  <link rel="stylesheet" href="vendor/bootstrap/css/bootstrap.min.css" />
   <link rel="stylesheet" href="style.css" />
 </head>
 <body>
@@ -11,352 +12,508 @@
        training events (a phase change, a rate cut). Persistent,
        section-relevant data (the plan, the machine profile) stays
        inline in its own tab instead of passing through here. -->
-  <div id="notification-bar" class="notification-bar" hidden></div>
+  <div id="notification-bar" class="notification-bar alert" hidden></div>
 
-  <header>
-    <h1>Scriptonait</h1>
-  </header>
+  <div class="container py-4">
+    <header class="mb-3">
+      <h1>Scriptonait</h1>
+    </header>
 
-  <nav class="tabs" id="tabs">
-    <button class="tab-button active" type="button" data-tab="overview">Overview</button>
-    <button class="tab-button" type="button" data-tab="corpus">Corpus</button>
-    <button class="tab-button" type="button" data-tab="training">Training</button>
-    <button class="tab-button" type="button" data-tab="inference">Inference</button>
-    <button class="tab-button" type="button" data-tab="settings">Settings</button>
-  </nav>
+    <nav class="tabs nav nav-tabs mb-3" id="tabs">
+      <button class="tab-button nav-link active" type="button" data-tab="overview">Overview</button>
+      <button class="tab-button nav-link" type="button" data-tab="corpus">Corpus</button>
+      <button class="tab-button nav-link" type="button" data-tab="training">Training</button>
+      <button class="tab-button nav-link" type="button" data-tab="inference">Inference</button>
+      <button class="tab-button nav-link" type="button" data-tab="settings">Settings</button>
+    </nav>
 
-  <main>
-    <section class="tab-panel" id="tab-overview">
-      <div id="model-status" class="model-status absent">
-        <span id="model-status-text">No model yet.</span>
-        <div class="progress" id="model-progress" hidden><div class="bar" id="model-progress-bar"></div></div>
-      </div>
-      <p id="next-step" class="next-step"></p>
-
-      <div id="model-details" class="model-details"></div>
-      <div class="row">
-        <button id="new-project-btn" type="button" class="secondary">New Project</button>
-        <button id="export-btn" type="button" class="secondary">Save</button>
-        <label class="file-btn">
-          Load Model
-          <input type="file" id="import-input" accept=".ckpt,.bin" hidden />
-        </label>
-      </div>
-      <div class="row">
-        <button id="export-project-btn" type="button" class="secondary">Export Project</button>
-        <label class="file-btn">
-          Import Project…
-          <input type="file" id="import-project-input" accept=".snp" hidden />
-        </label>
-      </div>
-
-      <p id="overview-plan" class="stats" hidden></p>
-
-      <details class="advanced" id="overview-corpus-panel" open hidden>
-        <summary>Corpus</summary>
-        <div class="history-table-wrap">
-          <table class="history-table" id="overview-corpus-table">
-            <thead>
-              <tr><th>Source</th><th>Train tokens</th><th>Held out</th><th>Sampled</th></tr>
-            </thead>
-            <tbody id="overview-corpus-body"></tbody>
-          </table>
+    <main>
+      <section class="tab-panel" id="tab-overview">
+        <div id="model-status" class="model-status absent">
+          <span id="model-status-text">No model yet.</span>
+          <div class="progress" id="model-progress" hidden><div class="bar progress-bar" id="model-progress-bar"></div></div>
         </div>
-      </details>
-    </section>
+        <p id="next-step" class="next-step"></p>
 
-    <section class="tab-panel" id="tab-corpus" hidden>
-      <div class="input-group">
-        <label for="file-input" class="file-btn">
-          Add Files
-          <input type="file" id="file-input" multiple accept=".txt,.md,.markdown,.fountain,.text" hidden />
-        </label>
-      </div>
-
-      <div class="input-group">
-        <label for="paste-input">Or paste some in</label>
-        <textarea id="paste-input" rows="4" placeholder="Paste a scene, chapter, or excerpt…"></textarea>
-        <div class="row">
-          <input type="text" id="paste-title" placeholder="Name for this piece" />
-          <button id="add-paste-btn" type="button">Add</button>
-        </div>
-      </div>
-
-      <div class="sources-toolbar" id="sources-toolbar" hidden>
-        <input type="search" id="sources-filter" placeholder="Filter by name…" />
-        <button id="remove-duplicates-btn" type="button" class="secondary" hidden>Remove Copies</button>
-        <button id="remove-all-btn" type="button" class="secondary">Remove All</button>
-      </div>
-      <div id="sources-list" class="sources-list"></div>
-      <p id="corpus-stats" class="corpus-stats"></p>
-    </section>
-
-    <section class="tab-panel" id="tab-training" hidden>
-      <p id="train-explains" class="hint"></p>
-
-      <div class="row">
-        <button id="train-btn" type="button" disabled>Train</button>
-        <button id="train-stop-btn" type="button" class="secondary" hidden>Stop</button>
-      </div>
-
-      <details class="advanced" open>
-        <summary>Progress</summary>
-        <div id="train-plan" class="plan" hidden>
-          <p class="plan-phase"><span id="plan-phase-title"></span><span id="plan-phase-detail"></span></p>
-          <p id="plan-numbers" class="stats"></p>
-          <p id="plan-corpus" class="stats"></p>
-          <ul id="plan-actions" class="plan-actions"></ul>
-        </div>
-
-        <div id="train-status" class="job-status" hidden>
-          <div class="progress"><div class="bar" id="train-progress-bar"></div></div>
-          <p id="train-stats" class="stats"></p>
-          <p id="train-window" class="hint"></p>
-          <p id="train-advice" class="advice" hidden></p>
-        </div>
-
-        <canvas id="loss-chart" width="640" height="160" hidden></canvas>
-      </details>
-
-      <details class="advanced" id="metrics-panel">
-        <summary>Metrics <span id="history-count" class="hint"></span></summary>
-        <div class="row">
-          <button id="history-copy-btn" type="button" class="secondary">Copy as Markdown</button>
-          <button id="history-json-btn" type="button" class="secondary">Copy as JSON</button>
-          <button id="history-clear-btn" type="button" class="secondary">Clear History</button>
-        </div>
-
-        <textarea id="history-output" class="history-output" rows="10" readonly hidden></textarea>
-
-        <div class="history-table-wrap">
-          <table class="history-table" id="history-table"></table>
-        </div>
-
-        <div id="history-events" class="history-events"></div>
-      </details>
-
-      <details class="advanced" id="samples-panel">
-        <summary>Samples</summary>
-        <div id="sample-history" class="sample-history" hidden>
-          <div class="row">
-            <button id="sample-prev" type="button" class="secondary">Earlier</button>
-            <span class="stats">
-              <input type="number" id="sample-index" min="1" step="1" class="sample-index-input" />
-              of <span id="sample-total"></span> · step <span id="sample-step"></span>
-            </span>
-            <button id="sample-next" type="button" class="secondary">Later</button>
+        <div id="model-details" class="model-details"></div>
+        <div class="row g-2 mb-2">
+          <div class="col-auto">
+            <button id="new-project-btn" type="button" class="btn btn-secondary secondary">New Project</button>
           </div>
-          <div class="train-sample">
-            <div class="train-sample-head" id="sample-history-head"></div>
-            <pre id="sample-history-text"></pre>
+          <div class="col-auto">
+            <button id="export-btn" type="button" class="btn btn-secondary secondary">Save</button>
+          </div>
+          <div class="col-auto">
+            <label class="file-btn btn btn-secondary secondary mb-0">
+              Load Model
+              <input type="file" id="import-input" accept=".ckpt,.bin" hidden />
+            </label>
           </div>
         </div>
-      </details>
-
-    </section>
-
-    <section class="tab-panel" id="tab-inference" hidden>
-      <textarea id="prompt-input" rows="3"
-        placeholder="Write a 700 word novel about two people in space related to Plato's allegory of the cave"></textarea>
-
-      <div id="understood" class="understood" hidden></div>
-
-      <div class="row">
-        <button id="generate-btn" type="button" disabled>Generate</button>
-        <button id="stop-btn" type="button" class="secondary" hidden>Stop</button>
-        <label class="checkbox-label">
-          <input type="checkbox" id="notify-toggle" />
-          Notify me when it's done
-        </label>
-      </div>
-
-      <div id="generate-status" class="job-status" hidden>
-        <div class="progress"><div class="bar" id="generate-progress-bar"></div></div>
-        <p id="generate-stats" class="stats"></p>
-      </div>
-
-      <pre id="output" class="output" hidden></pre>
-      <div id="qa-notes" class="qa-notes" hidden></div>
-    </section>
-
-    <section class="tab-panel" id="tab-settings" hidden>
-      <details class="advanced" id="training-settings-panel" open>
-        <summary>Training Settings</summary>
-
-        <label>Mode
-          <select id="train-mode">
-            <option value="auto" selected>Auto</option>
-            <option value="manual">Manual</option>
-          </select>
-        </label>
-
-        <div class="settings-grid">
-          <label>Effort
-            <select id="train-effort">
-              <option value="auto" selected>Auto — full speed, steps kept interruptible</option>
-              <option value="0.25">Gentle — leaves the machine usable</option>
-              <option value="0.5">Balanced</option>
-              <option value="1">Full speed — will make things sluggish</option>
-            </select>
-          </label>
-          <label>Planned steps
-            <input type="number" id="train-steps" value="0" min="0" max="1000000" />
-          </label>
-          <label>Batch size
-            <input type="number" id="train-batch" value="0" min="0" max="256" />
-          </label>
-          <label>Learning rate
-            <input type="number" id="train-lr" value="0" min="0" max="0.01" step="0.00001" />
-          </label>
-          <label>Schedule
-            <select id="schedule-mode">
-              <option value="wsd" selected>Warmup-Stable-Decay</option>
-              <option value="cosine-cuts">Cosine + rate cuts</option>
-              <option value="cosine">Cosine</option>
-            </select>
-          </label>
-          <label>Metrics every
-            <input type="number" id="metrics-every" value="100" min="1" max="100000" />
-          </label>
-          <label>Source-opening windows
-            <input type="number" id="opening-rate" value="40" min="0" max="100" />%
-          </label>
-          <label>Show training window
-            <select id="show-training-window">
-              <option value="on" selected>On</option>
-              <option value="off">Off</option>
-            </select>
-          </label>
-          <label>Max characters
-            <input type="number" id="training-window-chars" value="200" min="10" max="2000" />
-          </label>
-          <label class="checkbox-label">
-            <input type="checkbox" id="sample-toggle" /> Sample every
-          </label>
-          <label>Sample steps
-            <input type="number" id="sample-every" value="50" min="1" max="100000" />
-          </label>
-        </div>
-        <p class="hint" id="batch-hint"></p>
-
-        <p class="hint" id="shape-hint">New model shape:</p>
-        <p class="hint shape-estimate" id="shape-estimate"></p>
-        <div class="settings-grid">
-          <label>Layers <input type="number" id="cfg-layers" value="4" min="1" max="12" /></label>
-          <label>Hidden size <input type="number" id="cfg-hidden" value="192" min="16" max="768" step="16" /></label>
-          <label>Heads <input type="number" id="cfg-heads" value="6" min="1" max="16" /></label>
-          <label>KV heads <input type="number" id="cfg-kv-heads" value="2" min="1" max="16" /></label>
-          <label>Context <input type="number" id="cfg-context" value="512" min="32" max="2048" step="32" /></label>
-          <label>Attention window <input type="number" id="cfg-window" value="256" min="32" max="2048" step="32" /></label>
+        <div class="row g-2 mb-2">
+          <div class="col-auto">
+            <button id="export-project-btn" type="button" class="btn btn-secondary secondary">Export Project</button>
+          </div>
+          <div class="col-auto">
+            <label class="file-btn btn btn-secondary secondary mb-0">
+              Import Project…
+              <input type="file" id="import-project-input" accept=".snp" hidden />
+            </label>
+          </div>
         </div>
 
-        <div class="row" id="live-controls">
-          <label>Peak learning rate, live
-            <input type="number" id="live-lr" min="0" max="0.01" step="0.00001" />
-          </label>
-          <button id="live-lr-btn" type="button" class="secondary">Apply</button>
-          <button id="reset-schedule-btn" type="button" class="secondary">Undo Plateau Cut</button>
-        </div>
-      </details>
+        <p id="overview-plan" class="stats" hidden></p>
 
-      <details class="advanced" open>
-        <summary>Auto-save</summary>
-        <div class="settings-grid">
-          <label>Auto-save
-            <select id="autosave-enabled">
-              <option value="on" selected>On</option>
-              <option value="off">Off</option>
-            </select>
-          </label>
-          <label>Frequency (steps)
-            <input type="number" id="autosave-frequency" value="1000" min="1" />
-          </label>
-          <label>Mode
-            <select id="autosave-mode">
-              <option value="overwrite" selected>Overwrite</option>
-              <option value="add">Add</option>
-            </select>
-          </label>
-          <label>File name
-            <input type="text" id="autosave-filename" placeholder="scriptonait" />
-          </label>
-        </div>
-        <p class="hint" id="autosave-mode-hint"></p>
-        <div class="row">
-          <span id="autosave-status" class="hint">File: not set.</span>
-          <button id="autosave-file-btn" type="button" class="secondary">Choose…</button>
-        </div>
-      </details>
+        <details class="advanced card" id="overview-corpus-panel" open hidden>
+          <summary class="card-header">Corpus</summary>
+          <div class="card-body">
+            <div class="history-table-wrap">
+              <table class="history-table table table-striped table-hover" id="overview-corpus-table">
+                <thead>
+                  <tr><th>Source</th><th>Train tokens</th><th>Held out</th><th>Sampled</th></tr>
+                </thead>
+                <tbody id="overview-corpus-body"></tbody>
+              </table>
+            </div>
+          </div>
+        </details>
+      </section>
 
-      <details class="advanced" open>
-        <summary>Inference</summary>
-        <div class="settings-grid">
-          <label>Training
-            <select id="training-device">
-              <option value="gpu" selected>GPU</option>
-              <option value="cpu" disabled>CPU (needs a GPU)</option>
-              <option value="remote">Remote</option>
-            </select>
-          </label>
-          <label>Inference
-            <select id="inference-device">
-              <option value="gpu" selected>GPU</option>
-              <option value="cpu">CPU</option>
-            </select>
-          </label>
-          <label>Temperature
-            <input type="number" id="opt-temperature" value="0.9" min="0" max="2" step="0.05" />
-          </label>
-          <label>Top-k
-            <input type="number" id="opt-top-k" value="40" min="0" max="500" />
-          </label>
-          <label>Top-p
-            <input type="number" id="opt-top-p" value="0.95" min="0.05" max="1" step="0.01" />
-          </label>
-          <label>Min-p
-            <input type="number" id="opt-min-p" value="0.05" min="0" max="1" step="0.01" />
-          </label>
-          <label>Repetition penalty
-            <input type="number" id="opt-repetition" value="1.1" min="1" max="2" step="0.05" />
-          </label>
-          <label>Seed
-            <input type="number" id="opt-seed" value="0" min="0" />
-          </label>
-          <label>Length
-            <select id="opt-length-mode">
-              <option value="continuous" selected>Continuous</option>
-              <option value="limit">Limit to</option>
-            </select>
-          </label>
-          <label>Max tokens
-            <input type="number" id="opt-max-tokens" value="200" min="1" max="8192" disabled />
+      <section class="tab-panel" id="tab-corpus" hidden>
+        <div class="input-group-wrap mb-3">
+          <label for="file-input" class="file-btn btn btn-primary">
+            Add Files
+            <input type="file" id="file-input" multiple accept=".txt,.md,.markdown,.fountain,.text" hidden />
           </label>
         </div>
-        <div class="row" id="remote-server-settings" hidden>
-          <label>Remote server URL
-            <input type="text" id="remote-server-url" placeholder="http://127.0.0.1:8420" />
-          </label>
-          <label>Remote server token
-            <input type="password" id="remote-server-token" />
-          </label>
-          <button id="remote-test-btn" type="button" class="secondary">Test Connection</button>
-          <span id="remote-server-status" class="hint">Not tested.</span>
+
+        <div class="mb-3">
+          <label for="paste-input" class="form-label">Or paste some in</label>
+          <textarea id="paste-input" class="form-control" rows="4" placeholder="Paste a scene, chapter, or excerpt…"></textarea>
+          <div class="row g-2 mt-1">
+            <div class="col-auto">
+              <input type="text" id="paste-title" class="form-control" placeholder="Name for this piece" />
+            </div>
+            <div class="col-auto">
+              <button id="add-paste-btn" type="button" class="btn btn-primary">Add</button>
+            </div>
+          </div>
         </div>
-      </details>
 
-      <details class="advanced" open>
-        <summary>Machine Benchmark</summary>
-        <label>Auto-benchmark
-          <select id="benchmark-enabled">
-            <option value="on" selected>On</option>
-            <option value="off">Off</option>
-          </select>
-        </label>
-        <p id="machine-profile-text" class="hint">Machine profile: not measured yet.</p>
-      </details>
-    </section>
-  </main>
+        <div class="sources-toolbar row g-2 align-items-center mb-2" id="sources-toolbar" hidden>
+          <div class="col-auto">
+            <input type="search" id="sources-filter" class="form-control" placeholder="Filter by name…" />
+          </div>
+          <div class="col-auto">
+            <button id="remove-duplicates-btn" type="button" class="btn btn-secondary secondary" hidden>Remove Copies</button>
+          </div>
+          <div class="col-auto">
+            <button id="remove-all-btn" type="button" class="btn btn-secondary secondary">Remove All</button>
+          </div>
+        </div>
+        <div id="sources-list" class="sources-list"></div>
+        <p id="corpus-stats" class="corpus-stats"></p>
+      </section>
 
+      <section class="tab-panel" id="tab-training" hidden>
+        <p id="train-explains" class="hint"></p>
+
+        <div class="row g-2 mb-2">
+          <div class="col-auto">
+            <button id="train-btn" type="button" class="btn btn-primary" disabled>Train</button>
+          </div>
+          <div class="col-auto">
+            <button id="train-stop-btn" type="button" class="btn btn-secondary secondary" hidden>Stop</button>
+          </div>
+        </div>
+
+        <div class="row g-2 align-items-end mb-2" id="live-controls" hidden>
+          <div class="col-auto">
+            <label class="form-label mb-0">Learning rate override
+              <input type="number" id="live-lr" class="form-control" min="0" max="0.01" step="0.00001" />
+            </label>
+          </div>
+          <div class="col-auto">
+            <button id="live-lr-btn" type="button" class="btn btn-secondary secondary">Apply</button>
+          </div>
+          <div class="col-auto">
+            <button id="reset-schedule-btn" type="button" class="btn btn-secondary secondary">Undo Plateau Cut</button>
+          </div>
+        </div>
+
+        <details class="advanced card mb-3" open>
+          <summary class="card-header">Progress</summary>
+          <div class="card-body">
+            <div id="train-plan" class="plan" hidden>
+              <p class="plan-phase"><span id="plan-phase-title"></span><span id="plan-phase-detail"></span></p>
+              <p id="plan-numbers" class="stats"></p>
+              <p id="plan-corpus" class="stats"></p>
+              <ul id="plan-actions" class="plan-actions"></ul>
+            </div>
+
+            <div id="train-status" class="job-status" hidden>
+              <div class="progress"><div class="bar progress-bar" id="train-progress-bar"></div></div>
+              <p id="train-stats" class="stats"></p>
+              <p id="train-window" class="hint"></p>
+              <p id="train-advice" class="advice" hidden></p>
+            </div>
+
+            <canvas id="loss-chart" width="640" height="160" hidden></canvas>
+          </div>
+        </details>
+
+        <details class="advanced card mb-3" id="metrics-panel">
+          <summary class="card-header">Metrics <span id="history-count" class="hint"></span></summary>
+          <div class="card-body">
+            <div class="row g-2 mb-2">
+              <div class="col-auto">
+                <button id="history-copy-btn" type="button" class="btn btn-secondary secondary">Copy as Markdown</button>
+              </div>
+              <div class="col-auto">
+                <button id="history-json-btn" type="button" class="btn btn-secondary secondary">Copy as JSON</button>
+              </div>
+              <div class="col-auto">
+                <button id="history-clear-btn" type="button" class="btn btn-secondary secondary">Clear History</button>
+              </div>
+            </div>
+
+            <textarea id="history-output" class="history-output form-control" rows="10" readonly hidden></textarea>
+
+            <div class="history-table-wrap">
+              <table class="history-table table table-striped table-hover" id="history-table"></table>
+            </div>
+
+            <div id="history-events" class="history-events"></div>
+          </div>
+        </details>
+
+        <details class="advanced card mb-3" id="samples-panel">
+          <summary class="card-header">Samples</summary>
+          <div class="card-body">
+            <div id="sample-history" class="sample-history" hidden>
+              <div class="row g-2 align-items-center mb-2">
+                <div class="col-auto">
+                  <button id="sample-prev" type="button" class="btn btn-secondary secondary">Earlier</button>
+                </div>
+                <div class="col-auto">
+                  <span class="stats">
+                    <input type="number" id="sample-index" min="1" step="1" class="sample-index-input form-control form-control-sm d-inline-block" />
+                    of <span id="sample-total"></span> · step <span id="sample-step"></span>
+                  </span>
+                </div>
+                <div class="col-auto">
+                  <button id="sample-next" type="button" class="btn btn-secondary secondary">Later</button>
+                </div>
+              </div>
+              <div class="train-sample">
+                <div class="train-sample-head" id="sample-history-head"></div>
+                <pre id="sample-history-text"></pre>
+              </div>
+            </div>
+          </div>
+        </details>
+
+      </section>
+
+      <section class="tab-panel" id="tab-inference" hidden>
+        <div class="mb-3">
+          <textarea id="prompt-input" class="form-control" rows="3"
+            placeholder="Write a 700 word novel about two people in space related to Plato's allegory of the cave"></textarea>
+        </div>
+
+        <div id="understood" class="understood" hidden></div>
+
+        <div class="row g-2 align-items-center mb-2">
+          <div class="col-auto">
+            <button id="generate-btn" type="button" class="btn btn-primary" disabled>Generate</button>
+          </div>
+          <div class="col-auto">
+            <button id="stop-btn" type="button" class="btn btn-secondary secondary" hidden>Stop</button>
+          </div>
+          <div class="col-auto form-check">
+            <input type="checkbox" id="notify-toggle" class="form-check-input" />
+            <label class="form-check-label" for="notify-toggle">Notify me when it's done</label>
+          </div>
+        </div>
+
+        <div id="generate-status" class="job-status" hidden>
+          <div class="progress"><div class="bar progress-bar" id="generate-progress-bar"></div></div>
+          <p id="generate-stats" class="stats"></p>
+        </div>
+
+        <pre id="output" class="output" hidden></pre>
+        <div id="qa-notes" class="qa-notes" hidden></div>
+      </section>
+
+      <section class="tab-panel" id="tab-settings" hidden>
+        <details class="advanced card mb-3" id="training-mode-panel" open>
+          <summary class="card-header">Training Mode</summary>
+          <div class="card-body">
+            <div class="mb-0">
+              <label class="form-label" for="train-mode">Mode</label>
+              <select id="train-mode" class="form-select">
+                <option value="auto" selected>Auto</option>
+                <option value="manual">Manual</option>
+              </select>
+            </div>
+          </div>
+        </details>
+
+        <details class="advanced card mb-3" id="manual-settings-panel" open>
+          <summary class="card-header">Manual Settings <span class="badge text-bg-secondary">Manual mode only</span></summary>
+          <div class="card-body">
+            <div class="settings-grid row g-3">
+              <div class="col-sm-6 col-md-4">
+                <label class="form-label" for="train-effort">Effort</label>
+                <select id="train-effort" class="form-select">
+                  <option value="auto" selected>Auto — full speed, steps kept interruptible</option>
+                  <option value="0.25">Gentle — leaves the machine usable</option>
+                  <option value="0.5">Balanced</option>
+                  <option value="1">Full speed — will make things sluggish</option>
+                </select>
+              </div>
+              <div class="col-sm-6 col-md-4">
+                <label class="form-label" for="train-batch">Batch size</label>
+                <input type="number" id="train-batch" class="form-control" value="0" min="0" max="256" />
+              </div>
+              <div class="col-sm-6 col-md-4">
+                <label class="form-label" for="train-lr">Learning rate</label>
+                <input type="number" id="train-lr" class="form-control" value="0" min="0" max="0.01" step="0.00001" />
+              </div>
+            </div>
+            <p class="hint" id="batch-hint"></p>
+          </div>
+        </details>
+
+        <details class="advanced card mb-3" id="schedule-panel" open>
+          <summary class="card-header">Schedule <span class="badge text-bg-secondary">live</span></summary>
+          <div class="card-body">
+            <div class="mb-0">
+              <label class="form-label" for="schedule-mode">Schedule</label>
+              <select id="schedule-mode" class="form-select">
+                <option value="wsd" selected>Warmup-Stable-Decay</option>
+                <option value="cosine-cuts">Cosine + rate cuts</option>
+                <option value="cosine">Cosine</option>
+              </select>
+            </div>
+          </div>
+        </details>
+
+        <details class="advanced card mb-3" id="training-plan-panel" open>
+          <summary class="card-header">Training Plan <span class="badge text-bg-secondary">live</span></summary>
+          <div class="card-body">
+            <div class="settings-grid row g-3">
+              <div class="col-sm-6 col-md-4">
+                <label class="form-label" for="train-steps">Planned steps</label>
+                <input type="number" id="train-steps" class="form-control" value="0" min="0" max="1000000" />
+              </div>
+              <div class="col-sm-6 col-md-4">
+                <label class="form-label" for="metrics-every">Metrics every</label>
+                <input type="number" id="metrics-every" class="form-control" value="100" min="1" max="100000" />
+              </div>
+              <div class="col-sm-6 col-md-4">
+                <label class="form-label" for="opening-rate">Source-opening windows</label>
+                <div class="input-group">
+                  <input type="number" id="opening-rate" class="form-control" value="40" min="0" max="100" />
+                  <span class="input-group-text">%</span>
+                </div>
+              </div>
+              <div class="col-sm-6 col-md-4">
+                <label class="form-label" for="show-training-window">Show training window</label>
+                <select id="show-training-window" class="form-select">
+                  <option value="on" selected>On</option>
+                  <option value="off">Off</option>
+                </select>
+              </div>
+              <div class="col-sm-6 col-md-4">
+                <label class="form-label" for="training-window-chars">Max characters</label>
+                <input type="number" id="training-window-chars" class="form-control" value="200" min="10" max="2000" />
+              </div>
+              <div class="col-sm-6 col-md-4 form-check pt-4">
+                <input type="checkbox" id="sample-toggle" class="form-check-input" />
+                <label class="form-check-label" for="sample-toggle">Sample every</label>
+              </div>
+              <div class="col-sm-6 col-md-4">
+                <label class="form-label" for="sample-every">Sample steps</label>
+                <input type="number" id="sample-every" class="form-control" value="50" min="1" max="100000" />
+              </div>
+            </div>
+          </div>
+        </details>
+
+        <details class="advanced card mb-3" id="model-shape-panel" open>
+          <summary class="card-header">Model Shape</summary>
+          <div class="card-body">
+            <p class="hint" id="shape-hint">New model shape:</p>
+            <p class="hint shape-estimate" id="shape-estimate"></p>
+            <div class="settings-grid row g-3">
+              <div class="col-sm-6 col-md-4">
+                <label class="form-label" for="cfg-layers">Layers</label>
+                <input type="number" id="cfg-layers" class="form-control" value="4" min="1" max="12" />
+              </div>
+              <div class="col-sm-6 col-md-4">
+                <label class="form-label" for="cfg-hidden">Hidden size</label>
+                <input type="number" id="cfg-hidden" class="form-control" value="192" min="16" max="768" step="16" />
+              </div>
+              <div class="col-sm-6 col-md-4">
+                <label class="form-label" for="cfg-heads">Heads</label>
+                <input type="number" id="cfg-heads" class="form-control" value="6" min="1" max="16" />
+              </div>
+              <div class="col-sm-6 col-md-4">
+                <label class="form-label" for="cfg-kv-heads">KV heads</label>
+                <input type="number" id="cfg-kv-heads" class="form-control" value="2" min="1" max="16" />
+              </div>
+              <div class="col-sm-6 col-md-4">
+                <label class="form-label" for="cfg-context">Context</label>
+                <input type="number" id="cfg-context" class="form-control" value="512" min="32" max="2048" step="32" />
+              </div>
+              <div class="col-sm-6 col-md-4">
+                <label class="form-label" for="cfg-window">Attention window</label>
+                <input type="number" id="cfg-window" class="form-control" value="256" min="32" max="2048" step="32" />
+              </div>
+            </div>
+          </div>
+        </details>
+
+        <details class="advanced card mb-3" open>
+          <summary class="card-header">Auto-save</summary>
+          <div class="card-body">
+            <div class="settings-grid row g-3">
+              <div class="col-sm-6 col-md-3">
+                <label class="form-label" for="autosave-enabled">Auto-save</label>
+                <select id="autosave-enabled" class="form-select">
+                  <option value="on" selected>On</option>
+                  <option value="off">Off</option>
+                </select>
+              </div>
+              <div class="col-sm-6 col-md-3">
+                <label class="form-label" for="autosave-frequency">Frequency (steps)</label>
+                <input type="number" id="autosave-frequency" class="form-control" value="1000" min="1" />
+              </div>
+              <div class="col-sm-6 col-md-3">
+                <label class="form-label" for="autosave-mode">Mode</label>
+                <select id="autosave-mode" class="form-select">
+                  <option value="overwrite" selected>Overwrite</option>
+                  <option value="add">Add</option>
+                </select>
+              </div>
+              <div class="col-sm-6 col-md-3">
+                <label class="form-label" for="autosave-filename">File name</label>
+                <input type="text" id="autosave-filename" class="form-control" placeholder="scriptonait" />
+              </div>
+            </div>
+            <p class="hint" id="autosave-mode-hint"></p>
+            <div class="row g-2 align-items-center">
+              <div class="col-auto">
+                <span id="autosave-status" class="hint">File: not set.</span>
+              </div>
+              <div class="col-auto">
+                <button id="autosave-file-btn" type="button" class="btn btn-secondary secondary">Choose…</button>
+              </div>
+            </div>
+          </div>
+        </details>
+
+        <details class="advanced card mb-3" id="remote-backend-panel" open>
+          <summary class="card-header">Remote Backend</summary>
+          <div class="card-body">
+            <div class="mb-3">
+              <label class="form-label" for="training-device">Training device</label>
+              <select id="training-device" class="form-select">
+                <option value="gpu" selected>GPU</option>
+                <option value="cpu" disabled>CPU (needs a GPU)</option>
+                <option value="remote">Remote</option>
+              </select>
+            </div>
+            <div class="row g-2 align-items-center" id="remote-server-settings" hidden>
+              <div class="col-auto">
+                <label class="form-label mb-0" for="remote-server-url">Remote server URL
+                  <input type="text" id="remote-server-url" class="form-control" placeholder="http://127.0.0.1:8420" />
+                </label>
+              </div>
+              <div class="col-auto">
+                <label class="form-label mb-0" for="remote-server-token">Remote server token
+                  <input type="password" id="remote-server-token" class="form-control" />
+                </label>
+              </div>
+              <div class="col-auto">
+                <button id="remote-test-btn" type="button" class="btn btn-secondary secondary">Test Connection</button>
+              </div>
+              <div class="col-auto">
+                <span id="remote-server-status" class="hint">Not tested.</span>
+              </div>
+            </div>
+          </div>
+        </details>
+
+        <details class="advanced card mb-3" open>
+          <summary class="card-header">Inference</summary>
+          <div class="card-body">
+            <div class="settings-grid row g-3">
+              <div class="col-sm-6 col-md-4">
+                <label class="form-label" for="inference-device">Device</label>
+                <select id="inference-device" class="form-select">
+                  <option value="gpu" selected>GPU</option>
+                  <option value="cpu">CPU</option>
+                </select>
+              </div>
+              <div class="col-sm-6 col-md-4">
+                <label class="form-label" for="opt-temperature">Temperature</label>
+                <input type="number" id="opt-temperature" class="form-control" value="0.9" min="0" max="2" step="0.05" />
+              </div>
+              <div class="col-sm-6 col-md-4">
+                <label class="form-label" for="opt-top-k">Top-k</label>
+                <input type="number" id="opt-top-k" class="form-control" value="40" min="0" max="500" />
+              </div>
+              <div class="col-sm-6 col-md-4">
+                <label class="form-label" for="opt-top-p">Top-p</label>
+                <input type="number" id="opt-top-p" class="form-control" value="0.95" min="0.05" max="1" step="0.01" />
+              </div>
+              <div class="col-sm-6 col-md-4">
+                <label class="form-label" for="opt-min-p">Min-p</label>
+                <input type="number" id="opt-min-p" class="form-control" value="0.05" min="0" max="1" step="0.01" />
+              </div>
+              <div class="col-sm-6 col-md-4">
+                <label class="form-label" for="opt-repetition">Repetition penalty</label>
+                <input type="number" id="opt-repetition" class="form-control" value="1.1" min="1" max="2" step="0.05" />
+              </div>
+              <div class="col-sm-6 col-md-4">
+                <label class="form-label" for="opt-seed">Seed</label>
+                <input type="number" id="opt-seed" class="form-control" value="0" min="0" />
+              </div>
+              <div class="col-sm-6 col-md-4">
+                <label class="form-label" for="opt-length-mode">Length</label>
+                <select id="opt-length-mode" class="form-select">
+                  <option value="continuous" selected>Continuous</option>
+                  <option value="limit">Limit to</option>
+                </select>
+              </div>
+              <div class="col-sm-6 col-md-4">
+                <label class="form-label" for="opt-max-tokens">Max tokens</label>
+                <input type="number" id="opt-max-tokens" class="form-control" value="200" min="1" max="8192" disabled />
+              </div>
+            </div>
+          </div>
+        </details>
+
+        <details class="advanced card mb-3" open>
+          <summary class="card-header">Machine Benchmark</summary>
+          <div class="card-body">
+            <div class="mb-2">
+              <label class="form-label" for="benchmark-enabled">Auto-benchmark</label>
+              <select id="benchmark-enabled" class="form-select">
+                <option value="on" selected>On</option>
+                <option value="off">Off</option>
+              </select>
+            </div>
+            <p id="machine-profile-text" class="hint">Machine profile: not measured yet.</p>
+          </div>
+        </details>
+      </section>
+    </main>
+  </div>
+
+  <script src="vendor/bootstrap/js/bootstrap.bundle.min.js"></script>
   <script type="module" src="app.js"></script>
 </body>
 </html>

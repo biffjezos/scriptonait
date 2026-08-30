@@ -139,10 +139,11 @@ let noticeTimeout = null;
 
 /// `level` is 'error' | 'info' | 'success'. Errors stay until replaced or
 /// dismissed; info/success clear themselves after a few seconds.
+const NOTICE_ALERT_CLASS = { error: 'alert-danger', info: 'alert-info', success: 'alert-success' };
 function notice(text, level = 'error') {
   const bar = $('notification-bar');
   bar.textContent = text;
-  bar.className = `notification-bar ${level}`;
+  bar.className = `notification-bar alert ${NOTICE_ALERT_CLASS[level] || NOTICE_ALERT_CLASS.error}`;
   bar.hidden = false;
   if (noticeTimeout) clearTimeout(noticeTimeout);
   if (level !== 'error') {
@@ -1262,15 +1263,15 @@ onStream('train-progress', (progress) => {
       ? ''
       : describeBatchSources(progress.sources, Number($('training-window-chars').value));
   setTitleProgress('Fine-tuning', progress.fractionDone);
-  lossHistory.push(progress.smoothedLoss);
+  lossHistory.push({ step: progress.step, loss: progress.smoothedLoss });
   if (
     typeof progress.validationLoss === 'number' &&
     (validationHistory.length === 0 ||
       validationHistory[validationHistory.length - 1].loss !== progress.validationLoss)
   ) {
-    validationHistory.push({ at: lossHistory.length - 1, loss: progress.validationLoss });
+    validationHistory.push({ at: progress.step, loss: progress.validationLoss });
     if (typeof progress.trainingProbe === 'number' && progress.trainingProbe >= 0) {
-      probeHistory.push({ at: lossHistory.length - 1, loss: progress.trainingProbe });
+      probeHistory.push({ at: progress.step, loss: progress.trainingProbe });
     }
   }
   drawLossChart();
@@ -1513,9 +1514,13 @@ const samples = () => history.filter((r) => r.kind === 'sample');
 /// never read back into the arrays drawLossChart reads from.
 ///
 /// Measurements come far sparser than the live per-tick training curve
-/// did (once every `metricsEvery` steps, not every progress tick), so
-/// the restored curve is coarser than what live training draws — but
-/// it is the run's real shape, not a guess at one.
+/// did (once every `metricsEvery` steps, not every progress tick) —
+/// each point here carries its own step number rather than relying on
+/// array position to stand in for one, which is what let a resumed
+/// run's much denser live ticks warp the x-axis against this coarser
+/// rebuilt portion (500 steps per point here, roughly 1 per point once
+/// live training resumed — the same index space, two very different
+/// meanings).
 function rebuildChartFromHistory() {
   lossHistory.length = 0;
   validationHistory.length = 0;
@@ -1524,12 +1529,12 @@ function rebuildChartFromHistory() {
     .filter((r) => typeof r.loss === 'number')
     .sort((a, b) => a.step - b.step);
   for (const row of rows) {
-    lossHistory.push(row.loss);
+    lossHistory.push({ step: row.step, loss: row.loss });
     if (typeof row.heldOut === 'number') {
-      validationHistory.push({ at: lossHistory.length - 1, loss: row.heldOut });
+      validationHistory.push({ at: row.step, loss: row.heldOut });
     }
     if (typeof row.probe === 'number' && row.probe >= 0) {
-      probeHistory.push({ at: lossHistory.length - 1, loss: row.probe });
+      probeHistory.push({ at: row.step, loss: row.probe });
     }
   }
   if (lossHistory.length > 0) $('loss-chart').hidden = false;
@@ -2077,6 +2082,8 @@ async function persistTrainingPlanSettings() {
     mode: $('train-mode').value,
     plannedSteps: Number($('train-steps').value) || 0,
     effort: $('train-effort').value,
+    batchSize: Number($('train-batch').value) || 0,
+    learningRate: Number($('train-lr').value) || 0,
     sampleToggle: $('sample-toggle').checked,
     sampleEvery: Number($('sample-every').value) || 0,
     boundarySampleRate: Number($('opening-rate').value) / 100,
@@ -2087,10 +2094,35 @@ async function persistTrainingPlanSettings() {
   });
 }
 for (const id of [
-  'train-mode', 'train-steps', 'train-effort', 'sample-toggle', 'sample-every',
-  'opening-rate', 'metrics-every', 'show-training-window', 'training-window-chars', 'schedule-mode',
+  'train-mode', 'train-steps', 'train-effort', 'train-batch', 'train-lr', 'sample-toggle',
+  'sample-every', 'opening-rate', 'metrics-every', 'show-training-window', 'training-window-chars',
+  'schedule-mode',
 ]) {
-  $(id).addEventListener('change', persistTrainingPlanSettings);
+  $(id).addEventListener('change', () =>
+    withNotice('Saving setting', 'Setting saved', persistTrainingPlanSettings));
+}
+
+/// Every field the Settings tab's Inference panel owns beyond the two
+/// device selects (inference-device/training-device already have their
+/// own persistence): sampling, seed, and the length-mode/max-tokens pair.
+async function persistInferenceOptions() {
+  await db.putInferenceOptions({
+    temperature: Number($('opt-temperature').value),
+    topK: Number($('opt-top-k').value),
+    topP: Number($('opt-top-p').value),
+    minP: Number($('opt-min-p').value),
+    repetitionPenalty: Number($('opt-repetition').value),
+    seed: Number($('opt-seed').value) || 0,
+    lengthMode: $('opt-length-mode').value,
+    maxTokens: Number($('opt-max-tokens').value) || 0,
+  });
+}
+for (const id of [
+  'opt-temperature', 'opt-top-k', 'opt-top-p', 'opt-min-p', 'opt-repetition', 'opt-seed',
+  'opt-length-mode', 'opt-max-tokens',
+]) {
+  $(id).addEventListener('change', () =>
+    withNotice('Saving setting', 'Setting saved', persistInferenceOptions));
 }
 
 /// Every setting a training run reads off the Training-Settings and
@@ -2175,19 +2207,21 @@ onStream('bench-progress', ({ stage, dispatchesPerSubmit }) => {
 let benchmarkAutoEnabled = true;
 
 $('benchmark-enabled').addEventListener('change', async (event) => {
-  const wasEnabled = benchmarkAutoEnabled;
-  benchmarkAutoEnabled = event.target.value !== 'off';
-  await db.putBenchmarkConfig({ autoEnabled: benchmarkAutoEnabled });
-  // Turning it off and back on is the only way to clear a bad stored
-  // profile now that there is no dedicated button for it: the toggle
-  // itself is the escape hatch.
-  if (benchmarkAutoEnabled && !wasEnabled && gpuReport) {
-    await db.deleteMachineProfile(gpuReport);
-    machineProfile = null;
-    notice('Machine profile cleared — the next training run measures it again.', 'info');
-  }
-  renderMachineProfile();
-  updateGuidance();
+  await withNotice('Saving setting', 'Setting saved', async () => {
+    const wasEnabled = benchmarkAutoEnabled;
+    benchmarkAutoEnabled = event.target.value !== 'off';
+    await db.putBenchmarkConfig({ autoEnabled: benchmarkAutoEnabled });
+    // Turning it off and back on is the only way to clear a bad stored
+    // profile now that there is no dedicated button for it: the toggle
+    // itself is the escape hatch.
+    if (benchmarkAutoEnabled && !wasEnabled && gpuReport) {
+      await db.deleteMachineProfile(gpuReport);
+      machineProfile = null;
+      notice('Machine profile cleared — the next training run measures it again.', 'info');
+    }
+    renderMachineProfile();
+    updateGuidance();
+  });
 });
 
 /// Loaded from Settings at startup, and kept live from there.
@@ -2460,6 +2494,7 @@ function drawLossChart() {
 
   const plotTop = topBand;
   const points = lossHistory
+    .map((p) => p.loss)
     .concat(validationHistory.map((p) => p.loss))
     .concat(probeHistory.map((p) => p.loss));
   const min = Math.min(...points);
@@ -2468,19 +2503,32 @@ function drawLossChart() {
   const plotSpan = height - plotTop - 12;
   const yFor = (loss) => height - ((loss - min) / span) * plotSpan - 6;
 
+  // By step number, not array position: a rebuilt-from-history point
+  // (one every `metricsEvery` steps) and a live progress tick (roughly
+  // one per step) sit at wildly different densities in the same array,
+  // and index-based x-positions stretched whichever portion was denser
+  // across most of the chart's width regardless of how many actual
+  // steps it covered.
+  const steps = lossHistory.map((p) => p.step);
+  const minStep = Math.min(...steps);
+  const maxStep = Math.max(...steps);
+  const stepSpan = maxStep - minStep || 1;
+  const xFor = (step) => ((step - minStep) / stepSpan) * width;
+
   ctx.strokeStyle = '#7aa2f7';
   ctx.lineWidth = 2;
   ctx.beginPath();
-  lossHistory.forEach((loss, i) => {
-    const x = (i / (lossHistory.length - 1)) * width;
-    const y = yFor(loss);
+  lossHistory.forEach((point, i) => {
+    const x = xFor(point.step);
+    const y = yFor(point.loss);
     if (i === 0) ctx.moveTo(x, y);
     else ctx.lineTo(x, y);
   });
   ctx.stroke();
 
-  /// Both fixed-set curves, positioned by where in the run they were
-  /// measured so they line up in time rather than by index.
+  /// Both fixed-set curves, positioned by the step they were measured
+  /// at so they line up in time with the curve above rather than by
+  /// index.
   const drawMeasured = (series, colour, dashed) => {
     if (series.length < 2) return;
     ctx.strokeStyle = colour;
@@ -2488,7 +2536,7 @@ function drawLossChart() {
     ctx.setLineDash(dashed ? [4, 3] : []);
     ctx.beginPath();
     series.forEach((point, i) => {
-      const x = (point.at / Math.max(lossHistory.length - 1, 1)) * width;
+      const x = xFor(point.at);
       const y = yFor(point.loss);
       if (i === 0) ctx.moveTo(x, y);
       else ctx.lineTo(x, y);
@@ -2670,6 +2718,7 @@ $('export-project-btn').addEventListener('click', async () => {
         benchmarkConfig: await db.getBenchmarkConfig(),
         trainingPlan: await db.getTrainingPlanSettings(),
         remoteServerConfig: await db.getRemoteServerConfig(),
+        inferenceOptions: await db.getInferenceOptions(),
       },
     });
     console.info(
@@ -2727,6 +2776,7 @@ $('import-project-input').addEventListener('change', async (event) => {
     if (settings.benchmarkConfig) await db.putBenchmarkConfig(settings.benchmarkConfig);
     if (settings.trainingPlan) await db.putTrainingPlanSettings(settings.trainingPlan);
     if (settings.remoteServerConfig) await db.putRemoteServerConfig(settings.remoteServerConfig);
+    if (settings.inferenceOptions) await db.putInferenceOptions(settings.inferenceOptions);
 
     // Before the corpus gets rebuilt, not after: syncAllSources (called
     // below, both directly and inside restoreModel-shaped paths) reads
@@ -2933,6 +2983,7 @@ async function buildProjectBlob(checkpointBytes, optimizerBytes) {
       benchmarkConfig: await db.getBenchmarkConfig(),
       trainingPlan: await db.getTrainingPlanSettings(),
       remoteServerConfig: await db.getRemoteServerConfig(),
+      inferenceOptions: await db.getInferenceOptions(),
     },
   });
 }
@@ -3426,6 +3477,8 @@ async function applyLoadedSettings() {
       $('train-mode').value = planSettings.mode === 'manual' ? 'manual' : 'auto';
       if (planSettings.plannedSteps > 0) $('train-steps').value = String(planSettings.plannedSteps);
       if (planSettings.effort) $('train-effort').value = planSettings.effort;
+      if (planSettings.batchSize > 0) $('train-batch').value = String(planSettings.batchSize);
+      if (planSettings.learningRate > 0) $('train-lr').value = String(planSettings.learningRate);
       $('sample-toggle').checked = !!planSettings.sampleToggle;
       if (planSettings.sampleEvery > 0) $('sample-every').value = String(planSettings.sampleEvery);
       if (typeof planSettings.boundarySampleRate === 'number') {
@@ -3442,6 +3495,26 @@ async function applyLoadedSettings() {
     }
   } catch (error) {
     console.warn('[scriptonait] could not read training-plan settings', error);
+  }
+  try {
+    const inferenceOptions = await db.getInferenceOptions();
+    if (inferenceOptions) {
+      if (typeof inferenceOptions.temperature === 'number') {
+        $('opt-temperature').value = String(inferenceOptions.temperature);
+      }
+      if (typeof inferenceOptions.topK === 'number') $('opt-top-k').value = String(inferenceOptions.topK);
+      if (typeof inferenceOptions.topP === 'number') $('opt-top-p').value = String(inferenceOptions.topP);
+      if (typeof inferenceOptions.minP === 'number') $('opt-min-p').value = String(inferenceOptions.minP);
+      if (typeof inferenceOptions.repetitionPenalty === 'number') {
+        $('opt-repetition').value = String(inferenceOptions.repetitionPenalty);
+      }
+      if (inferenceOptions.seed > 0) $('opt-seed').value = String(inferenceOptions.seed);
+      if (inferenceOptions.lengthMode) $('opt-length-mode').value = inferenceOptions.lengthMode;
+      if (inferenceOptions.maxTokens > 0) $('opt-max-tokens').value = String(inferenceOptions.maxTokens);
+      applyLengthMode();
+    }
+  } catch (error) {
+    console.warn('[scriptonait] could not read inference options', error);
   }
   // Unconditional: the Batch/Effort/Learning-rate disabled state has to
   // be set correctly on every load, not only when saved settings exist.
