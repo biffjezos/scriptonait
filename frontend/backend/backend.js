@@ -5,10 +5,9 @@
 /// own WASM+WebGPU today; a remote machine running the same code
 /// natively, later) is a setting, not a rewrite.
 ///
-/// `LocalWasmBackend` is the only implementation today, wrapping the
-/// existing Worker/postMessage plumbing. A future `RemoteBackend` would
-/// open a WebSocket to a remote `llm-server` process and speak the exact
-/// same message shape this interface already describes.
+/// `LocalWasmBackend` wraps the existing Worker/postMessage plumbing.
+/// `RemoteBackend` speaks the same shape over HTTP + Server-Sent Events
+/// to a remote `llm-server` process instead.
 export class Backend {
   /// Send one request, get one response. `transfer` names objects (an
   /// ArrayBuffer, say) to move rather than copy, exactly like
