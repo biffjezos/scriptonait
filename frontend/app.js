@@ -2097,7 +2097,8 @@ for (const id of [
   'sample-every', 'opening-rate', 'metrics-every', 'show-training-window', 'training-window-chars',
   'schedule-mode',
 ]) {
-  $(id).addEventListener('change', persistTrainingPlanSettings);
+  $(id).addEventListener('change', () =>
+    withNotice('Saving setting', 'Setting saved', persistTrainingPlanSettings));
 }
 
 /// Every field the Settings tab's Inference panel owns beyond the two
@@ -2119,7 +2120,8 @@ for (const id of [
   'opt-temperature', 'opt-top-k', 'opt-top-p', 'opt-min-p', 'opt-repetition', 'opt-seed',
   'opt-length-mode', 'opt-max-tokens',
 ]) {
-  $(id).addEventListener('change', persistInferenceOptions);
+  $(id).addEventListener('change', () =>
+    withNotice('Saving setting', 'Setting saved', persistInferenceOptions));
 }
 
 /// Every setting a training run reads off the Training-Settings and
@@ -2204,19 +2206,21 @@ onStream('bench-progress', ({ stage, dispatchesPerSubmit }) => {
 let benchmarkAutoEnabled = true;
 
 $('benchmark-enabled').addEventListener('change', async (event) => {
-  const wasEnabled = benchmarkAutoEnabled;
-  benchmarkAutoEnabled = event.target.value !== 'off';
-  await db.putBenchmarkConfig({ autoEnabled: benchmarkAutoEnabled });
-  // Turning it off and back on is the only way to clear a bad stored
-  // profile now that there is no dedicated button for it: the toggle
-  // itself is the escape hatch.
-  if (benchmarkAutoEnabled && !wasEnabled && gpuReport) {
-    await db.deleteMachineProfile(gpuReport);
-    machineProfile = null;
-    notice('Machine profile cleared — the next training run measures it again.', 'info');
-  }
-  renderMachineProfile();
-  updateGuidance();
+  await withNotice('Saving setting', 'Setting saved', async () => {
+    const wasEnabled = benchmarkAutoEnabled;
+    benchmarkAutoEnabled = event.target.value !== 'off';
+    await db.putBenchmarkConfig({ autoEnabled: benchmarkAutoEnabled });
+    // Turning it off and back on is the only way to clear a bad stored
+    // profile now that there is no dedicated button for it: the toggle
+    // itself is the escape hatch.
+    if (benchmarkAutoEnabled && !wasEnabled && gpuReport) {
+      await db.deleteMachineProfile(gpuReport);
+      machineProfile = null;
+      notice('Machine profile cleared — the next training run measures it again.', 'info');
+    }
+    renderMachineProfile();
+    updateGuidance();
+  });
 });
 
 /// Loaded from Settings at startup, and kept live from there.

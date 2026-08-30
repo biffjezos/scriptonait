@@ -65,30 +65,38 @@ h1 {
   margin-top: 1rem;
 }
 
-/* One bar, fixed at the top, for every transient notice. */
+/* One bar, stuck to the top of the viewport above every other element
+   while it's showing something, for every transient notice. `sticky`
+   rather than `fixed` so it still only takes up space in the page while
+   actually visible (it's `hidden` most of the time — info/success
+   notices clear themselves after a few seconds) rather than leaving a
+   permanent empty strip; a much higher z-index than before and a fully
+   opaque background (mixed against the page background, not
+   `transparent`) are what actually fixes scrolled content appearing on
+   top of or bleeding through it. */
 .notification-bar {
   position: sticky;
   top: 0;
-  z-index: 10;
+  z-index: 1000;
   padding: 0.6rem 1.5rem;
   font-size: 0.9rem;
   text-align: center;
 }
 
 .notification-bar.error {
-  background: color-mix(in srgb, var(--danger) 15%, transparent);
+  background: color-mix(in srgb, var(--danger) 15%, var(--bg));
   color: var(--danger);
   border-bottom: 1px solid var(--danger);
 }
 
 .notification-bar.info {
-  background: color-mix(in srgb, var(--accent) 12%, transparent);
+  background: color-mix(in srgb, var(--accent) 12%, var(--bg));
   color: var(--text);
   border-bottom: 1px solid var(--accent);
 }
 
 .notification-bar.success {
-  background: color-mix(in srgb, #4a9a5a 15%, transparent);
+  background: color-mix(in srgb, #4a9a5a 15%, var(--bg));
   color: var(--text);
   border-bottom: 1px solid #4a9a5a;
 }
@@ -457,10 +465,26 @@ footer {
 }
 
 .sample-index-input {
-  width: 5.5ch;
+  width: 4.5rem;
   padding: 0.1rem 0.3rem;
   font: inherit;
   text-align: right;
+  /* Without this the browser's own up/down spinner eats a fixed chunk
+     of the box regardless of `width`, leaving barely enough room for
+     the digits themselves — the field isn't stepped through anyway,
+     it's typed into or driven by the Earlier/Later buttons beside it. */
+  appearance: textfield;
+  -moz-appearance: textfield;
+}
+.sample-index-input::-webkit-outer-spin-button,
+.sample-index-input::-webkit-inner-spin-button {
+  -webkit-appearance: none;
+  margin: 0;
+}
+
+#sample-prev,
+#sample-next {
+  min-width: 5.5rem;
 }
 
 .output {
