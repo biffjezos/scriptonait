@@ -1594,8 +1594,10 @@ function renderSampleHistory() {
   const index = sampleCursor < 0 ? all.length - 1 : Math.min(sampleCursor, all.length - 1);
   const sample = all[index];
   const quality = sample.quality;
-  $('sample-position').textContent =
-    `${index + 1} of ${all.length} · step ${Number(sample.step).toLocaleString()}`;
+  $('sample-index').value = String(index + 1);
+  $('sample-index').max = String(all.length);
+  $('sample-total').textContent = String(all.length);
+  $('sample-step').textContent = Number(sample.step).toLocaleString();
   $('sample-history-head').textContent = [
     `step ${Number(sample.step).toLocaleString()}`,
     typeof sample.loss === 'number' ? `loss ${sample.loss.toFixed(3)}` : null,
@@ -1846,6 +1848,17 @@ $('sample-next').addEventListener('click', () => {
   // Stepping onto the newest goes back to following it, rather than
   // pinning to whatever index the newest happens to be right now.
   sampleCursor = index + 1 >= all.length - 1 ? -1 : index + 1;
+  renderSampleHistory();
+});
+
+$('sample-index').addEventListener('change', (event) => {
+  const all = samples();
+  if (all.length === 0) return;
+  const typed = Math.round(Number(event.target.value));
+  const requested = Number.isFinite(typed) ? Math.min(all.length, Math.max(1, typed)) : all.length;
+  // Same convention as "Later": landing on the newest resumes following
+  // it, rather than pinning to whatever index happens to be newest now.
+  sampleCursor = requested >= all.length ? -1 : requested - 1;
   renderSampleHistory();
 });
 

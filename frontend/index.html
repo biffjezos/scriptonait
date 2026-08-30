@@ -140,7 +140,10 @@
         <div id="sample-history" class="sample-history" hidden>
           <div class="row">
             <button id="sample-prev" type="button" class="secondary">Earlier</button>
-            <span id="sample-position" class="stats"></span>
+            <span class="stats">
+              <input type="number" id="sample-index" min="1" step="1" class="sample-index-input" />
+              of <span id="sample-total"></span> · step <span id="sample-step"></span>
+            </span>
             <button id="sample-next" type="button" class="secondary">Later</button>
           </div>
           <div class="train-sample">

@@ -456,6 +456,13 @@ footer {
   font-size: 0.82rem;
 }
 
+.sample-index-input {
+  width: 5.5ch;
+  padding: 0.1rem 0.3rem;
+  font: inherit;
+  text-align: right;
+}
+
 .output {
   margin-top: 1rem;
   padding: 1rem;
