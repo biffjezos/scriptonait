@@ -233,13 +233,10 @@ function setProgress(barId, fraction) {
   $(barId).style.width = `${(clamped * 100).toFixed(1)}%`;
 }
 
-// --- Title-bar and notifications --------------------------------------
+// --- Title bar -----------------------------------------------------------
 //
 // A background tab shows only its title, so that's where progress goes
-// when the page isn't visible. Notifications need a user gesture to ask
-// for permission, so the checkbox asks when it's ticked rather than on
-// page load — an unprompted permission dialog is exactly the thing
-// everyone has learned to dismiss.
+// when the page isn't visible.
 
 const BASE_TITLE = document.title;
 
@@ -250,40 +247,6 @@ function setTitleProgress(label, fraction) {
   }
   const percent = fraction > 0 ? ` ${(fraction * 100).toFixed(0)}%` : '';
   document.title = `${label}${percent} — ${BASE_TITLE}`;
-}
-
-$('notify-toggle').addEventListener('change', async (event) => {
-  if (!event.target.checked) return;
-  if (!('Notification' in window)) {
-    event.target.checked = false;
-    showError("this browser doesn't support notifications");
-    return;
-  }
-  if (Notification.permission === 'default') {
-    const result = await Notification.requestPermission();
-    if (result !== 'granted') {
-      event.target.checked = false;
-      showError('notifications were blocked — the page will still show progress');
-    }
-  } else if (Notification.permission === 'denied') {
-    event.target.checked = false;
-    showError('notifications are blocked for this site in your browser settings');
-    return;
-  }
-  if (event.target.checked) notice('Notifications turned on.', 'success');
-});
-
-function notify(title, body) {
-  if (!$('notify-toggle').checked) return;
-  if (!('Notification' in window) || Notification.permission !== 'granted') return;
-  // Only worth interrupting for if the user isn't already looking at it.
-  if (document.visibilityState === 'visible') return;
-  try {
-    new Notification(title, { body, tag: 'scriptonait' });
-  } catch (error) {
-    // Some browsers refuse constructor notifications outside a service
-    // worker. Not worth surfacing — the in-page status still updated.
-  }
 }
 
 // --- Model state -------------------------------------------------------
@@ -336,9 +299,7 @@ function updateGuidance() {
   const explains = $('train-explains');
   explains.textContent = !canTrain
     ? 'Training needs WebGPU. This browser did not give the page a GPU.'
-    : !model
-      ? 'New model, from scratch, trained on your GPU.'
-      : '';
+    : '';
 
   if (training) {
     step.textContent = 'Training on your GPU. Stop any time — progress is kept.';
@@ -771,7 +732,6 @@ $('generate-btn').addEventListener('click', async () => {
       `${result.wordCount} words in ${formatDuration(result.elapsedSeconds)} · ` +
       `${result.tokensPerSecond.toFixed(0)} tokens/s · ${why}`;
     renderNotes(result.notes);
-    notify('Your piece is ready', `${result.wordCount} words — ${why}.`);
     notice(`Generated ${result.wordCount} words — ${why}.`, 'success');
     // Measure what came out, to the console. Not on the page: the piece
     // is the point, and a person reading it does not need a score
@@ -1031,10 +991,14 @@ async function refreshSources() {
 }
 
 /// Say how much material is loaded, and whether the model has seen it.
+///
+/// Empty and no note: leaves this line blank rather than repeating
+/// what the sources list's own empty state ("Nothing added yet.") right
+/// above it already says.
 function updateSourceSummary(list, note = '') {
   const stats = $('corpus-stats');
   if (!list || list.length === 0) {
-    stats.textContent = note || 'Nothing added yet.';
+    stats.textContent = note;
     return;
   }
   const chars = list.reduce((sum, s) => sum + (s.rawText || '').length, 0);
@@ -1379,7 +1343,6 @@ function renderPlan(plan) {
   // out which.
   if (plan.phase.key !== lastPhaseKey) {
     if (lastPhaseKey !== null) {
-      notify(`Training: ${plan.phase.title}`, plan.phase.detail);
       notice(`${plan.phase.title} — ${plan.phase.detail}`, 'info');
     }
     console.info(`[scriptonait] phase: ${plan.phase.title} — ${plan.phase.detail}`, n);
@@ -1440,7 +1403,6 @@ onStream('train-advice', ({ advice, step }) => {
   box.hidden = false;
   notice(advice, 'info');
   console.info(`[scriptonait] advice: ${advice}`);
-  notify('Your model has stopped improving', advice);
 });
 
 // The single overwriting sample card is gone \u2014 the Samples panel (backed
@@ -1749,7 +1711,6 @@ onStream('train-stopped', ({ step, reason }) => {
   refreshPlan().catch(() => {});
   if (reason === 'finished') {
     $('train-stats').textContent = `Finished at step ${step.toLocaleString()} — press Train to continue`;
-    notify('Training finished', `${step.toLocaleString()} steps.`);
     notice(`Training finished at step ${step.toLocaleString()}.`, 'success');
     return;
   }
@@ -2413,7 +2374,6 @@ $('train-btn').addEventListener('click', async () => {
       $('train-stats').textContent =
         `${result.steps} steps in ${formatDuration(result.elapsedSeconds)} · loss ${loss}` +
         ' · press Train again to continue';
-      notify('Training finished', `${result.steps} steps, loss ${loss}.`);
       notice(`Training finished — ${result.steps} steps, loss ${loss}.`, 'success');
     }
     if (result.model) renderModel(result.model);
