@@ -16,7 +16,7 @@ mod layer;
 mod optimizer;
 
 pub use layer::LayerWeights;
-pub use optimizer::{clip_global_norm, AdamState};
+pub use optimizer::{clip_global_norm, AdamState, ADAM_BETA1, ADAM_BETA2, ADAM_EPS};
 
 use layer::LayerCache;
 
