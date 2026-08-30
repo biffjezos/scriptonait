@@ -64,6 +64,7 @@ impl WasmLLM {
                 }
             },
             pretrained: true,
+            warmup_variance: false,
         }))))
     }
 
@@ -104,6 +105,7 @@ impl WasmLLM {
             gpu: None,
             train: TrainConfig::default(),
             pretrained: false,
+            warmup_variance: false,
         }))))
     }
 
@@ -181,6 +183,7 @@ impl WasmLLM {
         let config = inner.config;
         let train = inner.train;
         let step = inner.step;
+        let warmup_variance = inner.warmup_variance;
         let context_len = config.context_len;
         // Characters as well as tokens, because the token count moves
         // when the vocabulary is relearned and the character count does
@@ -215,7 +218,7 @@ impl WasmLLM {
              \"contextLen\":{},\"sources\":{},\"corpusTokens\":{},\
              \"trainingTokens\":{},\"validationTokens\":{},\"pretrained\":{},\
              \"plateauScale\":{},\"tokensSeen\":{},\"corpusChars\":{},\"startStep\":{},\
-             \"scheduleKind\":{},\"mix\":[{}]}}",
+             \"scheduleKind\":{},\"warmupVariance\":{},\"mix\":[{}]}}",
             step,
             train.total_steps,
             train.warmup_steps,
@@ -239,6 +242,7 @@ impl WasmLLM {
             corpus_chars,
             train.start_step,
             json_string(schedule_kind),
+            warmup_variance,
             mix,
         )
     }

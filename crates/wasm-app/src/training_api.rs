@@ -141,8 +141,28 @@ impl WasmLLM {
         inner.train.total_steps = steps;
         // Recomputed only when the plan actually changes (a fresh model,
         // or the plan deliberately extended/shortened) — not on every
-        // Train press.
-        inner.train.warmup_steps = TrainConfig::warmup_for(steps);
+        // Train press. Which formula: see `set_warmup_strategy`.
+        inner.train.warmup_steps = if inner.warmup_variance {
+            TrainConfig::warmup_for_variance(steps)
+        } else {
+            TrainConfig::warmup_for(steps)
+        };
+    }
+
+    /// Which formula chooses warmup length when the plan is (re)set: the
+    /// existing 2%-of-plan heuristic (`false`) or RAdam's own
+    /// beta2-derived length (`true`, `TrainConfig::warmup_for_variance`).
+    /// Recomputes `warmup_steps` against the current plan immediately —
+    /// flipping the control should be felt right away, not only the next
+    /// time `set_project_plan` happens to run.
+    pub fn set_warmup_strategy(&self, variance: bool) {
+        let inner = &mut *self.0.borrow_mut();
+        inner.warmup_variance = variance;
+        inner.train.warmup_steps = if variance {
+            TrainConfig::warmup_for_variance(inner.train.total_steps)
+        } else {
+            TrainConfig::warmup_for(inner.train.total_steps)
+        };
     }
 
     /// Where in the current run a given step falls, 0 to 1.
