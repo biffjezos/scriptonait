@@ -71,6 +71,24 @@ jobs:
         with:
           version: latest
 
+      - name: Fetch Bootstrap
+        # Vendored the same way frontend/pkg/ is: fetched here, not
+        # committed (see .gitignore), never loaded from a CDN at runtime
+        # (this project's own stated rule — nothing gets downloaded by
+        # the page itself unasked). Pinned to one version's official
+        # prebuilt dist archive, published by the Bootstrap project on
+        # its own GitHub releases, not a "latest" link, so a Bootstrap
+        # release can't silently change this page.
+        env:
+          BOOTSTRAP_VERSION: 5.3.3
+        run: |
+          curl -sSLf -o /tmp/bootstrap.zip \
+            "https://github.com/twbs/bootstrap/releases/download/v${BOOTSTRAP_VERSION}/bootstrap-${BOOTSTRAP_VERSION}-dist.zip"
+          unzip -q /tmp/bootstrap.zip -d /tmp/bootstrap-dist
+          mkdir -p frontend/vendor/bootstrap
+          cp -r "/tmp/bootstrap-dist/bootstrap-${BOOTSTRAP_VERSION}-dist/css" frontend/vendor/bootstrap/css
+          cp -r "/tmp/bootstrap-dist/bootstrap-${BOOTSTRAP_VERSION}-dist/js" frontend/vendor/bootstrap/js
+
       - name: Check the format strings
         # llm-gpu and wasm-app need crates.io, which the development
         # sandbox has no route to, so they compile for the first time
@@ -88,7 +106,7 @@ jobs:
         # (frontend/backend/remote-backend.js, say) needs this exact
         # coverage or its own syntax error ships silently.
         run: |
-          find frontend -name '*.js' -not -path 'frontend/pkg/*' | while read -r f; do
+          find frontend -name '*.js' -not -path 'frontend/pkg/*' -not -path 'frontend/vendor/*' | while read -r f; do
             name=$(echo "$f" | tr '/' '_')
             cp "$f" "/tmp/${name%.js}.mjs"
             node --check "/tmp/${name%.js}.mjs"

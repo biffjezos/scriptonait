@@ -139,10 +139,11 @@ let noticeTimeout = null;
 
 /// `level` is 'error' | 'info' | 'success'. Errors stay until replaced or
 /// dismissed; info/success clear themselves after a few seconds.
+const NOTICE_ALERT_CLASS = { error: 'alert-danger', info: 'alert-info', success: 'alert-success' };
 function notice(text, level = 'error') {
   const bar = $('notification-bar');
   bar.textContent = text;
-  bar.className = `notification-bar ${level}`;
+  bar.className = `notification-bar alert ${NOTICE_ALERT_CLASS[level] || NOTICE_ALERT_CLASS.error}`;
   bar.hidden = false;
   if (noticeTimeout) clearTimeout(noticeTimeout);
   if (level !== 'error') {

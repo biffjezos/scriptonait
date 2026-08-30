@@ -9,6 +9,26 @@
   --danger: #a83232;
   --mono: 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace;
   --sans: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;
+
+  /* Bootstrap's own components (focus rings, checked checkboxes, active
+     list/dropdown items, `.text-primary`/`.bg-primary` utilities, links)
+     read these variables instead of a fixed blue, so the vendored,
+     unmodified bootstrap.min.css still comes out in this app's existing
+     color scheme. `.btn-primary` needs its own override below — see that
+     comment for why this alone doesn't reach it. */
+  --bs-body-font-family: var(--sans);
+  --bs-body-bg: var(--bg);
+  --bs-body-color: var(--text);
+  --bs-border-color: var(--border);
+  --bs-primary: var(--accent);
+  --bs-primary-rgb: 122, 75, 42;
+  --bs-link-color: var(--accent);
+  --bs-link-color-rgb: 122, 75, 42;
+  --bs-link-hover-color: var(--accent-hover);
+  --bs-link-hover-color-rgb: 95, 58, 32;
+  --bs-danger: var(--danger);
+  --bs-card-bg: var(--panel-bg);
+  --bs-card-border-color: var(--border);
 }
 
 @media (prefers-color-scheme: dark) {
@@ -21,6 +41,13 @@
     --accent: #d99a5f;
     --accent-hover: #eab27c;
     --danger: #e37a7a;
+    --bs-primary-rgb: 217, 154, 95;
+    --bs-link-color-rgb: 217, 154, 95;
+    --bs-link-hover-color-rgb: 234, 178, 124;
+    --bs-body-color-rgb: 236, 231, 221;
+    --bs-emphasis-color: var(--text);
+    --bs-secondary-color: var(--text-dim);
+    --bs-tertiary-bg: var(--panel-bg);
   }
 }
 
@@ -42,12 +69,6 @@ body {
   background: var(--bg);
   color: var(--text);
   line-height: 1.5;
-}
-
-header {
-  padding: 2rem 1.5rem 1rem;
-  max-width: 760px;
-  margin: 0 auto;
 }
 
 h1 {
@@ -83,173 +104,38 @@ h1 {
   text-align: center;
 }
 
-.notification-bar.error {
-  background: color-mix(in srgb, var(--danger) 15%, var(--bg));
-  color: var(--danger);
-  border-bottom: 1px solid var(--danger);
-}
-
-.notification-bar.info {
-  background: color-mix(in srgb, var(--accent) 12%, var(--bg));
-  color: var(--text);
-  border-bottom: 1px solid var(--accent);
-}
-
-.notification-bar.success {
-  background: color-mix(in srgb, #4a9a5a 15%, var(--bg));
-  color: var(--text);
-  border-bottom: 1px solid #4a9a5a;
-}
-
-/* Tabs */
-.tabs {
-  display: flex;
-  gap: 0.25rem;
-  max-width: 760px;
-  margin: 0 auto;
-  padding: 0 1.5rem;
-  border-bottom: 1px solid var(--border);
-}
-
-.tab-button {
-  background: none;
-  border: none;
-  border-bottom: 2px solid transparent;
-  color: var(--text-dim);
-  font: inherit;
-  font-weight: 600;
-  padding: 0.6rem 0.9rem;
-  cursor: pointer;
-}
-
-.tab-button:hover {
-  color: var(--text);
-}
-
-.tab-button.active {
-  color: var(--accent);
-  border-bottom-color: var(--accent);
-}
-
-
-
-
-
-
-
-
-
-
-main {
-  max-width: 760px;
-  margin: 0 auto;
-  padding: 0 1.5rem 3rem;
-  display: flex;
-  flex-direction: column;
-  gap: 1.5rem;
-}
-
-.panel {
-  background: var(--panel-bg);
-  border: 1px solid var(--border);
-  border-radius: 10px;
-  padding: 1.25rem 1.5rem;
-}
-
-.panel h2 {
-  margin-top: 0;
-  font-size: 1.05rem;
-  font-family: var(--mono);
-  color: var(--accent);
-}
-
-.input-group {
-  margin-bottom: 1rem;
-}
-
-.input-group label {
-  display: block;
-  font-weight: 600;
-  margin-bottom: 0.35rem;
-}
-
-.row {
-  display: flex;
-  gap: 0.5rem;
-  align-items: center;
-  flex-wrap: wrap;
-}
-
-input[type="text"],
-input[type="url"],
-input[type="number"],
-textarea,
-select {
-  font: inherit;
-  padding: 0.45rem 0.6rem;
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  background: var(--bg);
-  color: var(--text);
-}
-
-input[type="url"],
-#paste-input,
-#prompt-input {
-  flex: 1;
-  min-width: 200px;
-}
-
 textarea {
-  width: 100%;
-  resize: vertical;
   font-family: var(--mono);
 }
 
-button {
-  font: inherit;
-  font-weight: 600;
-  padding: 0.5rem 1rem;
-  border-radius: 6px;
-  border: 1px solid var(--accent);
-  background: var(--accent);
-  color: #fff;
-  cursor: pointer;
+/* Bootstrap's own `.btn` styles every real button now. `.btn-primary`'s
+   colors, though, are baked into the vendored bootstrap.min.css as fixed
+   hex (Sass resolves `$primary` to a literal at compile time — unlike
+   `.btn`'s own use of `--bs-btn-bg`, the color a variant mixes in isn't a
+   live variable reference), so a `:root` override of `--bs-primary`
+   alone does not retint it. Re-declaring `.btn-primary`'s own local
+   variables is Bootstrap's documented way to retint one component
+   without recompiling Sass. */
+.btn-primary {
+  --bs-btn-bg: var(--accent);
+  --bs-btn-border-color: var(--accent);
+  --bs-btn-hover-bg: var(--accent-hover);
+  --bs-btn-hover-border-color: var(--accent-hover);
+  --bs-btn-active-bg: var(--accent-hover);
+  --bs-btn-active-border-color: var(--accent-hover);
+  --bs-btn-disabled-bg: var(--accent);
+  --bs-btn-disabled-border-color: var(--accent);
+  --bs-btn-focus-shadow-rgb: var(--bs-primary-rgb);
 }
 
-button:hover:not(:disabled) {
-  background: var(--accent-hover);
-  border-color: var(--accent-hover);
-}
-
-button:disabled {
-  opacity: 0.5;
-  cursor: not-allowed;
-}
-
+/* This keeps only the app's "secondary" look (transparent, accent text)
+   layered on top of `.btn-secondary` for the buttons that ask for it via
+   one extra class. */
 button.secondary,
 #stop-train-btn,
 #delete-model-btn {
   background: transparent;
   color: var(--accent);
-}
-
-.file-btn {
-  display: inline-block;
-  font-weight: 600;
-  padding: 0.5rem 1rem;
-  border-radius: 6px;
-  border: 1px solid var(--accent);
-  color: var(--accent);
-  cursor: pointer;
-}
-
-/* `.input-group label` (one class + one element = higher specificity than
-   `.file-btn` alone) was overriding this to `display: block`, stretching
-   the Add Files button to the full width of its container. Two classes
-   beats one class + one element regardless of source order. */
-.input-group .file-btn {
-  display: inline-block;
 }
 
 .hint {
@@ -258,34 +144,8 @@ button.secondary,
   margin: 0.4rem 0;
 }
 
-.settings-grid {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
-  gap: 0.75rem 1rem;
-  margin-bottom: 0.75rem;
-}
-
-.settings-grid label {
-  display: flex;
-  flex-direction: column;
-  gap: 0.25rem;
-  font-size: 0.9rem;
-  font-weight: 600;
-}
-
-.checkbox-label {
-  flex-direction: row !important;
-  align-items: center;
-  gap: 0.5rem !important;
-}
-
-
-.sources-toolbar {
-  display: flex;
-  gap: 0.5rem;
-  margin-top: 0.5rem;
-}
-
+/* The filter box grows to fill the row; the buttons beside it (their own
+   Bootstrap `col-auto`) stay their natural width. */
 .sources-toolbar input {
   flex: 1;
   min-width: 8rem;
@@ -401,13 +261,6 @@ button.secondary,
   margin-top: 0.5rem;
   background: var(--bg);
 }
-
-footer {
-  max-width: 760px;
-  margin: 0 auto;
-  padding: 0 1.5rem 3rem;
-}
-
 
 /* ---------------------------------------------------------------------
    Status, progress and streaming output.
@@ -526,30 +379,6 @@ footer {
   font-size: 0.8rem;
 }
 
-/* Panels are <details> now, so the heading has to sit in the summary. */
-details.panel > summary {
-  cursor: pointer;
-  list-style: none;
-}
-
-details.panel > summary::-webkit-details-marker {
-  display: none;
-}
-
-details.panel > summary h2 {
-  display: inline-block;
-  margin: 0;
-}
-
-details.panel > summary::before {
-  content: '▸ ';
-  color: var(--text-dim);
-}
-
-details.panel[open] > summary::before {
-  content: '▾ ';
-}
-
 .advanced {
   margin-top: 1rem;
   font-size: 0.92rem;
@@ -584,15 +413,6 @@ details.panel[open] > summary::before {
   font-family: var(--mono);
 }
 
-select {
-  padding: 0.4rem;
-  border: 1px solid var(--border);
-  border-radius: 4px;
-  background: var(--panel-bg);
-  color: var(--text);
-  font-family: inherit;
-}
-
 #loss-chart {
   margin-top: 0.75rem;
   width: 100%;
@@ -619,15 +439,6 @@ select {
   white-space: pre-wrap;
   word-break: break-word;
   font-size: 0.9rem;
-}
-
-#sample-prompt {
-  flex: 1;
-  min-width: 12rem;
-}
-
-#sample-every {
-  width: 6rem;
 }
 
 /* What the two loss curves are telling you to do next. Loud enough to
@@ -774,24 +585,6 @@ select {
 
 .sample-history {
   margin-top: 0.75rem;
-}
-
-#live-controls {
-  align-items: center;
-  gap: 0.75rem;
-  margin: 0.5rem 0;
-}
-
-/* Auto-save. A model is hours of somebody's GPU, and until this existed
-   the only thing that wrote it down was the end of a run. */
-#autosave-row {
-  align-items: center;
-  gap: 0.75rem;
-  margin: 0.5rem 0;
-}
-
-#autosave-status {
-  flex: 1 1 20rem;
 }
 
 /* Where the history text lands so it can always be copied by hand. A
