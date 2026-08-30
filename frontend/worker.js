@@ -80,6 +80,26 @@ const PLATEAU_FLOOR = 0.05;
 /// not enough curve yet to measure the noise from.
 const PLATEAU_MIN_DELTA = 0.005;
 
+/// The smallest movement that counts as movement, as a fraction of the
+/// loss level itself.
+///
+/// A curve that is smoothly, monotonically improving has almost no
+/// spread around its own mean by construction — that is what "smooth"
+/// means, not evidence there is nothing left to improve. A noise floor
+/// built only from that spread shrinks fastest exactly when a run is
+/// behaving best, and starts mistaking ordinary deceleration (a cosine
+/// schedule slowing down is expected, not a plateau) for the real
+/// thing. That is what a real run's own history showed: a noise floor
+/// that had shrunk to 0.0036 called four still-falling measurements
+/// "no improvement," cut the rate, which slowed the fall further,
+/// shrank the floor further, and cut again — five cuts in 15,000 of a
+/// 100,000-step plan, landing the schedule on its floor (5% of the
+/// planned rate) before a fifth of the run had happened. This relative
+/// floor is the fix: it can't shrink below a fixed fraction of the
+/// loss's own current level, so a curve has to actually go flat at that
+/// level, not just get smooth, before its own noise counts as evidence.
+const PLATEAU_RELATIVE_FLOOR = 0.01;
+
 /// How much the held-out curve moves on its own, measured from the
 /// curve rather than assumed.
 ///
@@ -96,7 +116,7 @@ function heldOutNoise(series, window) {
   const spread = Math.sqrt(
     recent.reduce((a, b) => a + (b - mean) ** 2, 0) / (recent.length - 1),
   );
-  return Math.max(spread, 0.002);
+  return Math.max(spread, PLATEAU_MIN_DELTA, mean * PLATEAU_RELATIVE_FLOOR);
 }
 
 /// How many held-out windows the validation set holds, and how often it
@@ -1026,6 +1046,13 @@ const live = {
   samplePrompt: '',
   sampleMaxTokens: 0,
   sampling: null,
+  // 'wsd' | 'cosine-cuts' | 'cosine' — see the Settings tab's own
+  // Schedule control. Only 'cosine-cuts' ever calls decay_on_plateau;
+  // the model itself only distinguishes 'wsd' from everything else
+  // (llm.set_schedule_kind), since "cosine" and "cosine-cuts" are the
+  // same shape and differ only in whether this file reacts to a
+  // plateau on top of it.
+  scheduleMode: 'wsd',
 };
 
 /// One place both `train()` (seeding from the settings a run started
@@ -1036,7 +1063,7 @@ const live = {
 /// touched, so a partial push from one changed control never resets
 /// anything else.
 function applyLiveSettings({
-  batchSize, maxSteps, effort, peakLearningRate, boundarySampleRate,
+  batchSize, maxSteps, effort, peakLearningRate, scheduleMode, boundarySampleRate,
   autosaveFrequencySteps, metricsEvery, sampleEvery, samplePrompt, sampleMaxTokens, sampling,
 } = {}) {
   if (typeof batchSize === 'number' && batchSize > 0) live.batchSize = batchSize;
@@ -1051,18 +1078,46 @@ function applyLiveSettings({
     live.effort = effort;
     live.pauseMs = Math.max(0, Math.round(SLICE_MS * (1 - effort) / Math.max(effort, 0.05)));
   }
+  if (typeof scheduleMode === 'string' && llm) {
+    live.scheduleMode = scheduleMode;
+    llm.set_schedule_kind(scheduleMode === 'wsd' ? 'wsd' : 'cosine');
+    // A model saved while stuck under an old plateau cut carries that
+    // cut in its checkpoint regardless of what schedule it resumes
+    // under — switching away from "cosine-cuts" specifically is someone
+    // trying to get out from under exactly that, so clear it here
+    // rather than leaving them to separately find "Undo Plateau Cut."
+    if (scheduleMode !== 'cosine-cuts' && llm.plateau_scale() < 1) {
+      const before = llm.plateau_scale();
+      llm.reset_plateau_scale();
+      log(`schedule changed to ${scheduleMode}; cleared a plateau cut left at ${before.toFixed(2)}x`);
+      recordEvent(llm.step(), 'schedule-restored',
+        `switched to ${scheduleMode}; an earlier plateau cut (${before.toFixed(2)}x) was cleared`);
+    }
+  }
   if (typeof peakLearningRate === 'number' && peakLearningRate > 0 && llm) {
     const before = JSON.parse(llm.training_plan()).peakLr;
     llm.set_learning_rate(peakLearningRate);
     const plan = JSON.parse(llm.training_plan());
     if (plan.peakLr !== before) {
+      // A rate set by hand is the user overriding the schedule's own
+      // judgment — a plateau cut still sitting underneath it from
+      // whatever the rate used to be would keep suppressing it, and the
+      // user asking for a specific rate would silently not get it. This
+      // was the actual shape of "I can't change the learning rate":
+      // typing a new peak while plateau_scale was already down at its
+      // 0.05 floor changed nothing about the rate actually in force.
+      const hadCut = plan.plateauScale < 1;
+      if (hadCut) llm.reset_plateau_scale();
+      const inForce = JSON.parse(llm.training_plan()).lrNow;
       log(
         `peak learning rate changed from ${before.toExponential(2)} to ` +
-          `${plan.peakLr.toExponential(2)}; the rate in force is now ${plan.lrNow.toExponential(2)}`,
+          `${plan.peakLr.toExponential(2)}; the rate in force is now ${inForce.toExponential(2)}` +
+          (hadCut ? ' (an earlier plateau cut was cleared)' : ''),
       );
       recordEvent(plan.step, 'rate-changed',
         `peak learning rate changed by hand from ${before.toExponential(2)} to ` +
-        `${plan.peakLr.toExponential(2)} (in force: ${plan.lrNow.toExponential(2)})`);
+        `${plan.peakLr.toExponential(2)} (in force: ${inForce.toExponential(2)})` +
+        (hadCut ? ' — cleared an earlier plateau cut' : ''));
     }
   }
   if (typeof boundarySampleRate === 'number' && boundarySampleRate >= 0 && llm) {
@@ -1081,14 +1136,14 @@ function applyLiveSettings({
 }
 
 async function train({
-  batchSize, peakLearningRate, maxSteps, effort, sampleEvery, samplePrompt, sampleMaxTokens, sampling,
-  autosaveFrequencySteps, metricsEvery, boundarySampleRate,
+  batchSize, peakLearningRate, maxSteps, effort, scheduleMode, sampleEvery, samplePrompt,
+  sampleMaxTokens, sampling, autosaveFrequencySteps, metricsEvery, boundarySampleRate,
 }) {
   // The exact same call a mid-run settings change makes — see
   // `applyLiveSettings`'s own doc comment. Starting a run is that
   // function's seed case, not a second code path.
   applyLiveSettings({
-    batchSize, maxSteps, effort, peakLearningRate, boundarySampleRate,
+    batchSize, maxSteps, effort, peakLearningRate, scheduleMode, boundarySampleRate,
     autosaveFrequencySteps, metricsEvery, sampleEvery, samplePrompt, sampleMaxTokens, sampling,
   });
   stopRequested = false;
@@ -1388,52 +1443,59 @@ async function train({
           );
           lastBitsPerByte = bpb;
 
-          // Plateau detection. A cosine schedule decays on a plan; it
-          // has no idea whether the run is following it. When held-out
-          // loss stops improving, the usual cause is steps too large to
-          // settle into the minimum the model is circling, and the
-          // usual answer is to cut the rate and let it.
-          // Judged against how much this curve moves anyway, not against
-          // a constant — and not at all until the model has had enough
-          // training for a plateau to be a real thing rather than the
-          // shape of a steep descent seen through noise.
-          const noise = heldOutNoise(heldOut, PLATEAU_PATIENCE);
-          const trained = JSON.parse(llm.training_plan()).tokensSeen;
-          if (bestSeen === null || measured < bestSeen - noise) {
-            bestSeen = measured;
-            sinceImprovement = 0;
-          } else if (trained < TOKENS_BEFORE_CUTTING_THE_RATE) {
-            // Counted, but not acted on: a run that crosses the
-            // threshold mid-plateau should not have to start over.
-            sinceImprovement += 1;
-          } else {
-            sinceImprovement += 1;
-            if (sinceImprovement >= PLATEAU_PATIENCE) {
+          // Plateau detection — only when the Schedule setting actually
+          // asks for it (see live.scheduleMode's own comment). Warmup-
+          // Stable-Decay and plain Cosine already have a principled
+          // answer for "when does the rate come down"; layering a
+          // reactive cut on top of either is how a run's own history
+          // showed the death-spiral this guards against: a shrinking
+          // noise floor keeps mistaking a decelerating-but-real descent
+          // for a plateau, cuts the rate, which slows the descent
+          // further, shrinks the floor further, and cuts again.
+          if (live.scheduleMode === 'cosine-cuts') {
+            // Judged against how much this curve moves anyway, not
+            // against a constant — and not at all until the model has
+            // had enough training for a plateau to be a real thing
+            // rather than the shape of a steep descent seen through
+            // noise.
+            const noise = heldOutNoise(heldOut, PLATEAU_PATIENCE);
+            const trained = JSON.parse(llm.training_plan()).tokensSeen;
+            if (bestSeen === null || measured < bestSeen - noise) {
+              bestSeen = measured;
               sinceImprovement = 0;
-              const before = llm.plateau_scale();
-              const after = llm.decay_on_plateau(PLATEAU_FACTOR, PLATEAU_FLOOR);
-              if (after < before) {
-                log(
-                  `plateau: ${PLATEAU_PATIENCE} held-out measurements with no improvement past ` +
-                    `${bestSeen.toFixed(4)} — cutting the learning rate to ${after.toFixed(2)}x ` +
-                    `the schedule (was ${before.toFixed(2)}x)`,
-                );
-                post('train-advice', {
-                  step: llm.step(),
-                  advice:
-                    `Held-out loss flat for ${PLATEAU_PATIENCE} measurements. Rate cut to ` +
-                    `${after.toFixed(2)}x the schedule.`,
-                });
-                recordEvent(llm.step(), 'rate-cut',
-                  `learning rate cut to ${after.toFixed(2)}x the schedule after ` +
-                  `${PLATEAU_PATIENCE} measurements with no improvement past ` +
-                  `${bestSeen.toFixed(4)} (noise floor ${noise.toFixed(4)})`);
-              } else {
-                log(
-                  `plateau: the learning rate is already at its floor (${after.toFixed(2)}x the ` +
-                    'schedule) and held-out loss is still not improving. More text, or a ' +
-                    'different model shape — not a smaller rate.',
-                );
+            } else if (trained < TOKENS_BEFORE_CUTTING_THE_RATE) {
+              // Counted, but not acted on: a run that crosses the
+              // threshold mid-plateau should not have to start over.
+              sinceImprovement += 1;
+            } else {
+              sinceImprovement += 1;
+              if (sinceImprovement >= PLATEAU_PATIENCE) {
+                sinceImprovement = 0;
+                const before = llm.plateau_scale();
+                const after = llm.decay_on_plateau(PLATEAU_FACTOR, PLATEAU_FLOOR);
+                if (after < before) {
+                  log(
+                    `plateau: ${PLATEAU_PATIENCE} held-out measurements with no improvement past ` +
+                      `${bestSeen.toFixed(4)} — cutting the learning rate to ${after.toFixed(2)}x ` +
+                      `the schedule (was ${before.toFixed(2)}x)`,
+                  );
+                  post('train-advice', {
+                    step: llm.step(),
+                    advice:
+                      `Held-out loss flat for ${PLATEAU_PATIENCE} measurements. Rate cut to ` +
+                      `${after.toFixed(2)}x the schedule.`,
+                  });
+                  recordEvent(llm.step(), 'rate-cut',
+                    `learning rate cut to ${after.toFixed(2)}x the schedule after ` +
+                    `${PLATEAU_PATIENCE} measurements with no improvement past ` +
+                    `${bestSeen.toFixed(4)} (noise floor ${noise.toFixed(4)})`);
+                } else {
+                  log(
+                    `plateau: the learning rate is already at its floor (${after.toFixed(2)}x the ` +
+                      'schedule) and held-out loss is still not improving. More text, or a ' +
+                      'different model shape — not a smaller rate.',
+                  );
+                }
               }
             }
           }
@@ -1605,15 +1667,10 @@ function corpusAdvice(heldOut, trainingLoss, tokensSeen) {
   const improvement = before - now;
   const gap = trainingLoss === null ? 0 : now - trainingLoss;
 
-  // How much the curve wobbles inside each window, so "it went up" is
-  // judged against how much it moves anyway rather than against a
-  // constant somebody picked. With a fixed validation set this is
-  // small, and a rise past it is a real rise.
-  const spread = (xs) => {
-    const m = mean(xs);
-    return Math.sqrt(xs.reduce((a, b) => a + (b - m) ** 2, 0) / Math.max(1, xs.length - 1));
-  };
-  const noise = Math.max(spread(heldOut.slice(-WINDOW * 2)), 0.002);
+  // Same noise floor the plateau detector itself uses — see
+  // heldOutNoise's own comment for why "how much the curve wobbles"
+  // alone isn't enough of a bar.
+  const noise = heldOutNoise(heldOut, WINDOW);
 
   if (improvement < -noise) {
     return 'Held-out loss rising while training loss falls. Add more text, or stop here.';

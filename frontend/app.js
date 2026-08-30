@@ -2083,11 +2083,12 @@ async function persistTrainingPlanSettings() {
     metricsEvery: Number($('metrics-every').value) || 0,
     showTrainingWindow: $('show-training-window').value !== 'off',
     trainingWindowChars: Number($('training-window-chars').value) || 0,
+    scheduleMode: $('schedule-mode').value,
   });
 }
 for (const id of [
   'train-mode', 'train-steps', 'train-effort', 'sample-toggle', 'sample-every',
-  'opening-rate', 'metrics-every', 'show-training-window', 'training-window-chars',
+  'opening-rate', 'metrics-every', 'show-training-window', 'training-window-chars', 'schedule-mode',
 ]) {
   $(id).addEventListener('change', persistTrainingPlanSettings);
 }
@@ -2120,6 +2121,7 @@ function readTrainingSettings() {
     // too high; there is nothing that catches one that is too low
     // except hours of your time.
     peakLearningRate: manualMode ? Number($('train-lr').value) : (fromScratch ? 6e-4 : 5e-5),
+    scheduleMode: $('schedule-mode').value,
     boundarySampleRate: Number($('opening-rate').value) / 100,
     autosaveFrequencySteps: Math.max(1, Number($('autosave-frequency').value) || 1000),
     metricsEvery: Number($('metrics-every').value) || 0,
@@ -2155,7 +2157,7 @@ function pushLiveTrainingSettings() {
 for (const id of [
   'train-mode', 'train-steps', 'train-effort', 'train-batch', 'train-lr', 'opening-rate',
   'sample-toggle', 'sample-every', 'metrics-every', 'autosave-frequency', 'prompt-input',
-  'opt-temperature', 'opt-top-k', 'opt-top-p', 'opt-min-p', 'opt-repetition',
+  'schedule-mode', 'opt-temperature', 'opt-top-k', 'opt-top-p', 'opt-min-p', 'opt-repetition',
   'opt-length-mode', 'opt-max-tokens',
 ]) {
   $(id).addEventListener('change', pushLiveTrainingSettings);
@@ -3436,6 +3438,7 @@ async function applyLoadedSettings() {
       if (planSettings.trainingWindowChars > 0) {
         $('training-window-chars').value = String(planSettings.trainingWindowChars);
       }
+      if (planSettings.scheduleMode) $('schedule-mode').value = planSettings.scheduleMode;
     }
   } catch (error) {
     console.warn('[scriptonait] could not read training-plan settings', error);
