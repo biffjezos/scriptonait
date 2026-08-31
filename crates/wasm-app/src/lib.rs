@@ -142,10 +142,19 @@ struct Inner {
     /// driver a command buffer long enough to trip its watchdog, and
     /// where the best sits is a property of the adapter.
     dispatches_per_submit: u32,
-    /// True when the weights came from a checkpoint rather than from
-    /// random initialization — the difference between "this model can
-    /// write" and "this model needs training first", which the UI has to
-    /// say out loud.
+    /// True when the current weights came from a checkpoint rather than
+    /// from random initialization — the difference between "this model
+    /// can write" and "this model needs training first", which the UI
+    /// has to say out loud. Also what `readTrainingSettings`'s Auto mode
+    /// reads to pick a from-scratch learning rate vs. a fine-tuning one
+    /// — so a fact about where the weights *came from*, set only where
+    /// that's actually true (`from_checkpoint`, `import_checkpoint_inner`)
+    /// and left `false` by `new`. A GPU weight sync
+    /// (`sync_from_gpu_inner`) used to also set this to `true`
+    /// unconditionally on every model, which meant any from-scratch
+    /// model got silently mistaken for pretrained the first time
+    /// training synced weights back — do not set this from anywhere
+    /// that isn't genuinely loading a checkpoint.
     pretrained: bool,
     /// Which formula `set_project_plan` uses for `warmup_steps`: the
     /// existing 2%-of-plan heuristic (`false`, `TrainConfig::warmup_for`)

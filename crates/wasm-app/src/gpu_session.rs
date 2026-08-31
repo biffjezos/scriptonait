@@ -153,7 +153,6 @@ impl WasmLLM {
         let model = llm_gpu::GpuModel::upload(&ctx, &weights, &config).map_err(js_err)?;
         let inner = &mut *self.0.borrow_mut();
         inner.weights = weights;
-        inner.pretrained = true;
         let step = inner.step;
         if let Some(gpu) = inner.gpu.as_mut() {
             gpu.model = Some(model);

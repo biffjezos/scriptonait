@@ -464,13 +464,6 @@
                   <option value="remote">Remote</option>
                 </select>
               </div>
-              <div class="col-sm-6 col-md-4">
-                <label class="form-label" for="training-compute">Device</label>
-                <select id="training-compute" class="form-select">
-                  <option value="gpu" selected>GPU</option>
-                  <option value="cpu" disabled>CPU (needs a GPU)</option>
-                </select>
-              </div>
             </div>
             <div class="row g-2 align-items-center" id="remote-server-settings" hidden>
               <div class="col-auto">
@@ -497,13 +490,6 @@
           <summary class="card-header">Inference</summary>
           <div class="card-body">
             <div class="settings-grid row g-3">
-              <div class="col-sm-6 col-md-4">
-                <label class="form-label" for="inference-location">Location</label>
-                <select id="inference-location" class="form-select">
-                  <option value="local" selected>Local</option>
-                  <option value="remote" disabled>Remote (not available yet)</option>
-                </select>
-              </div>
               <div class="col-sm-6 col-md-4">
                 <label class="form-label" for="inference-device">Device</label>
                 <select id="inference-device" class="form-select">
