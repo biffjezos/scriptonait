@@ -87,6 +87,19 @@ function remoteSourcesPayload() {
     .map((s) => ({ id: s.id, text: s.rawText, isHtml: s.kind === 'url' }));
 }
 
+// Mirrors worker.js's own constants of the same name and values —
+// duplicated, not imported, because the main thread and the training
+// worker are separate execution contexts with no shared module scope.
+// Needed here only for the one case worker.js's own live Auto-mode loop
+// can't reach: a remote run is a single job started once, not a series
+// of local slices this page keeps adjusting, so it needs one concrete
+// rate decided up front rather than deferring to a loop that runs
+// somewhere else entirely (`crates/llm-server`, which has no equivalent
+// of it). Keep both copies in sync if either changes.
+const REMOTE_TOKENS_PER_PARAM = 20;
+const REMOTE_AUTO_LR_FROM_SCRATCH = 6e-4;
+const REMOTE_AUTO_LR_TRAINED = 5e-5;
+
 /// Exports the local model's current checkpoint and starts a remote
 /// training run from it — always the checkpoint path, never a bare
 /// config, since by the time this is called `readTrainingSettings()`'s
@@ -96,11 +109,22 @@ function remoteSourcesPayload() {
 async function startRemoteTraining(settings) {
   const { bytes } = await call('export-checkpoint');
   const checkpointBase64 = bytesToBase64(new Uint8Array(bytes));
+  // Auto mode's rate isn't in `settings` (see readTrainingSettings) — a
+  // remote job needs the one number decided now, from this model's
+  // current token count, since nothing on the remote end will revisit
+  // it the way the local worker's own loop does.
+  let peakLearningRate = settings.peakLearningRate;
+  if (settings.autoLearningRate) {
+    const { numbers } = await call('training-plan', { batchSize: settings.batchSize });
+    peakLearningRate = numbers.tokensSeen < numbers.params * REMOTE_TOKENS_PER_PARAM
+      ? REMOTE_AUTO_LR_FROM_SCRATCH
+      : REMOTE_AUTO_LR_TRAINED;
+  }
   return trainCall('train', {
     checkpointBase64,
     sources: remoteSourcesPayload(),
     batchSize: settings.batchSize,
-    peakLearningRate: settings.peakLearningRate,
+    peakLearningRate,
     maxSteps: settings.maxSteps,
     autosaveFrequencySteps: settings.autosaveFrequencySteps,
   });
@@ -1861,7 +1885,10 @@ $('live-lr-btn').addEventListener('click', async () => {
   const rate = Number($('live-lr').value);
   if (!(rate > 0)) return;
   try {
-    const result = await trainCall('update-training-settings', { peakLearningRate: rate });
+    // autoLearningRate: false, or Auto mode would recompute and silently
+    // overwrite this override on the very next settings push — the
+    // point of an override is that it actually takes effect.
+    const result = await trainCall('update-training-settings', { peakLearningRate: rate, autoLearningRate: false });
     notice(`Peak learning rate is now ${result.peakLr}.`, 'success');
   } catch (error) {
     showError(error);
@@ -2188,25 +2215,24 @@ for (const id of [
 /// it only ever takes effect on a freshly built model, there is no live
 /// version of it.
 function readTrainingSettings() {
-  const fromScratch = model && !model.pretrained;
   const manualMode = $('train-mode').value === 'manual';
   return {
     batchSize: chosenBatchSize(),
     maxSteps: Number($('train-steps').value) || 0,
     effort: chosenEffort(),
-    // Manual mode uses the typed rate as-is. Auto picks one: a new model
-    // needs a rate large enough to learn a language from nothing; a
-    // working one needs a small enough rate not to forget it.
-    //
-    // 6e-4 is what nanoGPT uses for a 768-wide GPT-2, and a narrower
-    // model tolerates more rather than less, so it is a conservative
-    // choice at the widths this page builds — and twice the 3e-4 that
-    // was here, which was simply timid. With warm-up, gradient-norm
-    // clipping at 1.0 and the plateau cut watching held-out loss, there
-    // are three separate things that catch a rate that turns out to be
-    // too high; there is nothing that catches one that is too low
-    // except hours of your time.
-    peakLearningRate: manualMode ? Number($('train-lr').value) : (fromScratch ? 6e-4 : 5e-5),
+    // Manual mode uses the typed rate as-is. Auto mode picks its own,
+    // judged against this model's *live* token count in the worker
+    // (AUTO_LR_FROM_SCRATCH/AUTO_LR_TRAINED in worker.js) rather than
+    // here: `peakLearningRate` below is simply unused in that case.
+    // This used to be decided here, off `model.pretrained` — a fact
+    // about whether the weights came from a checkpoint, which becomes
+    // true the moment this model is ever reloaded from storage and
+    // stays true forever after, regardless of how little of it had
+    // actually trained. That silently capped Auto mode at the small
+    // fine-tuning rate for any model that had survived a single page
+    // reload.
+    peakLearningRate: manualMode ? Number($('train-lr').value) : 0,
+    autoLearningRate: !manualMode,
     scheduleMode: scheduleModeFromAxes({
       stablePhase: $('stable-phase').value,
       cooldownShape: $('cooldown-shape').value,

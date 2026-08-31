@@ -474,6 +474,23 @@ async function trainingSample(prompt, maxTokens, sampling) {
 /// work".
 const TOKENS_PER_PARAM = 20;
 
+/// The Settings tab's Training Mode "Auto" peak learning rate, before
+/// this model has seen its own compute-optimal token budget
+/// (`TOKENS_PER_PARAM * params`, the same "wanted" figure `planActions`
+/// already advises against) — large enough to actually learn a language
+/// from a random start. 6e-4 is what nanoGPT uses for a 768-wide GPT-2;
+/// a narrower model tolerates more rather than less, so it is
+/// conservative at the widths this page builds.
+const AUTO_LR_FROM_SCRATCH = 6e-4;
+/// Auto's peak rate once a model is past that budget: small enough not
+/// to undo what it already knows. Whether a model is "past" its budget
+/// is judged fresh every settings push (see `applyLiveSettings`) against
+/// live `tokensSeen` — not against whether the model was ever reloaded
+/// from storage, which `model.pretrained` used to stand in for and got
+/// this permanently wrong for any model that had survived one page
+/// reload, regardless of how little of its budget it had actually used.
+const AUTO_LR_TRAINED = 5e-5;
+
 /// How many passes over the same text are worth making. Muennighoff et
 /// al. (2023) found repeated data holds up well to about four epochs and
 /// decays after; past roughly sixteen it adds nearly nothing. Four is
@@ -1109,6 +1126,11 @@ const live = {
   // Settings tab's Warm-up control and `set_warmup_strategy`. `false` is
   // the existing 2%-of-plan heuristic every plan has used until now.
   warmupVariance: false,
+  // The Training tab's own Mode control (not the Scheduler's) — true
+  // picks AUTO_LR_FROM_SCRATCH/AUTO_LR_TRAINED by live token budget on
+  // every settings push instead of using whatever `peakLearningRate`
+  // was sent; see `applyLiveSettings`.
+  autoLearningRate: true,
   // The Settings tab's "Decay start" and "Plan length" controls — only
   // reachable when Cool-down timing is Deferred (WSD) and Stable phase
   // is Flat, same guard `applySchedulerCompatibility` already enforces
@@ -1127,7 +1149,7 @@ const live = {
 /// touched, so a partial push from one changed control never resets
 /// anything else.
 function applyLiveSettings({
-  batchSize, maxSteps, effort, peakLearningRate, scheduleMode, boundarySampleRate,
+  batchSize, maxSteps, effort, peakLearningRate, autoLearningRate, scheduleMode, boundarySampleRate,
   autosaveFrequencySteps, metricsEvery, sampleEvery, samplePrompt, sampleMaxTokens, sampling,
   warmupVariance, decayStartAdaptive, planLengthAdaptive,
 } = {}) {
@@ -1166,28 +1188,42 @@ function applyLiveSettings({
         `switched to ${scheduleMode}; an earlier plateau cut (${before.toFixed(2)}x) was cleared`);
     }
   }
-  if (typeof peakLearningRate === 'number' && peakLearningRate > 0 && llm) {
+  if (typeof autoLearningRate === 'boolean') live.autoLearningRate = autoLearningRate;
+  // Auto mode picks its own rate, judged fresh against this model's
+  // *live* token count every time settings are pushed — not decided
+  // once at Train and never revisited, and not standing in a fact about
+  // the model (whether it was ever reloaded from storage, which is what
+  // `pretrained` used to mean here and got permanently wrong for any
+  // model that had survived one page reload). `peakLearningRate` is
+  // still what Manual mode's typed rate arrives as.
+  let effectiveLr = peakLearningRate;
+  if (live.autoLearningRate && llm) {
+    const plan = JSON.parse(llm.training_plan());
+    effectiveLr = plan.tokensSeen < plan.params * TOKENS_PER_PARAM ? AUTO_LR_FROM_SCRATCH : AUTO_LR_TRAINED;
+  }
+  if (typeof effectiveLr === 'number' && effectiveLr > 0 && llm) {
     const before = JSON.parse(llm.training_plan()).peakLr;
-    llm.set_learning_rate(peakLearningRate);
+    llm.set_learning_rate(effectiveLr);
     const plan = JSON.parse(llm.training_plan());
     if (plan.peakLr !== before) {
-      // A rate set by hand is the user overriding the schedule's own
-      // judgment — a plateau cut still sitting underneath it from
-      // whatever the rate used to be would keep suppressing it, and the
-      // user asking for a specific rate would silently not get it. This
-      // was the actual shape of "I can't change the learning rate":
-      // typing a new peak while plateau_scale was already down at its
-      // 0.05 floor changed nothing about the rate actually in force.
+      // A rate change — auto-selected or typed by hand, either is the
+      // schedule's own judgment being overridden — clears a plateau cut
+      // still sitting underneath it from whatever the rate used to be,
+      // which would otherwise keep suppressing it. This was the actual
+      // shape of "I can't change the learning rate": a new peak set
+      // while plateau_scale was already down at its 0.05 floor changed
+      // nothing about the rate actually in force.
       const hadCut = plan.plateauScale < 1;
       if (hadCut) llm.reset_plateau_scale();
       const inForce = JSON.parse(llm.training_plan()).lrNow;
+      const how = live.autoLearningRate ? 'auto-selected' : 'set by hand';
       log(
-        `peak learning rate changed from ${before.toExponential(2)} to ` +
+        `peak learning rate ${how}: ${before.toExponential(2)} to ` +
           `${plan.peakLr.toExponential(2)}; the rate in force is now ${inForce.toExponential(2)}` +
           (hadCut ? ' (an earlier plateau cut was cleared)' : ''),
       );
       recordEvent(plan.step, 'rate-changed',
-        `peak learning rate changed by hand from ${before.toExponential(2)} to ` +
+        `peak learning rate ${how} from ${before.toExponential(2)} to ` +
         `${plan.peakLr.toExponential(2)} (in force: ${inForce.toExponential(2)})` +
         (hadCut ? ' — cleared an earlier plateau cut' : ''));
     }
@@ -1210,15 +1246,15 @@ function applyLiveSettings({
 }
 
 async function train({
-  batchSize, peakLearningRate, maxSteps, effort, scheduleMode, sampleEvery, samplePrompt,
-  sampleMaxTokens, sampling, autosaveFrequencySteps, metricsEvery, boundarySampleRate,
+  batchSize, peakLearningRate, autoLearningRate, maxSteps, effort, scheduleMode, sampleEvery,
+  samplePrompt, sampleMaxTokens, sampling, autosaveFrequencySteps, metricsEvery, boundarySampleRate,
   warmupVariance, decayStartAdaptive, planLengthAdaptive,
 }) {
   // The exact same call a mid-run settings change makes — see
   // `applyLiveSettings`'s own doc comment. Starting a run is that
   // function's seed case, not a second code path.
   applyLiveSettings({
-    batchSize, maxSteps, effort, peakLearningRate, scheduleMode, boundarySampleRate,
+    batchSize, maxSteps, effort, peakLearningRate, autoLearningRate, scheduleMode, boundarySampleRate,
     autosaveFrequencySteps, metricsEvery, sampleEvery, samplePrompt, sampleMaxTokens, sampling,
     warmupVariance, decayStartAdaptive, planLengthAdaptive,
   });
@@ -1249,7 +1285,7 @@ async function train({
     startingAtStep: llm.step(),
     peakLearningRate: startingPlan.peakLr,
     effort: live.effort,
-    learningRate: peakLearningRate > 0 ? peakLearningRate : 'automatic',
+    learningRate: live.autoLearningRate ? 'automatic' : peakLearningRate,
     plateauScale: llm.plateau_scale(),
     params: info.params,
   });
