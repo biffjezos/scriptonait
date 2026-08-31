@@ -1936,12 +1936,18 @@ function profileShapeMatches(profile) {
 function renderMachineProfile() {
   const text = $('machine-profile-text');
   if (!text) return;
-  if (!benchmarkAutoEnabled) {
-    text.textContent = 'Auto-benchmark is off. Batch size falls back to what is typed, or 1.';
-    return;
-  }
   if (benchmarking) {
     text.textContent = 'Measuring this machine…';
+    return;
+  }
+  // Auto-benchmark off only means this shape won't be *measured*
+  // automatically — chosenBatchSize() still uses an existing matching
+  // measurement regardless of this toggle, so "falls back to what is
+  // typed, or 1" is only true when there is no matching measurement to
+  // fall back on either; used to be shown whenever the toggle was off,
+  // even with a perfectly good matching profile already in hand.
+  if (!benchmarkAutoEnabled && (!machineProfile || !profileShapeMatches(machineProfile))) {
+    text.textContent = 'Auto-benchmark is off. Batch size falls back to what is typed, or 1.';
     return;
   }
   if (!machineProfile) {
@@ -2127,13 +2133,27 @@ function applySchedulerCompatibility() {
 }
 
 /// Auto owns every scheduler axis; Manual hands them back, subject to
-/// applySchedulerCompatibility's rules. Mirrors applyTrainMode exactly.
+/// applySchedulerCompatibility's rules. Mirrors applyTrainMode: Auto
+/// doesn't just disable the five selects, it resets them to this app's
+/// own considered defaults (plan-based warm-up, flat stable phase,
+/// deferred/WSD cool-down at the fixed fraction, a fixed plan length) —
+/// otherwise "Auto" would silently keep locking in whatever a previous
+/// Manual session happened to leave typed into these same controls,
+/// which is Manual with the door locked, not Auto.
 function applySchedulerMode() {
   const manual = $('scheduler-mode').value === 'manual';
   for (const id of ['warmup-strategy', 'stable-phase', 'cooldown-shape', 'decay-start', 'plan-length']) {
     $(id).disabled = !manual;
   }
-  if (manual) applySchedulerCompatibility();
+  if (manual) {
+    applySchedulerCompatibility();
+  } else {
+    $('warmup-strategy').value = 'plan';
+    $('stable-phase').value = 'flat';
+    $('cooldown-shape').value = 'deferred';
+    $('decay-start').value = 'fixed';
+    $('plan-length').value = 'fixed';
+  }
   updateGuidance();
 }
 $('scheduler-mode').addEventListener('change', applySchedulerMode);
@@ -2275,7 +2295,7 @@ function pushLiveTrainingSettings() {
 for (const id of [
   'train-mode', 'train-steps', 'train-effort', 'train-batch', 'train-lr', 'opening-rate',
   'sample-toggle', 'sample-every', 'metrics-every', 'autosave-frequency', 'prompt-input',
-  'warmup-strategy', 'stable-phase', 'cooldown-shape', 'decay-start', 'plan-length',
+  'scheduler-mode', 'warmup-strategy', 'stable-phase', 'cooldown-shape', 'decay-start', 'plan-length',
   'opt-temperature', 'opt-top-k', 'opt-top-p', 'opt-min-p', 'opt-repetition', 'opt-length-mode',
   'opt-max-tokens',
 ]) {
