@@ -1250,7 +1250,6 @@ async function train({
   // Held-out losses in order, so the run can say when more text would
   // help more than more steps.
   const heldOut = [];
-  let lastAdvice = null;
   // The phase the run was last seen in, so a change of phase is
   // announced once instead of on every recomputation.
   let lastPhase = null;
@@ -1590,12 +1589,6 @@ async function train({
               scheduleMode: live.scheduleMode,
             });
           }
-          const advice = corpusAdvice(heldOut, trainingProbe, JSON.parse(llm.training_plan()).tokensSeen);
-          if (advice && advice !== lastAdvice) {
-            lastAdvice = advice;
-            log(`advice: ${advice}`);
-            post('train-advice', { advice, step: llm.step() });
-          }
         }
       } catch (error) {
         log(`held-out loss failed: ${(error && error.message) || error}`);
@@ -1691,46 +1684,6 @@ async function train({
     stopReason: stopRequested ? 'stopped' : 'done',
     elapsedSeconds,
   };
-}
-
-/// What the two loss curves are saying, in a sentence, or null while
-/// they are still saying "keep going".
-///
-/// Training loss falls whether a model is learning the language or
-/// memorizing the corpus. Held-out loss is what separates those, and the
-/// two signals worth acting on are: it stopped improving (this corpus
-/// has taught what it can), or it started rising while training loss
-/// falls (the model is memorizing). Both have the same answer - more
-/// text - and both are invisible unless somebody watches the numbers,
-/// so the run watches them.
-function corpusAdvice(heldOut, trainingLoss, tokensSeen) {
-  // Nothing can be concluded from a held-out curve before the model has
-  // actually been trained. At step 250 both curves are falling steeply
-  // together and the difference between two nearby windows of them is
-  // about how fast the fall is, not about overfitting.
-  if (tokensSeen < TOKENS_BEFORE_JUDGING_HELD_OUT) return null;
-  const WINDOW = 5; // 250 steps at the validation cadence
-  if (heldOut.length < WINDOW * 2) return null;
-  const mean = (xs) => xs.reduce((a, b) => a + b, 0) / xs.length;
-  const now = mean(heldOut.slice(-WINDOW));
-  const before = mean(heldOut.slice(-WINDOW * 2, -WINDOW));
-  const improvement = before - now;
-  const gap = trainingLoss === null ? 0 : now - trainingLoss;
-
-  // Same noise floor the plateau detector itself uses — see
-  // heldOutNoise's own comment for why "how much the curve wobbles"
-  // alone isn't enough of a bar.
-  const noise = heldOutNoise(heldOut, WINDOW);
-
-  if (improvement < -noise) {
-    return 'Held-out loss rising while training loss falls. Add more text, or stop here.';
-  }
-  if (improvement < noise) {
-    return gap > 0.3
-      ? 'Held-out loss flat, well above training loss. More text would help more than more steps.'
-      : 'Held-out loss flat. More text, a bigger model, or a higher learning rate would help more than more steps.';
-  }
-  return null;
 }
 
 /// A lost or reset device is the one failure worth naming precisely: it

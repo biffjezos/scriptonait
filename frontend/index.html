@@ -127,6 +127,9 @@
           <div class="col-auto">
             <button id="train-stop-btn" type="button" class="btn btn-secondary secondary" hidden>Stop</button>
           </div>
+          <div class="col-auto">
+            <button id="branch-btn" type="button" class="btn btn-secondary secondary">Branch</button>
+          </div>
         </div>
 
         <div class="row g-2 align-items-end mb-2" id="live-controls" hidden>
@@ -157,7 +160,6 @@
               <div class="progress"><div class="bar progress-bar" id="train-progress-bar"></div></div>
               <p id="train-stats" class="stats"></p>
               <p id="train-window" class="hint"></p>
-              <p id="train-advice" class="advice" hidden></p>
             </div>
 
             <canvas id="loss-chart" width="640" height="160" hidden></canvas>

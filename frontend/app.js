@@ -254,6 +254,15 @@ function setTitleProgress(label, fraction) {
 let model = null;
 let generating = false;
 let training = false;
+/// The promise a local run's own `#train-btn` handler is awaiting —
+/// exposed so another action (Branch) can wait for a stop to genuinely
+/// finish. `trainCall('stop', ...)` only flips a flag in the worker and
+/// returns immediately; the training loop exits on its own schedule, and
+/// this is the only thing that resolves once it actually has. `null`
+/// whenever no local run is in flight. Not set for a remote run — there
+/// is nothing here for Branch to wait on in that case, which is why it's
+/// scoped out of this feature for now.
+let activeTrainingCall = null;
 
 function setModelStatus(state, text) {
   const el = $('model-status');
@@ -1397,12 +1406,14 @@ async function refreshCorpusStats() {
   }
 }
 
+// A point-in-time event (a reactive rate cut just fired — see worker.js's
+// cosine-cuts branch), not a standing verdict — the Progress panel's own
+// action list (planActions, driven by trainingPhase) already covers "what
+// does the curve look like right now" persistently, so this is a toast,
+// not a second box repeating it.
 onStream('train-advice', ({ advice, step }) => {
-  const box = $('train-advice');
-  box.textContent = `At step ${step.toLocaleString()}: ${advice}`;
-  box.hidden = false;
   notice(advice, 'info');
-  console.info(`[scriptonait] advice: ${advice}`);
+  console.info(`[scriptonait] advice at step ${step.toLocaleString()}: ${advice}`);
 });
 
 // The single overwriting sample card is gone \u2014 the Samples panel (backed
@@ -2380,7 +2391,6 @@ $('train-btn').addEventListener('click', async () => {
   $('train-status').hidden = false;
   $('loss-chart').hidden = false;
   $('train-stats').textContent = 'Starting…';
-  $('train-advice').hidden = true;
 
   let runningRemotely = false;
   try {
@@ -2436,7 +2446,8 @@ $('train-btn').addEventListener('click', async () => {
       return;
     }
 
-    const result = await call('train', readTrainingSettings(), [], 0);
+    activeTrainingCall = call('train', readTrainingSettings(), [], 0);
+    const result = await activeTrainingCall;
 
     if (result.stopReason === 'already-training') {
       showError('A training run is already going. Press Stop first if you want to change it.');
@@ -2475,6 +2486,7 @@ $('train-btn').addEventListener('click', async () => {
       setTitleProgress(null);
       updateGuidance();
     }
+    activeTrainingCall = null;
   }
 });
 
@@ -2785,6 +2797,102 @@ $('export-project-btn').addEventListener('click', async () => {
   });
 });
 
+/// One click for what was, until now, four manual steps: stop, export a
+/// copy under a name that says what step and schedule it's from, and
+/// keep training the original unaffected. Unlike Export Project, this
+/// deliberately never calls establishProjectFile — a branch's file must
+/// never become the running project's own auto-save target.
+$('branch-btn').addEventListener('click', async () => {
+  clearError();
+  if (!model) {
+    showError('No model to branch yet.');
+    return;
+  }
+  if (trainingBackendPref === 'remote') {
+    showError('Branching a remote training run is not supported yet.');
+    return;
+  }
+  const scheduleMode = scheduleModeFromAxes({
+    stablePhase: $('stable-phase').value,
+    cooldownShape: $('cooldown-shape').value,
+  });
+  // Asked for immediately, before any await — same reason Export Project
+  // does: the browser only honors showSaveFilePicker while it can still
+  // trace the call back to this click, and the stop-and-wait below is a
+  // real wait that would otherwise burn through that window.
+  let handle = null;
+  if (typeof window.showSaveFilePicker === 'function') {
+    try {
+      handle = await window.showSaveFilePicker({
+        suggestedName: branchFileName(model.step, scheduleMode),
+        types: [{ description: 'scriptonait project', accept: { 'application/octet-stream': ['.snp'] } }],
+      });
+    } catch (error) {
+      if (error && error.name === 'AbortError') return;
+      showError(error);
+      return;
+    }
+  }
+  $('branch-btn').disabled = true;
+  try {
+    await withNotice('Branching project', 'Branched project', async () => {
+      const wasTraining = training;
+      if (wasTraining) {
+        trainCall('stop', {}, [], 0).catch(() => {});
+        // The stop button only requests a stop; this is what actually
+        // waits for the run to finish, so the export below reads a
+        // quiescent checkpoint instead of racing the last few steps.
+        await activeTrainingCall.catch(() => {});
+      }
+      await persistChain;
+      const checkpointBytes = model ? (await call('export-checkpoint')).bytes : null;
+      const optimizerBytes = model
+        ? await call('export-optimizer').then((r) => r.bytes).catch(() => null)
+        : null;
+      const exportedSources = await db.listSources();
+      const exportedHistory = await db.listHistory();
+      const blob = project.buildProjectFile({
+        checkpointBytes,
+        optimizerBytes,
+        sources: exportedSources,
+        history: exportedHistory,
+        settings: {
+          autosaveConfig: await db.getAutosaveConfig(),
+          devicePreference: await db.getDevicePreference(),
+          benchmarkConfig: await db.getBenchmarkConfig(),
+          trainingPlan: await db.getTrainingPlanSettings(),
+          remoteServerConfig: await db.getRemoteServerConfig(),
+          inferenceOptions: await db.getInferenceOptions(),
+        },
+      });
+      if (handle) {
+        const writable = await handle.createWritable();
+        try {
+          await writable.write(blob);
+        } finally {
+          await writable.close();
+        }
+      } else {
+        const url = URL.createObjectURL(blob);
+        const link = document.createElement('a');
+        link.href = url;
+        link.download = branchFileName(model.step, scheduleMode);
+        link.click();
+        URL.revokeObjectURL(url);
+      }
+      // Resume the original run exactly as a second Train press would —
+      // by this point activeTrainingCall has settled, so the Train
+      // handler's own state (training/button/live-controls) is already
+      // back to "stopped," and pressing it again runs the same, already-
+      // exercised "a model exists, go straight to training" path.
+      if (wasTraining) $('train-btn').dispatchEvent(new Event('click'));
+      return wasTraining ? 'Branched — continuing the original run.' : 'Branched.';
+    });
+  } finally {
+    $('branch-btn').disabled = false;
+  }
+});
+
 $('import-project-input').addEventListener('change', async (event) => {
   const file = event.target.files[0];
   if (!file) return;
@@ -3004,6 +3112,14 @@ function autosaveBaseName() {
 
 function autosaveStepFileName(step) {
   return `${autosaveBaseName()}-step${String(Math.max(0, Math.round(step))).padStart(10, '0')}.snp`;
+}
+
+/// The suggested name for a Branch export — the step-suffixed pattern
+/// above, plus the schedule mode, since that's the setting most likely
+/// to be the reason a branch exists at all.
+function branchFileName(step, scheduleMode) {
+  const stepPart = String(Math.max(0, Math.round(step))).padStart(10, '0');
+  return `${autosaveBaseName()}-branch-step${stepPart}-${scheduleMode}.snp`;
 }
 
 /// The whole project — model, corpus, history, settings — as one blob,

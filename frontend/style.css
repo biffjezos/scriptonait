@@ -363,18 +363,6 @@ textarea {
   font-size: 0.9rem;
 }
 
-/* What the two loss curves are telling you to do next. Loud enough to
-   read at a glance, quiet enough not to look like an error. */
-.advice {
-  margin: 0.5rem 0 0;
-  padding: 0.5rem 0.75rem;
-  border-left: 3px solid var(--accent);
-  background: color-mix(in srgb, var(--accent) 8%, transparent);
-  color: var(--text);
-  font-size: 0.9rem;
-  line-height: 1.4;
-}
-
 /* What the shape in the fields would cost, before it is built. Choosing
    a model shape is choosing hours and gigabytes, and neither is
    guessable from "12 layers, 516 hidden". */
