@@ -2078,22 +2078,32 @@ function axesFromScheduleMode(scheduleMode) {
 /// Which of the other Manual-mode scheduler selects a given choice rules
 /// out, and what to coerce them to rather than leave them on a value
 /// that no longer means anything. Reactive plateau-cuts combined with a
-/// deferred (WSD) cool-down is a documented failure mode — this
-/// session's own plateau-cut death spiral — so it forces the cool-down
-/// back to Immediate, the simple, well-tested shape today's
-/// "cosine-cuts" already is, rather than leaving that combination
-/// reachable.
+/// deferred (WSD) cool-down, or with an adaptively-extended plan, is a
+/// documented failure mode — this session's own plateau-cut death
+/// spiral — so it forces the cool-down back to Immediate and the plan
+/// length back to Fixed, the simple, well-tested shape today's
+/// "cosine-cuts" already is, rather than leaving either combination
+/// reachable. Decay start only means anything once there is a deferred
+/// cool-down to place within.
 function applySchedulerCompatibility() {
   const reactive = $('stable-phase').value === 'reactive-cuts';
+
   $('cooldown-shape').disabled = reactive;
   if (reactive) $('cooldown-shape').value = 'immediate';
+
+  const deferred = $('cooldown-shape').value === 'deferred' && !reactive;
+  $('decay-start').disabled = !deferred;
+  if (!deferred) $('decay-start').value = 'fixed';
+
+  $('plan-length').disabled = reactive;
+  if (reactive) $('plan-length').value = 'fixed';
 }
 
 /// Auto owns every scheduler axis; Manual hands them back, subject to
 /// applySchedulerCompatibility's rules. Mirrors applyTrainMode exactly.
 function applySchedulerMode() {
   const manual = $('scheduler-mode').value === 'manual';
-  for (const id of ['warmup-strategy', 'stable-phase', 'cooldown-shape']) {
+  for (const id of ['warmup-strategy', 'stable-phase', 'cooldown-shape', 'decay-start', 'plan-length']) {
     $(id).disabled = !manual;
   }
   if (manual) applySchedulerCompatibility();
@@ -2129,6 +2139,8 @@ async function persistTrainingPlanSettings() {
     warmupStrategy: $('warmup-strategy').value,
     stablePhase: axes.stablePhase,
     cooldownShape: axes.cooldownShape,
+    decayStartAdaptive: $('decay-start').value === 'adaptive',
+    planLengthAdaptive: $('plan-length').value === 'adaptive-extend',
     // Kept alongside the axes above (not only derivable from them) so a
     // project this file writes still opens correctly in a build from
     // before the axes existed.
@@ -2138,7 +2150,7 @@ async function persistTrainingPlanSettings() {
 for (const id of [
   'train-mode', 'train-steps', 'train-effort', 'train-batch', 'train-lr', 'sample-toggle',
   'sample-every', 'opening-rate', 'metrics-every', 'show-training-window', 'training-window-chars',
-  'scheduler-mode', 'warmup-strategy', 'stable-phase', 'cooldown-shape',
+  'scheduler-mode', 'warmup-strategy', 'stable-phase', 'cooldown-shape', 'decay-start', 'plan-length',
 ]) {
   $(id).addEventListener('change', () =>
     withNotice('Saving setting', 'Setting saved', persistTrainingPlanSettings));
@@ -2200,6 +2212,8 @@ function readTrainingSettings() {
       cooldownShape: $('cooldown-shape').value,
     }),
     warmupVariance: $('warmup-strategy').value === 'variance',
+    decayStartAdaptive: $('decay-start').value === 'adaptive',
+    planLengthAdaptive: $('plan-length').value === 'adaptive-extend',
     boundarySampleRate: Number($('opening-rate').value) / 100,
     autosaveFrequencySteps: Math.max(1, Number($('autosave-frequency').value) || 1000),
     metricsEvery: Number($('metrics-every').value) || 0,
@@ -2235,8 +2249,9 @@ function pushLiveTrainingSettings() {
 for (const id of [
   'train-mode', 'train-steps', 'train-effort', 'train-batch', 'train-lr', 'opening-rate',
   'sample-toggle', 'sample-every', 'metrics-every', 'autosave-frequency', 'prompt-input',
-  'warmup-strategy', 'stable-phase', 'cooldown-shape', 'opt-temperature', 'opt-top-k', 'opt-top-p',
-  'opt-min-p', 'opt-repetition', 'opt-length-mode', 'opt-max-tokens',
+  'warmup-strategy', 'stable-phase', 'cooldown-shape', 'decay-start', 'plan-length',
+  'opt-temperature', 'opt-top-k', 'opt-top-p', 'opt-min-p', 'opt-repetition', 'opt-length-mode',
+  'opt-max-tokens',
 ]) {
   $(id).addEventListener('change', pushLiveTrainingSettings);
 }
@@ -3685,6 +3700,8 @@ async function applyLoadedSettings() {
       $('warmup-strategy').value = planSettings.warmupStrategy === 'variance' ? 'variance' : 'plan';
       $('stable-phase').value = axes.stablePhase;
       $('cooldown-shape').value = axes.cooldownShape;
+      $('decay-start').value = planSettings.decayStartAdaptive ? 'adaptive' : 'fixed';
+      $('plan-length').value = planSettings.planLengthAdaptive ? 'adaptive-extend' : 'fixed';
     }
   } catch (error) {
     console.warn('[scriptonait] could not read training-plan settings', error);

@@ -218,7 +218,7 @@ impl WasmLLM {
              \"contextLen\":{},\"sources\":{},\"corpusTokens\":{},\
              \"trainingTokens\":{},\"validationTokens\":{},\"pretrained\":{},\
              \"plateauScale\":{},\"tokensSeen\":{},\"corpusChars\":{},\"startStep\":{},\
-             \"scheduleKind\":{},\"warmupVariance\":{},\"mix\":[{}]}}",
+             \"scheduleKind\":{},\"warmupVariance\":{},\"wsdDecayStart\":{},\"mix\":[{}]}}",
             step,
             train.total_steps,
             train.warmup_steps,
@@ -243,6 +243,7 @@ impl WasmLLM {
             train.start_step,
             json_string(schedule_kind),
             warmup_variance,
+            train.wsd_decay_start(),
             mix,
         )
     }

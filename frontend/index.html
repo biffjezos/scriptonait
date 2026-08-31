@@ -323,6 +323,20 @@
                   <option value="immediate">Immediate — decays from warm-up onward (Cosine)</option>
                 </select>
               </div>
+              <div class="col-sm-6 col-md-4">
+                <label class="form-label" for="decay-start">Decay start</label>
+                <select id="decay-start" class="form-select">
+                  <option value="fixed" selected>Fixed fraction (80% of the plan)</option>
+                  <option value="adaptive">Adaptive — starts early on a detected plateau</option>
+                </select>
+              </div>
+              <div class="col-sm-6 col-md-4">
+                <label class="form-label" for="plan-length">Plan length</label>
+                <select id="plan-length" class="form-select">
+                  <option value="fixed" selected>Fixed</option>
+                  <option value="adaptive-extend">Adaptive — extends while still improving</option>
+                </select>
+              </div>
             </div>
           </div>
         </details>

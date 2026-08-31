@@ -80,6 +80,17 @@ const PLATEAU_FLOOR = 0.05;
 /// not enough curve yet to measure the noise from.
 const PLATEAU_MIN_DELTA = 0.005;
 
+/// How much longer an adaptively-extended plan grows each time — a
+/// fifth more steps, the same fraction WSD_DECAY_FRACTION reserves for
+/// decaying, so an extension gives roughly another decay window's worth
+/// of room rather than an arbitrary bump.
+const PLAN_EXTEND_FRACTION = 0.2;
+/// How many times one run may extend itself. Every extension requires
+/// fresh evidence of real improvement (see heldOutTrend), so this is a
+/// backstop against a curve that keeps barely clearing the noise floor
+/// forever, not the expected case.
+const PLAN_EXTEND_MAX_TIMES = 5;
+
 /// The smallest movement that counts as movement, as a fraction of the
 /// loss level itself.
 ///
@@ -476,6 +487,39 @@ const USEFUL_EPOCHS = 4;
 /// starts producing sentences rather than words.
 const TOKENS_BEFORE_JUDGING_THE_CORPUS = 10e6;
 
+/// How much the held-out curve moved between its two most recent
+/// windows of measurements, and the noise floor to judge that move
+/// against: `trend > noise` is still meaningfully improving, `trend <
+/// -noise` has risen (memorizing), anything in between is a plateau.
+/// `{ trend: null, noise: 0 }` before there is enough history or enough
+/// of the corpus has gone through the model for either answer to mean
+/// anything (see TOKENS_BEFORE_JUDGING_HELD_OUT) — every caller must
+/// treat `null` as "no verdict yet," not as zero.
+///
+/// Shared by `trainingPhase` and the adaptive scheduler axes (cool-down
+/// timing, plan length) below, so anything that asks "is this curve
+/// still improving" asks it through the exact same math. They used to
+/// each keep their own copy: the plateau detector cut the learning rate
+/// in half at step 3,800 while the phase display beside it said
+/// "held-out loss still improving", because each read the curve's own
+/// spread through a different formula. heldOutNoise's relative floor
+/// also matters here specifically — a curve that has gone smooth rather
+/// than actually flat has almost no spread of its own, and a noise
+/// floor built only from that spread is what mistook a still-falling
+/// curve for a plateau before.
+function heldOutTrend(heldOut, tokensSeen) {
+  const WINDOW = 5;
+  if (heldOut.length < WINDOW * 2 || tokensSeen < TOKENS_BEFORE_JUDGING_HELD_OUT) {
+    return { trend: null, noise: 0 };
+  }
+  const mean = (xs) => xs.reduce((a, b) => a + b, 0) / xs.length;
+  const recent = heldOut.slice(-WINDOW * 2);
+  return {
+    trend: mean(recent.slice(0, WINDOW)) - mean(recent.slice(WINDOW)),
+    noise: heldOutNoise(heldOut, WINDOW),
+  };
+}
+
 /// Which phase of a run this is, and what that means for what you are
 /// looking at.
 ///
@@ -496,32 +540,12 @@ function trainingPhase(plan, { heldOut, trainingLoss }) {
     };
   }
 
-  // Trend over the held-out curve, on the same window and against the
-  // same noise floor the corpus advice uses (heldOutNoise, not a second
-  // copy of its math), so the two never disagree about which way the
-  // line is going. They used to: the plateau detector cut the learning
-  // rate in half at step 3,800 while the phase beside it said "held-out
-  // loss still improving", because each read the curve's own spread
-  // through a different formula. heldOutNoise's relative floor also
-  // matters here specifically — a curve that has gone smooth rather than
-  // actually flat has almost no spread of its own, and a noise floor
-  // built only from that spread is what mistook a still-falling curve
-  // for a plateau before.
-  //
-  // Both are gated on the model having actually been trained. A curve
-  // 250 steps into a run is falling off a cliff; the difference between
-  // two adjacent windows of it is about how steep the cliff is at two
-  // nearby moments, and calling that "overfitting" is how a page ends up
+  // Both gated on the model having actually been trained. A curve 250
+  // steps into a run is falling off a cliff; the difference between two
+  // adjacent windows of it is about how steep the cliff is at two nearby
+  // moments, and calling that "overfitting" is how a page ends up
   // warning about memorization before the model can spell.
-  const WINDOW = 5;
-  let trend = null;
-  let noise = 0;
-  if (heldOut.length >= WINDOW * 2 && plan.tokensSeen >= TOKENS_BEFORE_JUDGING_HELD_OUT) {
-    const mean = (xs) => xs.reduce((a, b) => a + b, 0) / xs.length;
-    const recent = heldOut.slice(-WINDOW * 2);
-    noise = heldOutNoise(heldOut, WINDOW);
-    trend = mean(recent.slice(0, WINDOW)) - mean(recent.slice(WINDOW));
-  }
+  const { trend, noise } = heldOutTrend(heldOut, plan.tokensSeen);
   const gap = trainingLoss === null || heldOut.length === 0
     ? null
     : heldOut[heldOut.length - 1] - trainingLoss;
@@ -1085,6 +1109,14 @@ const live = {
   // Settings tab's Warm-up control and `set_warmup_strategy`. `false` is
   // the existing 2%-of-plan heuristic every plan has used until now.
   warmupVariance: false,
+  // The Settings tab's "Decay start" and "Plan length" controls — only
+  // reachable when Cool-down timing is Deferred (WSD) and Stable phase
+  // is Flat, same guard `applySchedulerCompatibility` already enforces
+  // for reactive-cuts. Both false is every plan's behavior until now:
+  // decay starts at the fixed WSD_DECAY_FRACTION point, and a plan never
+  // grows itself.
+  decayStartAdaptive: false,
+  planLengthAdaptive: false,
 };
 
 /// One place both `train()` (seeding from the settings a run started
@@ -1097,7 +1129,7 @@ const live = {
 function applyLiveSettings({
   batchSize, maxSteps, effort, peakLearningRate, scheduleMode, boundarySampleRate,
   autosaveFrequencySteps, metricsEvery, sampleEvery, samplePrompt, sampleMaxTokens, sampling,
-  warmupVariance,
+  warmupVariance, decayStartAdaptive, planLengthAdaptive,
 } = {}) {
   if (typeof batchSize === 'number' && batchSize > 0) live.batchSize = batchSize;
   // Before `maxSteps` below: set_project_plan reads this same strategy
@@ -1173,12 +1205,14 @@ function applyLiveSettings({
   if (typeof samplePrompt === 'string') live.samplePrompt = samplePrompt;
   if (typeof sampleMaxTokens === 'number') live.sampleMaxTokens = sampleMaxTokens;
   if (sampling) live.sampling = sampling;
+  if (typeof decayStartAdaptive === 'boolean') live.decayStartAdaptive = decayStartAdaptive;
+  if (typeof planLengthAdaptive === 'boolean') live.planLengthAdaptive = planLengthAdaptive;
 }
 
 async function train({
   batchSize, peakLearningRate, maxSteps, effort, scheduleMode, sampleEvery, samplePrompt,
   sampleMaxTokens, sampling, autosaveFrequencySteps, metricsEvery, boundarySampleRate,
-  warmupVariance,
+  warmupVariance, decayStartAdaptive, planLengthAdaptive,
 }) {
   // The exact same call a mid-run settings change makes — see
   // `applyLiveSettings`'s own doc comment. Starting a run is that
@@ -1186,7 +1220,7 @@ async function train({
   applyLiveSettings({
     batchSize, maxSteps, effort, peakLearningRate, scheduleMode, boundarySampleRate,
     autosaveFrequencySteps, metricsEvery, sampleEvery, samplePrompt, sampleMaxTokens, sampling,
-    warmupVariance,
+    warmupVariance, decayStartAdaptive, planLengthAdaptive,
   });
   stopRequested = false;
   training = true;
@@ -1268,6 +1302,9 @@ async function train({
   let bestSeen = null;
   // Median-ish step cost, for the estimate of how long the rest takes.
   let recentStepMs = null;
+  // How many times "Plan length: Adaptive, extends" has grown this run's
+  // plan — see PLAN_EXTEND_MAX_TIMES.
+  let planExtensions = 0;
 
   // Say where the run is starting from before it starts: which phase,
   // how much text there is for a model this size, what would help.
@@ -1540,6 +1577,79 @@ async function train({
               }
             }
           }
+
+          // The two adaptive scheduler axes ("Decay start", "Plan
+          // length") — both read the current plan fresh, since either
+          // may have just changed it under the other.
+          {
+            const plan = JSON.parse(llm.training_plan());
+
+            // Decay start, adaptive: bring WSD's decay forward from the
+            // fixed WSD_DECAY_FRACTION point to right now, the first
+            // time the held-out curve stops clearing its own noise
+            // floor — the same signal trainingPhase calls a plateau (or
+            // worse, overfitting; either way, early cool-down is the
+            // right response). Only ever moves decay earlier, never
+            // later: once the fixed point arrives on its own, `step <
+            // wsdDecayStart` is already false and there is nothing left
+            // to do here.
+            if (live.scheduleMode === 'wsd' && live.decayStartAdaptive && llm.step() < plan.wsdDecayStart) {
+              const { trend, noise } = heldOutTrend(heldOut, plan.tokensSeen);
+              if (trend !== null && trend < noise) {
+                const fixedPoint = plan.wsdDecayStart;
+                llm.set_decay_start(llm.step());
+                log(
+                  `adaptive cool-down: held-out loss has stopped improving — starting the decay ` +
+                    `now at step ${llm.step().toLocaleString()}, ` +
+                    `${(fixedPoint - llm.step()).toLocaleString()} steps ahead of the fixed point`,
+                );
+                post('train-advice', {
+                  step: llm.step(),
+                  advice:
+                    'Held-out loss has plateaued — cooling down now instead of waiting for the ' +
+                    'fixed point.',
+                });
+                recordEvent(llm.step(), 'decay-started',
+                  `adaptive cool-down: decay pinned to step ${llm.step()} (the fixed point would ` +
+                  `have been ${fixedPoint})`);
+              }
+            }
+
+            // Plan length, adaptive: a plan that reaches its planned
+            // length while still genuinely improving parks its rate at
+            // the floor and stops getting anywhere — trainingPhase's own
+            // "past-plan" phase exists because that happens. Extending
+            // here is that phase's fix: grow the plan by
+            // PLAN_EXTEND_FRACTION, capped at PLAN_EXTEND_MAX_TIMES per
+            // run, so a run still earning its keep gets more room
+            // instead of idling at the floor.
+            if (
+              live.planLengthAdaptive && plan.plannedSteps > 0 && plan.step >= plan.plannedSteps &&
+              planExtensions < PLAN_EXTEND_MAX_TIMES
+            ) {
+              const { trend, noise } = heldOutTrend(heldOut, plan.tokensSeen);
+              if (trend !== null && trend > noise) {
+                const additional = Math.max(1, Math.round(plan.plannedSteps * PLAN_EXTEND_FRACTION));
+                llm.extend_plan(additional);
+                planExtensions += 1;
+                const grownTo = JSON.parse(llm.training_plan()).plannedSteps;
+                log(
+                  `adaptive plan length: held-out loss is still improving past the planned ` +
+                    `${plan.plannedSteps.toLocaleString()} steps — extending by ` +
+                    `${additional.toLocaleString()} to ${grownTo.toLocaleString()} (extension ` +
+                    `${planExtensions} of ${PLAN_EXTEND_MAX_TIMES})`,
+                );
+                post('train-advice', {
+                  step: llm.step(),
+                  advice: `Still improving at the planned length — extended to ${grownTo.toLocaleString()} steps.`,
+                });
+                recordEvent(llm.step(), 'plan-extended',
+                  `adaptive plan length: extended from ${plan.plannedSteps} to ${grownTo} steps ` +
+                  `(extension ${planExtensions} of ${PLAN_EXTEND_MAX_TIMES})`);
+              }
+            }
+          }
+
           lastPhase = reportPlan({
             heldOut,
             trainingLoss: trainingProbe,

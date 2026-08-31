@@ -366,7 +366,8 @@ export async function getBenchmarkConfig() {
 ///   sampleToggle, sampleEvery, boundarySampleRate, metricsEvery,
 ///   showTrainingWindow, trainingWindowChars, schedulerMode: 'auto'|'manual',
 ///   warmupStrategy: 'plan'|'variance', stablePhase: 'flat'|'reactive-cuts',
-///   cooldownShape: 'deferred'|'immediate', scheduleMode }
+///   cooldownShape: 'deferred'|'immediate', decayStartAdaptive, planLengthAdaptive,
+///   scheduleMode }
 ///
 /// The Training tab's own settings, previously DOM-only: they reset to
 /// the markup's hardcoded defaults on every reload, which is the gap
@@ -392,6 +393,15 @@ export async function getBenchmarkConfig() {
 /// still open correctly in one from before the two axes existed; on a
 /// project saved before either existed, callers derive the axes from
 /// `scheduleMode` instead of resetting to a hardcoded default.
+///
+/// `decayStartAdaptive` and `planLengthAdaptive` are the Scheduler
+/// panel's "Decay start" and "Plan length" controls — whether the
+/// worker may pin a `Wsd` run's decay window early on a detected
+/// plateau, and whether it may grow the plan when still improving past
+/// its planned length; see worker.js's own `live.decayStartAdaptive`/
+/// `live.planLengthAdaptive` and `llm.set_decay_start`/`extend_plan`.
+/// Missing (a project saved before either existed) is `false` for both,
+/// today's only behavior until they did.
 export async function putTrainingPlanSettings(settings) {
   const record = { ...settings, id: TRAINING_PLAN_SETTINGS, savedAt: Date.now() };
   await withStore(SETTINGS_STORE, 'readwrite', (store) => store.put(record));

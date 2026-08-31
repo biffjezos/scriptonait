@@ -108,6 +108,13 @@ pub struct TrainConfig {
     pub plateau_scale: f32,
     /// The shape the decay takes; see `ScheduleKind`.
     pub schedule: ScheduleKind,
+    /// Where a `Wsd` run's decay window begins, if the Settings tab's
+    /// "Decay start" control has been set to Adaptive and a plateau has
+    /// pinned it — see `wsd_decay_start`. `None` (every plan's behavior
+    /// until this control existed) uses the fixed `WSD_DECAY_FRACTION`
+    /// point instead. Meaningless for `Cosine`, which has no separate
+    /// decay-start concept — decay always starts right after warmup.
+    pub decay_start_override: Option<u64>,
 }
 
 impl Default for TrainConfig {
@@ -122,6 +129,7 @@ impl Default for TrainConfig {
             start_step: 0,
             plateau_scale: 1.0,
             schedule: ScheduleKind::default(),
+            decay_start_override: None,
         }
     }
 }
@@ -175,11 +183,7 @@ impl TrainConfig {
                 self.lr * self.decayed_ratio(progress) * self.plateau_scale
             }
             ScheduleKind::Wsd => {
-                // Decay never starts before warmup ends, even on a plan
-                // short enough that WSD_DECAY_FRACTION of it would land
-                // inside warmup.
-                let decay_start = ((self.total_steps as f32 * (1.0 - WSD_DECAY_FRACTION)) as u64)
-                    .max(self.warmup_steps);
+                let decay_start = self.wsd_decay_start();
                 if into_run < decay_start {
                     self.lr * self.plateau_scale
                 } else {
@@ -189,6 +193,20 @@ impl TrainConfig {
                 }
             }
         }
+    }
+
+    /// Where a `Wsd` run's decay window begins: `decay_start_override`
+    /// if the adaptive cool-down has pinned one, else the fixed
+    /// `WSD_DECAY_FRACTION` point — never before `warmup_steps` ends,
+    /// even on a plan short enough that the fixed fraction of it would
+    /// land inside warmup, or an override taken before warmup finished.
+    /// Exposed (not just used inside `lr_at`) so the adaptive cool-down
+    /// detector can tell how much room is left before the fixed point
+    /// arrives on its own.
+    pub fn wsd_decay_start(&self) -> u64 {
+        let fixed_point = ((self.total_steps as f32 * (1.0 - WSD_DECAY_FRACTION)) as u64)
+            .max(self.warmup_steps);
+        self.decay_start_override.unwrap_or(fixed_point).max(self.warmup_steps)
     }
 
     /// The cosine-shaped fraction of `lr` in force at `progress` (0 at
@@ -756,6 +774,53 @@ mod tests {
                 cut.lr_at(step)
             );
         }
+    }
+
+    #[test]
+    fn decay_start_override_moves_where_wsd_starts_decaying() {
+        let cfg = TrainConfig { decay_start_override: Some(400), ..wsd_schedule() };
+        // Still at peak just before the pinned point, decaying from it —
+        // not from the fixed (1 - 0.2) * 1000 = 800 point wsd_schedule()
+        // would otherwise use.
+        assert!((cfg.lr_at(399) - cfg.lr).abs() < 1e-9, "peak just before the override");
+        assert!(cfg.lr_at(500) < cfg.lr, "decaying past the override");
+        assert_eq!(cfg.wsd_decay_start(), 400);
+    }
+
+    #[test]
+    fn decay_start_override_never_moves_decay_before_warmup_ends() {
+        // An override taken (or a plan shrunk) so that the pinned point
+        // would land inside warmup is clamped forward to warmup_steps —
+        // the same safety `lr_at`'s Wsd arm has always had for the fixed
+        // fraction, extended to the adaptive case.
+        let cfg = TrainConfig { decay_start_override: Some(10), ..wsd_schedule() };
+        assert_eq!(cfg.wsd_decay_start(), cfg.warmup_steps);
+    }
+
+    #[test]
+    fn wsd_decay_start_is_the_fixed_fraction_with_no_override() {
+        let cfg = wsd_schedule();
+        assert_eq!(cfg.wsd_decay_start(), 800, "(1 - WSD_DECAY_FRACTION) * 1000");
+    }
+
+    #[test]
+    fn extending_total_steps_with_an_override_set_stretches_the_decay_not_the_start() {
+        // The behavior extend_plan relies on: once a plateau has pinned
+        // decay_start_override, growing total_steps must give that same
+        // decay window more room to reach the floor in, not redefine
+        // when it began the way a plain (un-pinned) plan growing does —
+        // see wsd_extending_total_steps_extends_the_stable_phase_not_the_decay
+        // for that contrasting, override-free case.
+        let pinned = TrainConfig { decay_start_override: Some(400), ..wsd_schedule() };
+        let grown = TrainConfig { total_steps: 2000, ..pinned };
+        assert_eq!(grown.wsd_decay_start(), 400, "the pinned point does not move");
+        assert!(grown.lr_at(500) < grown.lr, "still decaying, not reset to the stable phase");
+        // The floor is reached later now — more steps of decay, not the
+        // same decay compressed or a jump back to peak.
+        assert!(
+            grown.lr_at(500) > pinned.lr_at(500),
+            "the same step should be earlier in a now-longer decay tail"
+        );
     }
 
     #[test]

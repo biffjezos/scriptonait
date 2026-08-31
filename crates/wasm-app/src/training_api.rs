@@ -147,6 +147,36 @@ impl WasmLLM {
         } else {
             TrainConfig::warmup_for(steps)
         };
+        // A deliberate replan gets a fresh decay-start decision rather
+        // than keeping one an earlier, now-superseded plan's plateau
+        // pinned — unlike `extend_plan`, which grows the *same* plan and
+        // must not move an already-pinned decay start. See
+        // `set_decay_start`/`wsd_decay_start`.
+        inner.train.decay_start_override = None;
+    }
+
+    /// For the Settings tab's "Decay start" control set to Adaptive:
+    /// pin a `Wsd` run's decay window to begin at `step` instead of
+    /// letting it fall out of the fixed `WSD_DECAY_FRACTION` point.
+    /// Only ever called to move decay earlier than that point — see
+    /// worker.js's own trigger condition — and holds until the plan is
+    /// next deliberately replanned (`set_project_plan`), which clears
+    /// it.
+    pub fn set_decay_start(&self, step: u32) {
+        let inner = &mut *self.0.borrow_mut();
+        inner.train.decay_start_override = Some(step as u64);
+    }
+
+    /// For the Settings tab's "Plan length" control set to Adaptive,
+    /// extends: grow the plan by `additional_steps` without resetting
+    /// anything else `set_project_plan` would — most importantly, a
+    /// `Wsd` run's `decay_start_override`, if one is already pinned.
+    /// Extending a run already decaying should give its existing decay
+    /// window more steps to reach the floor in, not redefine when that
+    /// window began.
+    pub fn extend_plan(&self, additional_steps: u32) {
+        let inner = &mut *self.0.borrow_mut();
+        inner.train.total_steps = inner.train.total_steps.saturating_add(additional_steps as u64);
     }
 
     /// Which formula chooses warmup length when the plan is (re)set: the
