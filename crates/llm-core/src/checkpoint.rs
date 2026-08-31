@@ -53,6 +53,18 @@ const MAGIC: &[u8; 4] = b"SCCK";
 /// to resume at. Version 3 added the cumulative token count. Files as old
 /// as version 2 still load; fields newer than the file's version read as
 /// their "not set" default rather than a wrong number.
+///
+/// Every version so far has only ever added *scalar* fields, read
+/// conditionally by version (see `Checkpoint::from_bytes` below) —
+/// there has never been more than one tensor group per layer to
+/// describe. A future architecture needing a variable number of them
+/// (Mixture-of-Experts: N sets of FFN weights per layer instead of one
+/// — see `llm_core::model::layer`'s `ffn_forward` and this crate's
+/// `PLAN.md`) would extend this the same way: bump `VERSION`, add a
+/// conditionally-read field (an expert count), and teach
+/// `ModelWeights::from_bytes` to size itself from it instead of purely
+/// from `ModelConfig` as it does today. Not done here — there is no
+/// expert count to store yet.
 const VERSION: u32 = 4;
 const MIN_READABLE_VERSION: u32 = 2;
 

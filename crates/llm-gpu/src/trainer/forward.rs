@@ -50,6 +50,16 @@ impl GpuTrainer {
             dispatch_add_inplace(chunks.enc(), ctx, &self.scratch.hidden, &self.scratch.tmp_h, t * h);
             chunks.copy(&self.scratch.hidden, &acts.h_after_attn, t * h);
 
+            // FFN sublayer: rmsnorm, gate/up, SwiGLU, down, add — a fixed,
+            // unconditional five-dispatch sequence, mirroring
+            // `llm_core::model::layer::LayerWeights::ffn_forward` kernel
+            // for kernel (see that method's doc comment for why this is
+            // the seam a Mixture-of-Experts FFN would replace). A routed
+            // version would add a router kernel choosing/weighting
+            // experts per token here, then loop this sequence — with
+            // `T_W_GATE`/`T_W_UP`/`T_W_DOWN` indexed per expert, not
+            // fixed — once per expert a token is routed to; see
+            // `layout.rs`'s note on `TENSORS_PER_LAYER`.
             self.dispatch_rmsnorm(
                 chunks,
                 ctx,

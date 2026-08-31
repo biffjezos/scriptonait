@@ -17,6 +17,21 @@ use crate::buffers;
 use crate::context::GpuContext;
 
 /// Per-layer tensors, in the order `ParamSet` stores them.
+///
+/// A Mixture-of-Experts FFN (see `llm_core::model::layer`'s `ffn_forward`
+/// for where that seam lives on the CPU side) would need N sets of
+/// `T_W_GATE`/`T_W_UP`/`T_W_DOWN` per layer instead of one, plus a
+/// router. That means `TENSORS_PER_LAYER` becoming a value computed from
+/// `ModelConfig` (an expert count) rather than this fixed `const`, and
+/// `T_W_GATE`/`T_W_UP`/`T_W_DOWN` becoming index-computing functions of
+/// an expert number rather than plain constants — `layer()`'s offset
+/// arithmetic below, and `shapes()`/`from_weights()`'s per-layer literal
+/// arrays, would all need to loop over experts instead of listing 9
+/// fixed fields. Not done here: no expert count, router shape, or
+/// checkpoint format for either exists yet (see `PLAN.md` and
+/// `checkpoint.rs`'s own note on its version scheme) — this note exists
+/// so that design starts from what actually has to change instead of
+/// rediscovering it.
 pub(super) const T_ATTN_GAIN: usize = 0;
 pub(super) const T_WQ: usize = 1;
 pub(super) const T_WK: usize = 2;

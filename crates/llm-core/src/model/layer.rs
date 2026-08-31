@@ -39,13 +39,22 @@ pub(super) struct LayerCache {
     pub(super) probs: Vec<f32>,
     pub(super) concat: Vec<f32>, // pre-Wo attention output
     pub(super) h_after_attn: Vec<f32>,
+    pub(super) ffn: FfnCache,
+}
+
+/// The FFN sublayer's own cached activations — everything `ffn_backward`
+/// needs that isn't already on `LayerCache`. Kept as its own struct (not
+/// four more flat fields on `LayerCache`) because this is exactly what a
+/// future architecture variant's own cache would replace; see
+/// `LayerWeights::ffn_forward`.
+pub(super) struct FfnCache {
     pub(super) normed2: Vec<f32>,
     pub(super) inv_rms2: Vec<f32>,
     pub(super) gate: Vec<f32>,
     pub(super) up: Vec<f32>,
 }
 
-impl LayerCache {
+impl FfnCache {
     /// The MLP down-projection's input is the SwiGLU activation, which
     /// isn't stored directly (only its `gate`/`up` inputs are) — recompute
     /// it, which is exact (not an approximation) since SwiGLU is a pure
@@ -178,6 +187,23 @@ impl LayerWeights {
         }
         let h_after_attn = hidden.to_vec();
 
+        let ffn = self.ffn_forward(hidden, config, t_len);
+
+        LayerCache { h_after_ple, normed1, inv_rms1, q, k, v, probs, concat, h_after_attn, ffn }
+    }
+
+    /// The FFN sublayer's forward pass: RMSNorm, SwiGLU MLP, added into
+    /// `hidden` (the residual stream) in place. Returns the activation
+    /// cache `ffn_backward` needs to retrace it.
+    ///
+    /// This is the one place a Mixture-of-Experts architecture (N of
+    /// these per layer, plus a router choosing/weighting which run for
+    /// each token) would need a different implementation — see this
+    /// crate's `PLAN.md`. Everything else in this file (PLE, attention,
+    /// both RMSNorms) is untouched by every MoE variant that's been
+    /// discussed, since MoE only ever replaces the FFN.
+    fn ffn_forward(&self, hidden: &mut [f32], config: &ModelConfig, t_len: usize) -> FfnCache {
+        let h = config.hidden_dim;
         let (normed2, inv_rms2) = ops::rmsnorm_fwd(hidden, &self.mlp_norm_gain, t_len, h, RMS_EPS);
         let gate = ops::linear_fwd(&normed2, &self.w_gate, t_len, h, config.ffn_dim());
         let up = ops::linear_fwd(&normed2, &self.w_up, t_len, h, config.ffn_dim());
@@ -188,21 +214,56 @@ impl LayerWeights {
             hidden[i] += mlp_out[i];
         }
 
-        LayerCache {
-            h_after_ple,
-            normed1,
-            inv_rms1,
-            q,
-            k,
-            v,
-            probs,
-            concat,
-            h_after_attn,
-            normed2,
-            inv_rms2,
-            gate,
-            up,
+        FfnCache { normed2, inv_rms2, gate, up }
+    }
+
+    /// The FFN sublayer's backward pass given the gradient at its output
+    /// (`d_hidden`, the same residual-stream gradient the whole layer's
+    /// `backward` receives) and its own forward `ffn` cache, accumulating
+    /// this sublayer's parameter gradients into `grad_out` and returning
+    /// the gradient at `h_after_attn` — the point the FFN's residual
+    /// branch off, which is what the attention branch's backward pass
+    /// (in `backward`, below) continues from. Pairs with `ffn_forward`;
+    /// see that method's own doc comment for why this is the seam.
+    fn ffn_backward(
+        &self,
+        ffn: &FfnCache,
+        h_after_attn: &[f32],
+        config: &ModelConfig,
+        t_len: usize,
+        d_hidden: &[f32],
+        grad_out: &mut LayerWeights,
+    ) -> Vec<f32> {
+        let h = config.hidden_dim;
+        let lg = grad_out;
+
+        // Residual: h_after_attn + mlp_out.
+        let d_mlp_out = d_hidden.to_vec(); // gradient splits equally into both residual branches
+        let (d_act, d_w_down) =
+            ops::linear_bwd(&d_mlp_out, &ffn.up_act_input(), &self.w_down, t_len, config.ffn_dim(), h);
+        lg.w_down.iter_mut().zip(&d_w_down).for_each(|(g, d)| *g += d);
+        let (d_gate, d_up) = ops::swiglu_bwd(&d_act, &ffn.gate, &ffn.up);
+        let (d_normed2_from_gate, d_w_gate) =
+            ops::linear_bwd(&d_gate, &ffn.normed2, &self.w_gate, t_len, h, config.ffn_dim());
+        let (d_normed2_from_up, d_w_up) =
+            ops::linear_bwd(&d_up, &ffn.normed2, &self.w_up, t_len, h, config.ffn_dim());
+        lg.w_gate.iter_mut().zip(&d_w_gate).for_each(|(g, d)| *g += d);
+        lg.w_up.iter_mut().zip(&d_w_up).for_each(|(g, d)| *g += d);
+        let mut d_normed2 = vec![0.0f32; t_len * h];
+        for i in 0..d_normed2.len() {
+            d_normed2[i] = d_normed2_from_gate[i] + d_normed2_from_up[i];
         }
+
+        let (d_h_after_attn_from_norm, d_mlp_gain) =
+            ops::rmsnorm_bwd(&d_normed2, h_after_attn, &self.mlp_norm_gain, &ffn.inv_rms2, t_len, h);
+        lg.mlp_norm_gain.iter_mut().zip(&d_mlp_gain).for_each(|(g, d)| *g += d);
+
+        // d_hidden at "h_after_attn" = contribution from residual pass-through (d_hidden itself) + from norm branch.
+        let mut d_h_after_attn = d_hidden.to_vec();
+        for i in 0..d_h_after_attn.len() {
+            d_h_after_attn[i] += d_h_after_attn_from_norm[i];
+        }
+        d_h_after_attn
     }
 
     /// Runs this layer's backward pass given the downstream gradient
@@ -228,32 +289,7 @@ impl LayerWeights {
         let lc = cache;
         let lg = grad_out;
 
-        // --- MLP branch (residual: h_after_attn + mlp_out) ---
-        let d_mlp_out = d_hidden.clone(); // gradient splits equally into both residual branches
-        let (d_act, d_w_down) =
-            ops::linear_bwd(&d_mlp_out, &lc.up_act_input(), &self.w_down, t_len, config.ffn_dim(), h);
-        lg.w_down.iter_mut().zip(&d_w_down).for_each(|(g, d)| *g += d);
-        let (d_gate, d_up) = ops::swiglu_bwd(&d_act, &lc.gate, &lc.up);
-        let (d_normed2_from_gate, d_w_gate) =
-            ops::linear_bwd(&d_gate, &lc.normed2, &self.w_gate, t_len, h, config.ffn_dim());
-        let (d_normed2_from_up, d_w_up) =
-            ops::linear_bwd(&d_up, &lc.normed2, &self.w_up, t_len, h, config.ffn_dim());
-        lg.w_gate.iter_mut().zip(&d_w_gate).for_each(|(g, d)| *g += d);
-        lg.w_up.iter_mut().zip(&d_w_up).for_each(|(g, d)| *g += d);
-        let mut d_normed2 = vec![0.0f32; t_len * h];
-        for i in 0..d_normed2.len() {
-            d_normed2[i] = d_normed2_from_gate[i] + d_normed2_from_up[i];
-        }
-
-        let (d_h_after_attn_from_norm, d_mlp_gain) =
-            ops::rmsnorm_bwd(&d_normed2, &lc.h_after_attn, &self.mlp_norm_gain, &lc.inv_rms2, t_len, h);
-        lg.mlp_norm_gain.iter_mut().zip(&d_mlp_gain).for_each(|(g, d)| *g += d);
-
-        // d_hidden at "h_after_attn" = contribution from residual pass-through (d_hidden itself) + from norm branch.
-        let mut d_h_after_attn = d_hidden.clone();
-        for i in 0..d_h_after_attn.len() {
-            d_h_after_attn[i] += d_h_after_attn_from_norm[i];
-        }
+        let d_h_after_attn = self.ffn_backward(&lc.ffn, &lc.h_after_attn, config, t_len, &d_hidden, lg);
 
         // --- Attention branch (residual: h_after_ple + attn_out) ---
         let d_attn_out = d_h_after_attn.clone();

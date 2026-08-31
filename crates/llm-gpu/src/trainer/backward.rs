@@ -47,7 +47,11 @@ impl GpuTrainer {
         for l in (0..c.num_layers).rev() {
             let acts = &self.acts[l];
 
-            // --- MLP branch ---
+            // --- MLP branch --- (mirrors
+            // `llm_core::model::layer::LayerWeights::ffn_backward`; see
+            // `forward.rs`'s matching comment on the FFN sublayer being
+            // the Mixture-of-Experts seam, and `layout.rs`'s note on
+            // `TENSORS_PER_LAYER`)
             dispatch_swiglu(chunks.enc(), ctx, &acts.gate, &acts.up, &s.act, t * ffn);
             self.dispatch_linear_bwd_dw(
                 chunks,

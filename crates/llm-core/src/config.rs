@@ -242,6 +242,15 @@ impl ModelConfig {
     }
 
     /// Total trainable scalar parameters.
+    ///
+    /// Hand-derived per architecture (dense-only today: `per_layer_mlp`
+    /// below is exactly the one FFN's Wgate/Wup/Wdown) rather than
+    /// generic — contrast `ModelWeights::param_count()`, which sums
+    /// whatever tensors actually exist. A future architecture (e.g.
+    /// Mixture-of-Experts — see `llm_core::model::layer`'s `ffn_forward`
+    /// and this crate's `PLAN.md`) would need its own version of
+    /// `per_layer_mlp` here too, kept in sync with its actual weight
+    /// shapes by hand the same way this one already has to be.
     pub fn param_count(&self) -> usize {
         let v = self.vocab_size();
         let h = self.hidden_dim;
