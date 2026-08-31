@@ -555,6 +555,10 @@ function renderModel(info) {
       <div><dt>Training steps</dt><dd>${info.step.toLocaleString()}</dd></div>
       <div><dt>Training and generating on</dt><dd>${escapeHtml(info.device || 'no GPU — cannot train')}</dd></div>
     </dl>`;
+  // Auto-save's suggested file name (Settings tab) is a live default
+  // until something's been explicitly chosen — refresh it now that the
+  // model its shape-based fallback reads from actually exists.
+  if (!autosaveFileName) $('autosave-filename').value = autosaveTargetBaseName();
   updateGuidance();
 }
 
@@ -3102,16 +3106,44 @@ function autosaveDirectorySupported() {
   return typeof window.showDirectoryPicker === 'function';
 }
 
-/// The name Add mode builds step-suffixed filenames from, and Overwrite
-/// mode suggests to the file picker — the Settings-tab field if
-/// anything's been typed into it, else whatever file was last connected,
-/// else a plain default.
+/// A name for the model that doesn't depend on it ever having been
+/// saved anywhere: its own shape, in the same order those fields are
+/// entered on the Overview tab (layers, hidden size, heads, key/value
+/// heads, context, attention window) — e.g. 16_640_16_8_512_512. Two
+/// models trained with different shapes get different default names
+/// instead of colliding on the same generic one.
+function modelShapeName() {
+  if (!model) return null;
+  return `${model.layers}_${model.hidden}_${model.heads}_${model.kvHeads}_${model.contextLen}_${model.window}`;
+}
+
+/// The project's own base name: whatever file was last connected — an
+/// Export, an Import, or New Project's own picker already gave the
+/// project one — else the model's own shape, which is at least specific
+/// to what's actually running rather than a generic placeholder. Used
+/// where a name is wanted for the *project* (Branch's own filenames,
+/// reflecting back a just-picked autosave file's name); see
+/// autosaveTargetBaseName for what auto-save's own file should be
+/// called, which is not always the same thing.
 function autosaveBaseName() {
-  return (autosaveFileName || 'scriptonait').replace(/\.snp$/i, '');
+  return (autosaveFileName || modelShapeName() || 'scriptonait').replace(/\.snp$/i, '');
+}
+
+/// What auto-save specifically should call its own file: whatever has
+/// actually already been chosen for it — typed into the Settings field,
+/// or connected through "Choose file…"/"Choose folder…", including a
+/// name inherited from an Export/Import/New Project that happened to
+/// establish one too — used exactly as given, so reconnecting after a
+/// lost permission still offers the same name back. Only before any of
+/// that has ever happened does this make one up: the model's own shape,
+/// with '_autosave' appended so this default is never mistaken for a
+/// manually-named export.
+function autosaveTargetBaseName() {
+  return autosaveFileName || `${modelShapeName() || 'scriptonait'}_autosave`;
 }
 
 function autosaveStepFileName(step) {
-  return `${autosaveBaseName()}-step${String(Math.max(0, Math.round(step))).padStart(10, '0')}.snp`;
+  return `${autosaveTargetBaseName()}-step${String(Math.max(0, Math.round(step))).padStart(10, '0')}.snp`;
 }
 
 /// The suggested name for a Branch export — the step-suffixed pattern
@@ -3372,8 +3404,11 @@ $('autosave-file-btn').addEventListener('click', async () => {
       // imported project's settings, an earlier Export/New Project, or
       // earlier this session — rather than always the generic default,
       // so reconnecting after an import or a lost permission is one
-      // click to the right name.
-      suggestedName: autosaveFileName || 'scriptonait.snp',
+      // click to the right name. Nothing established yet suggests the
+      // auto-save-specific default instead (project name, or the
+      // model's own shape, plus '_autosave') rather than the plain
+      // "scriptonait.snp" this picker used to fall back to.
+      suggestedName: `${autosaveTargetBaseName()}.snp`,
       types: [{ description: 'scriptonait project', accept: { 'application/octet-stream': ['.snp'] } }],
     });
   } catch (error) {
@@ -3421,7 +3456,7 @@ async function establishProjectFile(handle) {
 /// different status line.
 async function establishAutosaveDirectory(handle) {
   autosaveDirHandle = handle;
-  $('autosave-status').textContent = `Folder: ${handle.name} (files named ${autosaveBaseName()}-step<N>.snp).`;
+  $('autosave-status').textContent = `Folder: ${handle.name} (files named ${autosaveTargetBaseName()}-step<N>.snp).`;
   await db.putAutosaveDirectoryHandle(handle).catch((error) => {
     console.warn('[scriptonait] could not remember the auto-save folder', error);
   });
@@ -3474,7 +3509,7 @@ function refreshAutosaveTargetDisplay() {
   $('autosave-file-btn').textContent = autosaveMode === 'add' ? 'Choose folder…' : 'Choose file…';
   if (autosaveMode === 'add') {
     $('autosave-status').textContent = autosaveDirHandle
-      ? `Folder: ${autosaveDirHandle.name} (files named ${autosaveBaseName()}-step<N>.snp).`
+      ? `Folder: ${autosaveDirHandle.name} (files named ${autosaveTargetBaseName()}-step<N>.snp).`
       : 'Folder: not set.';
   } else {
     $('autosave-status').textContent = autosaveHandle ? `File: ${autosaveHandle.name}.` : 'File: not set.';
@@ -3488,8 +3523,11 @@ $('autosave-mode').addEventListener('change', async (event) => {
 });
 
 $('autosave-filename').addEventListener('change', async (event) => {
-  autosaveFileName = event.target.value.trim() || 'scriptonait';
-  event.target.value = autosaveFileName;
+  // Clearing the field back to empty means "go back to the default,"
+  // not "call it literally scriptonait" — null keeps autosaveTargetBaseName's
+  // own default live rather than freezing today's computed name in.
+  autosaveFileName = event.target.value.trim() || null;
+  event.target.value = autosaveTargetBaseName();
   refreshAutosaveTargetDisplay();
   await withNotice('Saving setting', 'Setting saved', () => persistAutosaveConfig());
 });
@@ -3549,7 +3587,7 @@ async function applyLoadedSettings() {
       // the handle checks right below override it with a confirmed
       // "connected" status when a live, permitted handle also exists.
       if (autosaveConfig.fileName) autosaveFileName = autosaveConfig.fileName;
-      $('autosave-filename').value = autosaveBaseName();
+      $('autosave-filename').value = autosaveTargetBaseName();
       $('autosave-status').textContent = autosaveMode === 'add'
         ? 'Folder: not set.'
         : autosaveFileName
@@ -3588,7 +3626,7 @@ async function applyLoadedSettings() {
         autosaveDirHandle = dirHandle;
         if (autosaveMode === 'add') {
           $('autosave-status').textContent =
-            `Folder: ${dirHandle.name} (files named ${autosaveBaseName()}-step<N>.snp).`;
+            `Folder: ${dirHandle.name} (files named ${autosaveTargetBaseName()}-step<N>.snp).`;
         }
       } else if (autosaveMode === 'add') {
         $('autosave-status').textContent = `Folder: ${dirHandle.name} (permission needed — choose it again).`;
