@@ -2064,44 +2064,36 @@ function scheduleModeFromAxes({ stablePhase, cooldownShape }) {
 }
 
 /// The reverse of scheduleModeFromAxes, for a project saved before the
-/// four axes existed — its only record of the schedule is this string.
+/// two axes existed — its only record of the schedule is this string.
 function axesFromScheduleMode(scheduleMode) {
   if (scheduleMode === 'cosine-cuts') {
-    return { stablePhase: 'reactive-cuts', cooldownShape: 'immediate', cooldownTiming: 'fixed', planLength: 'fixed' };
+    return { stablePhase: 'reactive-cuts', cooldownShape: 'immediate' };
   }
   if (scheduleMode === 'cosine') {
-    return { stablePhase: 'flat', cooldownShape: 'immediate', cooldownTiming: 'fixed', planLength: 'fixed' };
+    return { stablePhase: 'flat', cooldownShape: 'immediate' };
   }
-  return { stablePhase: 'flat', cooldownShape: 'deferred', cooldownTiming: 'fixed', planLength: 'fixed' };
+  return { stablePhase: 'flat', cooldownShape: 'deferred' };
 }
 
 /// Which of the other Manual-mode scheduler selects a given choice rules
 /// out, and what to coerce them to rather than leave them on a value
-/// that no longer means anything. Reactive plateau-cuts is the one
-/// combination with a documented failure mode when layered on top of a
-/// deferred cooldown or an adaptively-extended plan — this session's own
-/// plateau-cut death spiral — so it forces both back to the simple,
-/// well-tested shape today's "cosine-cuts" already is, rather than
-/// leaving a combination reachable that this app has already seen fail.
+/// that no longer means anything. Reactive plateau-cuts combined with a
+/// deferred (WSD) cool-down is a documented failure mode — this
+/// session's own plateau-cut death spiral — so it forces the cool-down
+/// back to Immediate, the simple, well-tested shape today's
+/// "cosine-cuts" already is, rather than leaving that combination
+/// reachable.
 function applySchedulerCompatibility() {
   const reactive = $('stable-phase').value === 'reactive-cuts';
-
   $('cooldown-shape').disabled = reactive;
   if (reactive) $('cooldown-shape').value = 'immediate';
-
-  const deferred = $('cooldown-shape').value === 'deferred' && !reactive;
-  $('cooldown-timing').disabled = !deferred;
-  if (!deferred) $('cooldown-timing').value = 'fixed';
-
-  $('plan-length').disabled = reactive;
-  if (reactive) $('plan-length').value = 'fixed';
 }
 
 /// Auto owns every scheduler axis; Manual hands them back, subject to
 /// applySchedulerCompatibility's rules. Mirrors applyTrainMode exactly.
 function applySchedulerMode() {
   const manual = $('scheduler-mode').value === 'manual';
-  for (const id of ['warmup-strategy', 'stable-phase', 'cooldown-shape', 'cooldown-timing', 'plan-length']) {
+  for (const id of ['warmup-strategy', 'stable-phase', 'cooldown-shape']) {
     $(id).disabled = !manual;
   }
   if (manual) applySchedulerCompatibility();
@@ -2137,8 +2129,6 @@ async function persistTrainingPlanSettings() {
     warmupStrategy: $('warmup-strategy').value,
     stablePhase: axes.stablePhase,
     cooldownShape: axes.cooldownShape,
-    cooldownTiming: $('cooldown-timing').value,
-    planLength: $('plan-length').value,
     // Kept alongside the axes above (not only derivable from them) so a
     // project this file writes still opens correctly in a build from
     // before the axes existed.
@@ -2148,7 +2138,7 @@ async function persistTrainingPlanSettings() {
 for (const id of [
   'train-mode', 'train-steps', 'train-effort', 'train-batch', 'train-lr', 'sample-toggle',
   'sample-every', 'opening-rate', 'metrics-every', 'show-training-window', 'training-window-chars',
-  'scheduler-mode', 'warmup-strategy', 'stable-phase', 'cooldown-shape', 'cooldown-timing', 'plan-length',
+  'scheduler-mode', 'warmup-strategy', 'stable-phase', 'cooldown-shape',
 ]) {
   $(id).addEventListener('change', () =>
     withNotice('Saving setting', 'Setting saved', persistTrainingPlanSettings));
@@ -3685,23 +3675,16 @@ async function applyLoadedSettings() {
       if (planSettings.trainingWindowChars > 0) {
         $('training-window-chars').value = String(planSettings.trainingWindowChars);
       }
-      // The four axes directly, if this project was saved after they
+      // The two axes directly, if this project was saved after they
       // existed; otherwise derived from the old scheduleMode string, so
       // nothing about the schedule resets on a project saved before them.
       const axes = planSettings.stablePhase
-        ? {
-            stablePhase: planSettings.stablePhase,
-            cooldownShape: planSettings.cooldownShape,
-            cooldownTiming: planSettings.cooldownTiming || 'fixed',
-            planLength: planSettings.planLength || 'fixed',
-          }
+        ? { stablePhase: planSettings.stablePhase, cooldownShape: planSettings.cooldownShape }
         : axesFromScheduleMode(planSettings.scheduleMode);
       $('scheduler-mode').value = planSettings.schedulerMode === 'manual' ? 'manual' : 'auto';
       $('warmup-strategy').value = planSettings.warmupStrategy === 'variance' ? 'variance' : 'plan';
       $('stable-phase').value = axes.stablePhase;
       $('cooldown-shape').value = axes.cooldownShape;
-      $('cooldown-timing').value = axes.cooldownTiming;
-      $('plan-length').value = axes.planLength;
     }
   } catch (error) {
     console.warn('[scriptonait] could not read training-plan settings', error);

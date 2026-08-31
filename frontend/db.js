@@ -366,8 +366,7 @@ export async function getBenchmarkConfig() {
 ///   sampleToggle, sampleEvery, boundarySampleRate, metricsEvery,
 ///   showTrainingWindow, trainingWindowChars, schedulerMode: 'auto'|'manual',
 ///   warmupStrategy: 'plan'|'variance', stablePhase: 'flat'|'reactive-cuts',
-///   cooldownShape: 'deferred'|'immediate', cooldownTiming: 'fixed'|'adaptive',
-///   planLength: 'fixed'|'adaptive-extend', scheduleMode }
+///   cooldownShape: 'deferred'|'immediate', scheduleMode }
 ///
 /// The Training tab's own settings, previously DOM-only: they reset to
 /// the markup's hardcoded defaults on every reload, which is the gap
@@ -385,13 +384,14 @@ export async function getBenchmarkConfig() {
 /// recording a Metrics row — see worker.js's `VALIDATE_EVERY`. Missing
 /// or 0 falls back to that default, the same as `boundarySampleRate`.
 ///
-/// `schedulerMode` through `planLength` are the Settings tab's Scheduler
-/// panel — see app.js's `scheduleModeFromAxes`/`axesFromScheduleMode`.
-/// `scheduleMode` ('wsd'|'cosine-cuts'|'cosine') is kept alongside them,
-/// not only derivable from them, purely for a project written by this
-/// build to still open correctly in one from before the axes existed;
-/// on a project saved before either existed, callers derive the axes
-/// from `scheduleMode` instead of resetting to a hardcoded default.
+/// `schedulerMode`, `warmupStrategy`, `stablePhase` and `cooldownShape`
+/// are the Settings tab's Scheduler panel — see app.js's
+/// `scheduleModeFromAxes`/`axesFromScheduleMode`. `scheduleMode`
+/// ('wsd'|'cosine-cuts'|'cosine') is kept alongside them, not only
+/// derivable from them, purely for a project written by this build to
+/// still open correctly in one from before the two axes existed; on a
+/// project saved before either existed, callers derive the axes from
+/// `scheduleMode` instead of resetting to a hardcoded default.
 export async function putTrainingPlanSettings(settings) {
   const record = { ...settings, id: TRAINING_PLAN_SETTINGS, savedAt: Date.now() };
   await withStore(SETTINGS_STORE, 'readwrite', (store) => store.put(record));
