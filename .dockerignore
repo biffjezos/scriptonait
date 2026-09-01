@@ -1,0 +1,7 @@
+# Kept out of the build context for speed, not correctness — none of
+# this is needed inside the image, and target/ in particular can be
+# large from local `cargo test` runs.
+target/
+.git/
+frontend/pkg/
+frontend/vendor/
