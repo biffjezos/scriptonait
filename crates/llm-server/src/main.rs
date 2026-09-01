@@ -32,9 +32,19 @@ mod protocol;
 mod routes;
 mod state;
 
+use axum::extract::DefaultBodyLimit;
 use tower_http::cors::CorsLayer;
 
 use state::AppState;
+
+/// axum's own default (2 MiB) is sized for typical JSON API bodies, not
+/// a corpus. `POST /session` sends every source's full text in one
+/// request — the "snapshot at start" design `protocol.rs` documents —
+/// and this app's own README describes loading "the scripts or books
+/// you like": a handful of novels alone routinely exceeds 2 MiB long
+/// before hitting whatever a real corpus is. 64 MiB is generous for
+/// plain text without being unbounded.
+const MAX_REQUEST_BODY_BYTES: usize = 64 * 1024 * 1024;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -68,7 +78,9 @@ fn main() {
 
 async fn serve(bind: String, port: u16, token: Option<String>, gpu: gpu_actor::GpuActorHandle) {
     let state = AppState { gpu, token };
-    let app = routes::router(state).layer(CorsLayer::permissive());
+    let app = routes::router(state)
+        .layer(CorsLayer::permissive())
+        .layer(DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES));
     let addr = format!("{bind}:{port}");
     let listener = match tokio::net::TcpListener::bind(&addr).await {
         Ok(listener) => listener,
