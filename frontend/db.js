@@ -20,14 +20,15 @@
 // transaction completes.
 
 const DB_NAME = 'scriptonait-llm';
-// Version 3 added the history store: one row per measurement, kept so a
-// run can be looked at after it happened rather than only while it is
-// scrolling past.
-const DB_VERSION = 3;
+// Version 4 added the library store: named whole-project snapshots kept
+// in the browser, so switching between several trained models doesn't
+// need a round trip through the filesystem.
+const DB_VERSION = 4;
 const SOURCES_STORE = 'sources';
 const MODELS_STORE = 'models';
 const SETTINGS_STORE = 'settings';
 const HISTORY_STORE = 'history';
+const LIBRARY_STORE = 'library';
 
 let dbPromise = null;
 
@@ -57,6 +58,11 @@ function openDb() {
       if (!db.objectStoreNames.contains(HISTORY_STORE)) {
         const store = db.createObjectStore(HISTORY_STORE, { keyPath: 'id' });
         store.createIndex('runId', 'runId', { unique: false });
+      }
+      // Named snapshots of a whole project — see the module below for
+      // what a record holds.
+      if (!db.objectStoreNames.contains(LIBRARY_STORE)) {
+        db.createObjectStore(LIBRARY_STORE, { keyPath: 'id' });
       }
     };
     req.onsuccess = () => resolve(req.result);
@@ -211,6 +217,40 @@ export async function getModel() {
 /// a reload could restore a model from a project that's gone.
 export async function clearModels() {
   await withStore(MODELS_STORE, 'readwrite', (store) => store.clear());
+}
+
+// --- The model library ---------------------------------------------------
+//
+// Named snapshots of a whole project — the same .snp bytes Export Project
+// and Branch already build, kept here instead of (or as well as) on disk.
+// This is what lets several trained models — Branch's own use case, run
+// more than once from one seed to get a specialist model per corpus —
+// stay a click apart instead of a file picker apart.
+//
+// A record: { id, name, step, params, savedAt, blob }. `step`/`params`
+// ride along unpacked, the same reason `putModel` carries them alongside
+// `bytes`: showing a library list shouldn't mean opening every entry's
+// project header first. `blob` is the `Blob` project.buildProjectFile
+// already returns — IndexedDB stores a Blob by reference until something
+// actually reads its bytes, so listing entries stays cheap regardless of
+// how large the checkpoints inside them are.
+
+export async function putLibraryEntry(record) {
+  await withStore(LIBRARY_STORE, 'readwrite', (store) => store.put(record));
+  return record;
+}
+
+export async function listLibrary() {
+  const all = (await withStore(LIBRARY_STORE, 'readonly', (store) => store.getAll())) || [];
+  return all.sort((a, b) => b.savedAt - a.savedAt);
+}
+
+export async function getLibraryEntry(id) {
+  return withStore(LIBRARY_STORE, 'readonly', (store) => store.get(id));
+}
+
+export async function deleteLibraryEntry(id) {
+  await withStore(LIBRARY_STORE, 'readwrite', (store) => store.delete(id));
 }
 
 // --- The machine profile -----------------------------------------------

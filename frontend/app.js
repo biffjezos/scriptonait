@@ -583,6 +583,7 @@ function renderModel(info) {
   // until something's been explicitly chosen — refresh it now that the
   // model its shape-based fallback reads from actually exists.
   if (!autosaveFileName) $('autosave-filename').value = autosaveTargetBaseName();
+  if (!$('library-name').value) $('library-name').value = libraryDefaultName();
   updateGuidance();
 }
 
@@ -883,7 +884,7 @@ async function persist(what, action) {
   }
 }
 
-function newSourceId() {
+function newId() {
   return crypto.randomUUID
     ? crypto.randomUUID()
     : `${Date.now()}-${Math.random().toString(36).slice(2)}`;
@@ -1131,7 +1132,7 @@ async function addSources(entries) {
     // (and, through that, its future windows) changes.
     const existing = sources.find((s) => s.title === entry.title);
     const source = {
-      id: existing ? existing.id : newSourceId(),
+      id: existing ? existing.id : newId(),
       title: entry.title,
       kind: entry.kind,
       rawText,
@@ -2776,6 +2777,58 @@ $('import-input').addEventListener('change', async (event) => {
   event.target.value = '';
 });
 
+/// Gather the current model + corpus + settings into the same project
+/// blob format Export Project, Branch, and the Library all build from —
+/// one function so the three can't quietly drift into disagreeing about
+/// what a snapshot contains. Waits for persistLater's fire-and-forget
+/// save chain first, so a source added moments ago is never missed.
+async function snapshotProjectBlob() {
+  await persistChain;
+  const checkpointBytes = model ? (await call('export-checkpoint')).bytes : null;
+  const optimizerBytes = model
+    ? await call('export-optimizer').then((r) => r.bytes).catch(() => null)
+    : null;
+  const exportedSources = await db.listSources();
+  const exportedHistory = await db.listHistory();
+  const blob = project.buildProjectFile({
+    checkpointBytes,
+    optimizerBytes,
+    sources: exportedSources,
+    history: exportedHistory,
+    settings: {
+      autosaveConfig: await db.getAutosaveConfig(),
+      devicePreference: await db.getDevicePreference(),
+      benchmarkConfig: await db.getBenchmarkConfig(),
+      trainingPlan: await db.getTrainingPlanSettings(),
+      remoteServerConfig: await db.getRemoteServerConfig(),
+      inferenceOptions: await db.getInferenceOptions(),
+    },
+  });
+  console.info(
+    `[scriptonait] project snapshot: ${exportedSources.length} source(s), ` +
+      `${exportedHistory.length} history row(s), ` +
+      `checkpoint ${checkpointBytes ? `${checkpointBytes.byteLength} bytes` : 'none (no model)'}, ` +
+      `${blob.size} bytes total`,
+  );
+  return blob;
+}
+
+/// Branch and Save to Library both want a *quiescent* snapshot — one
+/// that isn't racing the last few steps of a run still writing to the
+/// checkpoint — not just whatever `snapshotProjectBlob` reads right now
+/// the way Export Project is content to. Stops training if it's running
+/// and waits for the run to actually end before taking the snapshot;
+/// returns `wasTraining` so the caller can resume it afterward, the same
+/// way a second Train press would.
+async function stopAndSnapshotProject() {
+  const wasTraining = training;
+  if (wasTraining) {
+    trainCall('stop', {}, [], 0).catch(() => {});
+    await activeTrainingCall.catch(() => {});
+  }
+  return { blob: await snapshotProjectBlob(), wasTraining };
+}
+
 $('export-project-btn').addEventListener('click', async () => {
   clearError();
   // Asked for immediately, before any await: the browser only honors
@@ -2807,37 +2860,7 @@ $('export-project-btn').addEventListener('click', async () => {
     }
   }
   await withNotice('Exporting project', 'Exported project', async () => {
-    // Source saves go through persistLater's fire-and-forget chain —
-    // addSources doesn't wait for it, so a source added moments ago
-    // could still be in flight. Wait for it to drain before reading
-    // db.listSources(), or a fast export-right-after-add misses it.
-    await persistChain;
-    const checkpointBytes = model ? (await call('export-checkpoint')).bytes : null;
-    const optimizerBytes = model
-      ? await call('export-optimizer').then((r) => r.bytes).catch(() => null)
-      : null;
-    const exportedSources = await db.listSources();
-    const exportedHistory = await db.listHistory();
-    const blob = project.buildProjectFile({
-      checkpointBytes,
-      optimizerBytes,
-      sources: exportedSources,
-      history: exportedHistory,
-      settings: {
-        autosaveConfig: await db.getAutosaveConfig(),
-        devicePreference: await db.getDevicePreference(),
-        benchmarkConfig: await db.getBenchmarkConfig(),
-        trainingPlan: await db.getTrainingPlanSettings(),
-        remoteServerConfig: await db.getRemoteServerConfig(),
-        inferenceOptions: await db.getInferenceOptions(),
-      },
-    });
-    console.info(
-      `[scriptonait] exporting project: ${exportedSources.length} source(s), ` +
-        `${exportedHistory.length} history row(s), ` +
-        `checkpoint ${checkpointBytes ? `${checkpointBytes.byteLength} bytes` : 'none (no model)'}, ` +
-        `${blob.size} bytes total`,
-    );
+    const blob = await snapshotProjectBlob();
     if (handle) {
       const writable = await handle.createWritable();
       try {
@@ -2895,35 +2918,7 @@ $('branch-btn').addEventListener('click', async () => {
   $('branch-btn').disabled = true;
   try {
     await withNotice('Branching project', 'Branched project', async () => {
-      const wasTraining = training;
-      if (wasTraining) {
-        trainCall('stop', {}, [], 0).catch(() => {});
-        // The stop button only requests a stop; this is what actually
-        // waits for the run to finish, so the export below reads a
-        // quiescent checkpoint instead of racing the last few steps.
-        await activeTrainingCall.catch(() => {});
-      }
-      await persistChain;
-      const checkpointBytes = model ? (await call('export-checkpoint')).bytes : null;
-      const optimizerBytes = model
-        ? await call('export-optimizer').then((r) => r.bytes).catch(() => null)
-        : null;
-      const exportedSources = await db.listSources();
-      const exportedHistory = await db.listHistory();
-      const blob = project.buildProjectFile({
-        checkpointBytes,
-        optimizerBytes,
-        sources: exportedSources,
-        history: exportedHistory,
-        settings: {
-          autosaveConfig: await db.getAutosaveConfig(),
-          devicePreference: await db.getDevicePreference(),
-          benchmarkConfig: await db.getBenchmarkConfig(),
-          trainingPlan: await db.getTrainingPlanSettings(),
-          remoteServerConfig: await db.getRemoteServerConfig(),
-          inferenceOptions: await db.getInferenceOptions(),
-        },
-      });
+      const { blob, wasTraining } = await stopAndSnapshotProject();
       if (handle) {
         const writable = await handle.createWritable();
         try {
@@ -2952,24 +2947,17 @@ $('branch-btn').addEventListener('click', async () => {
   }
 });
 
-$('import-project-input').addEventListener('change', async (event) => {
-  const file = event.target.files[0];
-  if (!file) return;
-  if (!confirm(`Import "${file.name}"? This replaces the current model, corpus, history and settings.`)) {
-    event.target.value = '';
-    return;
-  }
-  clearError();
-  // The same staged progress the page's own startup restore shows —
-  // several real seconds of work (parsing the file, then the model,
-  // corpus and history each round-tripping through the worker and
-  // IndexedDB) with nothing on screen in between otherwise.
-  notice(`Reading ${file.name}…`, 'info');
+/// Replace the live model + corpus + history + settings with what's in
+/// `buffer` — a whole project's bytes, whichever store they came from (an
+/// imported .snp file, or a Switch from the Library). The one place both
+/// agree on what "loading a project" means, so they can't quietly drift
+/// apart on it. `label` names the source for the status line and the
+/// console log. Returns whether it worked.
+async function applyProjectBuffer(buffer, label) {
   try {
-    const buffer = await file.arrayBuffer();
     const { header, checkpointBytes, optimizerBytes } = project.parseProjectFile(buffer);
     console.info(
-      `[scriptonait] importing ${file.name} (${buffer.byteLength} bytes): ` +
+      `[scriptonait] loading ${label} (${buffer.byteLength} bytes): ` +
         `${(header.sources || []).length} source(s), ${(header.history || []).length} history row(s), ` +
         `checkpoint ${checkpointBytes ? `${checkpointBytes.byteLength} bytes` : 'none'}, ` +
         `optimizer ${optimizerBytes ? `${optimizerBytes.byteLength} bytes` : 'none'}`,
@@ -2977,11 +2965,11 @@ $('import-project-input').addEventListener('change', async (event) => {
 
     // Same reason New Project clears it (see that handler's own comment):
     // the file/folder handle lives in this browser, not in the project
-    // file, so it survives an import untouched unless told otherwise. Left
+    // file, so it survives a load untouched unless told otherwise. Left
     // alone, applyLoadedSettings below would find the *previous* project's
     // still-permitted handle, reconnect autosave to it, and the next
     // autosave would silently overwrite that other project's file with
-    // this one's content. Cleared before the imported settings are written
+    // this one's content. Cleared before the loaded settings are written
     // so its persisted fileName (display-only) isn't lost by the same call.
     await clearAutosaveTarget();
     await db.replaceAllSources(header.sources || []);
@@ -2999,7 +2987,7 @@ $('import-project-input').addEventListener('change', async (event) => {
     // #opening-rate straight off the DOM to push the boundary-sample
     // rate to the freshly created corpus. Restoring settings afterward
     // meant that read still saw whatever was on screen before the
-    // import — so a project's own opening-window rate (and every other
+    // load — so a project's own opening-window rate (and every other
     // field this restores) never actually reached the rebuilt corpus,
     // even though it was sitting correctly in IndexedDB and the field
     // itself updated a moment later.
@@ -3012,10 +3000,10 @@ $('import-project-input').addEventListener('change', async (event) => {
         await call('import-optimizer', { bytes: optimizerBytes }, [optimizerBytes]).catch(() => {});
       }
     } else {
-      // No checkpoint in this project file: the old model belongs to
-      // the project just replaced, not this one — leaving it in
-      // IndexedDB would resume an auto-save mode's rotating snapshots
-      // from a project that's gone.
+      // No checkpoint in this project: the old model belongs to the
+      // project just replaced, not this one — leaving it in IndexedDB
+      // would resume an auto-save mode's rotating snapshots from a
+      // project that's gone.
       await db.clearModels();
       model = null;
       setModelStatus('absent', 'No model yet.');
@@ -3024,7 +3012,7 @@ $('import-project-input').addEventListener('change', async (event) => {
 
     // A full replace, not a merge: refreshSources only ever adds sources
     // it doesn't already know about, so the in-memory list has to be
-    // cleared first or a source dropped by the import would linger.
+    // cleared first or a source dropped by the load would linger.
     // syncAllSources hands each one to the model and restores its
     // persisted sample count (syncSource does that per source already).
     sources = [];
@@ -3037,14 +3025,138 @@ $('import-project-input').addEventListener('change', async (event) => {
     renderHistory();
     rebuildChartFromHistory();
     updateGuidance();
-    notice(`Imported ${file.name}.`, 'success');
+    notice(`Loaded ${label}.`, 'success');
+    return true;
   } catch (error) {
-    showError(`that project file didn't load: ${(error && error.message) || error}`);
+    showError(`${label} didn't load: ${(error && error.message) || error}`);
     setModelStatus('absent', 'No model loaded.');
+    return false;
   }
+}
+
+$('import-project-input').addEventListener('change', async (event) => {
+  const file = event.target.files[0];
+  if (!file) return;
+  if (!confirm(`Import "${file.name}"? This replaces the current model, corpus, history and settings.`)) {
+    event.target.value = '';
+    return;
+  }
+  clearError();
+  // The same staged progress the page's own startup restore shows —
+  // several real seconds of work (parsing the file, then the model,
+  // corpus and history each round-tripping through the worker and
+  // IndexedDB) with nothing on screen in between otherwise.
+  notice(`Reading ${file.name}…`, 'info');
+  const buffer = await file.arrayBuffer();
+  await applyProjectBuffer(buffer, file.name);
   event.target.value = '';
 });
 
+// --- The model library ---------------------------------------------------
+//
+// Named snapshots of a whole project (see db.js's own header on the
+// record shape) — what turns Branch's "fork a copy" into several models
+// a click apart instead of a file picker apart: train one specialist
+// corpus, Branch it, keep training; Save to Library, switch corpora,
+// train the next; Switch back to any of them for Generate at any time.
+
+/// A default name for the next Save: the project's own base name (an
+/// Export/Import/New Project's file, or the model's shape if none has
+/// ever been chosen) plus this model's step, so saving progress on the
+/// same project more than once doesn't produce indistinguishable entries
+/// by default.
+function libraryDefaultName() {
+  if (!model) return '';
+  const stepPart = String(Math.max(0, Math.round(model.step))).padStart(10, '0');
+  return `${autosaveBaseName()}-step${stepPart}`;
+}
+
+async function renderLibrary() {
+  const entries = await db.listLibrary();
+  const list = $('library-list');
+  if (entries.length === 0) {
+    list.innerHTML = '<p class="empty-hint">Nothing saved yet.</p>';
+    return;
+  }
+  list.innerHTML = entries
+    .map(
+      (entry) => `
+    <div class="source-item" data-id="${entry.id}">
+      <div class="meta">
+        <span class="title">${escapeHtml(entry.name)}</span>
+        <span class="stats">${formatCount(entry.params)} params · step ${entry.step.toLocaleString()} · ${new Date(entry.savedAt).toLocaleString()}</span>
+      </div>
+      <div class="actions">
+        <button type="button" class="secondary switch-library" data-id="${entry.id}">Switch</button>
+        <button type="button" class="secondary delete-library" data-id="${entry.id}">Delete</button>
+      </div>
+    </div>`,
+    )
+    .join('');
+}
+
+$('library-save-btn').addEventListener('click', async () => {
+  if (!model) {
+    showError('No model to save yet.');
+    return;
+  }
+  const name = $('library-name').value.trim() || libraryDefaultName();
+  clearError();
+  $('library-save-btn').disabled = true;
+  try {
+    await withNotice('Saving to library', 'Saved to library', async () => {
+      const { blob, wasTraining } = await stopAndSnapshotProject();
+      await db.putLibraryEntry({
+        id: newId(),
+        name,
+        step: model.step,
+        params: model.params,
+        savedAt: Date.now(),
+        blob,
+      });
+      // Resume the original run exactly as a second Train press would —
+      // same reason Branch does this.
+      if (wasTraining) $('train-btn').dispatchEvent(new Event('click'));
+      return wasTraining ? 'Saved — continuing the original run.' : 'Saved to library.';
+    });
+  } finally {
+    $('library-save-btn').disabled = false;
+  }
+  $('library-name').value = '';
+  await renderLibrary();
+});
+
+// One listener on the container instead of one per row — same reason
+// sources-list does it this way.
+$('library-list').addEventListener('click', async (event) => {
+  const switchBtn = event.target.closest('.switch-library');
+  const deleteBtn = event.target.closest('.delete-library');
+  if (switchBtn) {
+    const entry = await db.getLibraryEntry(switchBtn.dataset.id);
+    if (!entry) {
+      showError('That library entry is gone.');
+      await renderLibrary();
+      return;
+    }
+    if (!confirm(`Switch to "${entry.name}"? This replaces the current model, corpus, history and settings.`)) {
+      return;
+    }
+    clearError();
+    notice(`Loading ${entry.name}…`, 'info');
+    const buffer = await entry.blob.arrayBuffer();
+    await applyProjectBuffer(buffer, entry.name);
+    await renderLibrary();
+  } else if (deleteBtn) {
+    const entry = await db.getLibraryEntry(deleteBtn.dataset.id);
+    if (!entry) {
+      await renderLibrary();
+      return;
+    }
+    if (!confirm(`Delete "${entry.name}" from the library? This can't be undone.`)) return;
+    await withNotice('Removing from library', 'Removed from library', () => db.deleteLibraryEntry(entry.id));
+    await renderLibrary();
+  }
+});
 
 // Profiling from the console: `scriptonait.profile()` runs one step per
 // command-buffer size and logs where the milliseconds go.
@@ -3824,6 +3936,7 @@ async function applyLoadedSettings() {
   // whole line of text exists to prevent.
   renderSources();
   updateGuidance();
+  renderLibrary();
 
   // Nothing is fetched from the network here. The page loads, shows what
   // you already have — including the model your last visit trained — and

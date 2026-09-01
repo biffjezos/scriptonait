@@ -64,6 +64,21 @@
           </div>
         </div>
 
+        <details class="advanced card mb-3" id="library-panel">
+          <summary class="card-header">Library</summary>
+          <div class="card-body">
+            <div class="row g-2 mb-2">
+              <div class="col-auto">
+                <input type="text" id="library-name" class="form-control" placeholder="Name" />
+              </div>
+              <div class="col-auto">
+                <button id="library-save-btn" type="button" class="btn btn-secondary secondary">Save to Library</button>
+              </div>
+            </div>
+            <div id="library-list" class="sources-list"></div>
+          </div>
+        </details>
+
         <p id="overview-plan" class="stats" hidden></p>
 
         <details class="advanced card" id="overview-corpus-panel" open hidden>
