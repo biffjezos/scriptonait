@@ -2971,6 +2971,15 @@ $('import-project-input').addEventListener('change', async (event) => {
         `optimizer ${optimizerBytes ? `${optimizerBytes.byteLength} bytes` : 'none'}`,
     );
 
+    // Same reason New Project clears it (see that handler's own comment):
+    // the file/folder handle lives in this browser, not in the project
+    // file, so it survives an import untouched unless told otherwise. Left
+    // alone, applyLoadedSettings below would find the *previous* project's
+    // still-permitted handle, reconnect autosave to it, and the next
+    // autosave would silently overwrite that other project's file with
+    // this one's content. Cleared before the imported settings are written
+    // so its persisted fileName (display-only) isn't lost by the same call.
+    await clearAutosaveTarget();
     await db.replaceAllSources(header.sources || []);
     await db.replaceAllHistory(header.history || []);
     const settings = header.settings || {};
@@ -3190,7 +3199,14 @@ function autosaveBaseName() {
 /// with '_autosave' appended so this default is never mistaken for a
 /// manually-named export.
 function autosaveTargetBaseName() {
-  return autosaveFileName || `${modelShapeName() || 'scriptonait'}_autosave`;
+  // Stripped the same way autosaveBaseName is: every caller uses this as a
+  // base to append its own suffix onto (-stepN.snp, the picker's own .snp),
+  // and autosaveFileName already carries .snp from handle.name — without
+  // stripping it here first, those calls doubled it (name.snp-stepN.snp,
+  // name.snp.snp).
+  return autosaveFileName
+    ? autosaveFileName.replace(/\.snp$/i, '')
+    : `${modelShapeName() || 'scriptonait'}_autosave`;
 }
 
 function autosaveStepFileName(step) {

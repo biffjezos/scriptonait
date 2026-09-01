@@ -130,16 +130,68 @@ impl AdamState {
         }
         let t = u32::from_le_bytes(bytes[0..4].try_into().unwrap()) as i32;
         let len = u32::from_le_bytes(bytes[4..8].try_into().unwrap()) as usize;
-        if bytes.len() != 8 + 2 * len {
+        let expected = expected_optimizer_len(len);
+        if expected != Some(bytes.len()) {
             return Err(format!(
                 "optimizer state is {} bytes, expected {} for this model shape",
                 bytes.len(),
-                8 + 2 * len
+                match expected {
+                    Some(e) => e.to_string(),
+                    None => format!("more than fits in memory (declared length {len} is bogus)"),
+                }
             ));
         }
         let m = ModelWeights::from_bytes(&bytes[8..8 + len], config)?;
         let v = ModelWeights::from_bytes(&bytes[8 + len..], config)?;
         let decay = m.decay_flags();
         Ok(Self { m, v, t, decay })
+    }
+}
+
+/// How many bytes an optimizer-state buffer must be for a declared
+/// per-tensor length of `len` (an 8-byte header, then `len` bytes each for
+/// `m` and `v`) — `None` if that overflows. A free function, not inlined
+/// as `8 + 2 * len`, so a corrupted length field can't wrap a 32-bit usize
+/// (the real target — wasm32 — not the 64-bit host `cargo test` runs on)
+/// and let a bogus length pass this check only to panic on the
+/// out-of-bounds slice a few lines below instead.
+fn expected_optimizer_len(len: usize) -> Option<usize> {
+    len.checked_mul(2).and_then(|doubled| doubled.checked_add(8))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn expected_optimizer_len_rejects_a_declared_length_that_would_overflow() {
+        // Only reachable through the real file format on a 32-bit target
+        // (len comes from a u32 field, so on the 64-bit host this test
+        // runs on, `2 * len` alone never overflows) — tested directly on
+        // a usize that would overflow regardless of host word size, so
+        // the guard itself is verified everywhere.
+        assert_eq!(expected_optimizer_len(usize::MAX), None);
+        assert_eq!(expected_optimizer_len(4), Some(16));
+    }
+
+    #[test]
+    fn from_bytes_rejects_a_length_that_disagrees_with_the_buffer() {
+        // Declares a per-tensor length of 1 (so 8 + 2*1 = 10 bytes total
+        // expected) but the buffer is only the 8-byte header — a corrupted
+        // or truncated file, not the overflow case above.
+        let mut bytes = [0u8; 8];
+        bytes[4..8].copy_from_slice(&1u32.to_le_bytes());
+        let config = ModelConfig {
+            num_layers: 1,
+            hidden_dim: 4,
+            num_heads: 1,
+            num_kv_heads: 1,
+            context_len: 4,
+            local_window: 4,
+            vocab_size: 4,
+            rope_theta: 10000.0,
+            use_ple: false,
+        };
+        assert!(AdamState::from_bytes(&bytes, &config).is_err());
     }
 }

@@ -276,15 +276,21 @@ struct Reader<'a> {
 
 impl<'a> Reader<'a> {
     fn take(&mut self, n: usize) -> Result<&'a [u8], String> {
-        if self.at + n > self.bytes.len() {
-            return Err(format!(
+        // checked_add, not `self.at + n`: a corrupted or hand-edited length
+        // field can be large enough to wrap a 32-bit usize (the real target
+        // — wasm32 — not the 64-bit host `cargo test` runs on), which would
+        // make an out-of-bounds request pass this check and then panic on
+        // the slice below instead of returning this Err.
+        let end = self.at.checked_add(n).filter(|&end| end <= self.bytes.len());
+        let end = end.ok_or_else(|| {
+            format!(
                 "checkpoint truncated: wanted {n} bytes at offset {}, file is {} bytes",
                 self.at,
                 self.bytes.len()
-            ));
-        }
-        let slice = &self.bytes[self.at..self.at + n];
-        self.at += n;
+            )
+        })?;
+        let slice = &self.bytes[self.at..end];
+        self.at = end;
         Ok(slice)
     }
 
@@ -416,6 +422,19 @@ mod tests {
         for cut in [0, 4, 20, bytes.len() / 2, bytes.len() - 1] {
             assert!(Checkpoint::from_bytes(&bytes[..cut]).is_err(), "accepted a {cut}-byte file");
         }
+    }
+
+    #[test]
+    fn take_rejects_a_length_that_would_overflow_the_read_offset() {
+        // Not reachable through Checkpoint::from_bytes's own u32 length
+        // fields on this 64-bit host (usize is 64-bit here, so `self.at +
+        // n` never overflows for any value a u32 can hold) — the same
+        // math wraps on the real target, wasm32, where usize is 32-bit.
+        // Reader::take is tested directly, at an offset near usize::MAX,
+        // so the overflow guard is verified on every host regardless.
+        let bytes = [0u8; 8];
+        let mut r = Reader { bytes: &bytes, at: usize::MAX - 2 };
+        assert!(r.take(10).is_err(), "an overflowing take() should error, not panic");
     }
 
     #[test]
