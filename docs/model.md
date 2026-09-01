@@ -27,6 +27,27 @@ pretrained weights, no third-party model code).
 - **Per-layer embeddings (PLE)**: implemented, off by default.
 - **KV cache** for decoding (see [generation.md](generation.md)).
 
+## Precision
+
+- **Compute — f32, always.** Weights, activations, gradients, and both
+  AdamW moment buffers (`m`/`v`) are f32 on the GPU and in the CPU
+  reference implementation alike. WGSL (WebGPU's shader language) has
+  no f64 type; nothing in this app trains or generates in anything
+  other than f32.
+- **Checkpoint weights at rest — bf16.** Every export (Save, Auto-save,
+  Export Project, Branch, the Library — see
+  [project.md](project.md)) narrows weights to bf16 (the top 16 bits of
+  each f32) purely to halve file size, and widens them back to f32 on
+  import. bf16 over fp16 because the conversion is a plain shift/round
+  with no subnormal or overflow handling to get subtly wrong, and bf16
+  keeps f32's exponent range — the same format large pretrained models
+  are commonly trained in natively, so a small quality cost at this
+  step is well precedented.
+- **Optimizer state at rest — f32, never narrowed.** Adam's momentum
+  has to survive a save/resume intact, and the moment buffers are
+  already 3x the size of the weights, so the size/precision trade
+  isn't taken there.
+
 ## Model Shape settings
 
 | Setting | Meaning |
