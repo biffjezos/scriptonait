@@ -760,6 +760,10 @@ $('generate-btn').addEventListener('click', async () => {
     // generation is never mistaken for a hang.
     }, [], 5 * 60 * 1000);
     setProgress('generate-progress-bar', 1);
+    if (result.stopReason === 'no-data') {
+      showError('Not enough text to generate from. Add some in Corpus.');
+      return;
+    }
     const why = {
       'end-of-text': 'the model ended the piece',
       length: 'reached the length you asked for',

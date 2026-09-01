@@ -3,7 +3,7 @@
 //! encoder every one of them threads through.
 
 use crate::context::GpuContext;
-use crate::model::{ceil_div, dispatch, P4, P8};
+use crate::model::{ceil_div, dispatch, RopeParams, P4, P8};
 
 use super::layout::{LayerActs, Scratch};
 use super::GpuTrainer;
@@ -268,15 +268,15 @@ impl GpuTrainer {
         let params = ctx.params.alloc(
             &ctx.device,
             &ctx.queue,
-            P8 {
-                a: self.t_len as u32,
-                b: heads as u32,
-                c: self.config.head_dim() as u32,
-                d: 0,
-                e: u32::from(inverse),
-                f: 0,
-                g: 0,
-                h: 0,
+            RopeParams {
+                t_len: self.t_len as u32,
+                heads: heads as u32,
+                head_dim: self.config.head_dim() as u32,
+                pos0: 0,
+                inverse: u32::from(inverse),
+                theta: self.config.rope_theta,
+                _p1: 0,
+                _p2: 0,
             },
         );
         let entries = [

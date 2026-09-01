@@ -106,6 +106,20 @@ impl WasmLLM {
         max_tokens: u32,
         on_token: &js_sys::Function,
     ) -> GenerationResult {
+        // Same signal train_step already gives worker.js when there's no
+        // batch to train on ("no-data"): with an empty corpus, every id
+        // but EOS is masked out by `allowed` (see sampling_config below),
+        // so the very first token is always EOS — a silent, instant "0
+        // words" that reads like a working, oddly terse model rather than
+        // "there is nothing to generate from yet".
+        if self.0.borrow().corpus.total_tokens() == 0 {
+            return GenerationResult {
+                text: String::new(),
+                word_count: 0,
+                tokens_generated: 0,
+                stop_reason: "no-data".to_string(),
+            };
+        }
         let max_tokens_override = (max_tokens > 0).then_some(max_tokens as usize);
         if !prefer_gpu {
             let request = self.build_request(&prompt, &extra_context);
@@ -292,7 +306,19 @@ impl WasmLLM {
         let (weights, config, tokenizer, prompt_tokens) = {
             let inner = self.0.borrow();
             let tokenizer = inner.corpus.tokenizer().clone();
-            let prompt_tokens = request.to_prompt_tokens(&tokenizer);
+            let mut prompt_tokens = request.to_prompt_tokens(&tokenizer);
+            // Same truncation Generator::new (the CPU path) applies before
+            // its own prefill: RoPE positions and this backend's KV-cache
+            // ring are both sized to context_len, so a longer prompt has
+            // to be cut down to the last context_len tokens first, not
+            // prefilled whole.
+            if prompt_tokens.is_empty() {
+                prompt_tokens.push(llm_core::tokenizer::BOS);
+            }
+            if prompt_tokens.len() > inner.config.context_len {
+                let start = prompt_tokens.len() - inner.config.context_len;
+                prompt_tokens = prompt_tokens[start..].to_vec();
+            }
             (inner.weights.clone(), inner.config, tokenizer, prompt_tokens)
         };
 
@@ -329,6 +355,29 @@ impl WasmLLM {
                 stop_reason = StopReason::EndOfText;
                 break;
             }
+            // Same rebuild Generator::maybe_reset_cache (the CPU path)
+            // does when its cache reaches context_len — this backend's
+            // ring is sized to it too, and unlike the CPU cache it never
+            // slides on its own, so a generation that runs this far
+            // would otherwise keep growing `position` past every RoPE
+            // angle the model was trained on with no correction at all.
+            // Rebuilding from the most recent half keeps positions in
+            // range at the cost of the model losing the older half of
+            // this generation's own context — the same tradeoff the CPU
+            // path already makes, not a new one. Checked and rebuilt
+            // *before* `next` joins `recent`/gets decoded below — the
+            // same order maybe_reset_cache runs in relative to advance's
+            // own decode_step, so `next` is fed to the cache exactly
+            // once, by the ordinary decode_step call, never folded into
+            // a rebuild prefill and then decoded again.
+            if model.position() >= config.context_len {
+                let keep = (config.context_len / 2).max(1);
+                let tail_start = recent.len().saturating_sub(keep);
+                let tail = recent[tail_start..].to_vec();
+                let (_, rebuilt_cache) = llm_core::model::prefill(&weights, &config, &tail);
+                model.seed_from_cpu_cache(&ctx, &rebuilt_cache);
+            }
+
             produced.push(next);
             recent.push(next);
 
@@ -340,7 +389,12 @@ impl WasmLLM {
                 break;
             }
             if !keep_going {
-                stop_reason = StopReason::Caller;
+                // Not Caller: the length guard decided this, not the
+                // on_token callback above (a real Stop button) — Budget
+                // is what dto.rs labels "length", so reaching the target
+                // reads as "reached the length you asked for" instead of
+                // an indistinguishable "stopped".
+                stop_reason = StopReason::Budget;
                 break;
             }
 
@@ -363,12 +417,9 @@ impl WasmLLM {
         Ok(GenerationResult {
             word_count: text.split_whitespace().count() as u32,
             tokens_generated: produced.len() as u32,
-            stop_reason: stop_reason_label(if guard.stopped_by_length() {
-                StopReason::Caller
-            } else {
-                stop_reason
-            })
-            .to_string(),
+            // The loop above already sets the correct reason itself — no
+            // need to recover it after the fact from the guard's own flag.
+            stop_reason: stop_reason_label(stop_reason).to_string(),
             text,
         })
     }

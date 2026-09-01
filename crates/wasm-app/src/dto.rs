@@ -131,7 +131,8 @@ impl GenerationResult {
     pub fn text(&self) -> String {
         self.text.clone()
     }
-    /// One of `end-of-text`, `length`, or `stopped`.
+    /// One of `end-of-text`, `length`, or `stopped` from a real
+    /// generation, or `busy`/`no-data` when generation never started.
     #[wasm_bindgen(getter)]
     pub fn stop_reason(&self) -> String {
         self.stop_reason.clone()

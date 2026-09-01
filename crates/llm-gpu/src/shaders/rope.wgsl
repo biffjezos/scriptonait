@@ -1,5 +1,6 @@
 // Rotary position embedding, applied in place to Q or K, per (row, head).
-// Mirrors ops::rope_apply_at (base 10000, pairs (2k, 2k+1)).
+// Mirrors ops::rope_apply_at (pairs (2k, 2k+1)), base given by `theta`
+// rather than assumed — see ModelConfig::rope_theta's own doc comment.
 //
 // `inverse` rotates the other way, which is what the backward pass needs:
 // RoPE is an orthogonal rotation, so the gradient wrt its input is the
@@ -14,7 +15,7 @@ struct Params {
     pos0: u32,
     // 1 rotates by the negative angle (the backward pass), 0 forward.
     inverse: u32,
-    _p0: u32,
+    theta: f32,
     _p1: u32,
     _p2: u32,
 };
@@ -37,7 +38,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let pos = f32(p.pos0 + t);
     let base = t * p.heads * p.head_dim + h * p.head_dim;
     for (var k: u32 = 0u; k < half; k = k + 1u) {
-        let freq = 1.0 / pow(10000.0, 2.0 * f32(k) / f32(p.head_dim));
+        let freq = 1.0 / pow(p.theta, 2.0 * f32(k) / f32(p.head_dim));
         let angle = sign * pos * freq;
         let c = cos(angle);
         let s = sin(angle);

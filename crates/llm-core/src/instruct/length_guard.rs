@@ -131,7 +131,15 @@ pub fn generate_response(
     Response {
         word_count: text.split_whitespace().count(),
         tokens_generated: tokenizer.encode(&text).len(),
-        stop_reason: if guard.stopped_by_length() { StopReason::Caller } else { reason },
+        // generate_stream only knows "the callback returned false," not
+        // why — both a real Stop button (on_progress) and the length
+        // guard reaching its target end up as StopReason::Caller from
+        // its point of view. This is the one place that can tell them
+        // apart, from the guard's own flag, and correct it to Budget
+        // (labeled "length" in dto.rs) so the length-target UI message
+        // is reachable at all, instead of every guard-triggered stop
+        // reading identically to a manual Stop.
+        stop_reason: if guard.stopped_by_length() { StopReason::Budget } else { reason },
         text,
     }
 }
@@ -228,7 +236,12 @@ impl<'a> ResponseSession<'a> {
         self.tokens_this_far += 1;
         if !self.guard.observe(&piece) {
             self.done = true;
-            self.reason = StopReason::Caller;
+            // Not Caller: the length guard decided this, not `cancel()`
+            // (a real Stop button) — Budget is what dto.rs labels
+            // "length", so reaching the target reads as "reached the
+            // length you asked for" instead of an indistinguishable
+            // "stopped".
+            self.reason = StopReason::Budget;
             let flushed = self.flush_pending();
             self.guard.observe(&flushed);
             let mut combined = piece;
@@ -261,7 +274,10 @@ impl<'a> ResponseSession<'a> {
         Response {
             word_count: text.split_whitespace().count(),
             tokens_generated: self.tokenizer.encode(&text).len(),
-            stop_reason: if self.guard.stopped_by_length() { StopReason::Caller } else { self.reason },
+            // Unlike generate_response, step() above already has direct
+            // control and sets the correct reason itself — no need to
+            // recover it after the fact from the guard's own flag.
+            stop_reason: self.reason,
             text,
         }
     }
@@ -461,6 +477,11 @@ mod tests {
         assert_eq!(actual.word_count, expected.word_count);
         assert_eq!(actual.tokens_generated, expected.tokens_generated);
         assert_eq!(actual.stop_reason, expected.stop_reason);
+        // The actual bug this test was extended to catch: reaching the
+        // word target has to report Budget (dto.rs labels it "length"),
+        // not Caller (labeled "stopped") — which is indistinguishable
+        // from a real Stop button pressed mid-generation.
+        assert_eq!(expected.stop_reason, StopReason::Budget);
     }
 
     #[test]

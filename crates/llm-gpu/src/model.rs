@@ -185,6 +185,23 @@ fn dispatch_rmsnorm(
     dispatch(encoder, ctx, &ctx.pipelines.rmsnorm, &entries, (1, 1, 1));
 }
 
+/// Mirrors rope.wgsl's `Params` field-for-field (including its layout —
+/// `theta` sits where a plain word count like `P8` would put its sixth
+/// u32) rather than reusing `P8`, since `P8` is u32-only and this shader's
+/// base has to travel as a real `f32`, not a bit-pattern.
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+pub(crate) struct RopeParams {
+    pub t_len: u32,
+    pub heads: u32,
+    pub head_dim: u32,
+    pub pos0: u32,
+    pub inverse: u32,
+    pub theta: f32,
+    pub _p1: u32,
+    pub _p2: u32,
+}
+
 fn dispatch_rope(
     encoder: &mut wgpu::CommandEncoder,
     ctx: &GpuContext,
@@ -192,11 +209,21 @@ fn dispatch_rope(
     heads: usize,
     head_dim: usize,
     pos: usize,
+    theta: f32,
 ) {
     let params = ctx.params.alloc(
         &ctx.device,
         &ctx.queue,
-        P8 { a: 1, b: heads as u32, c: head_dim as u32, d: pos as u32, e: 0, f: 0, g: 0, h: 0 },
+        RopeParams {
+            t_len: 1,
+            heads: heads as u32,
+            head_dim: head_dim as u32,
+            pos0: pos as u32,
+            inverse: 0,
+            theta,
+            _p1: 0,
+            _p2: 0,
+        },
     );
     let entries = [
         wgpu::BindGroupEntry { binding: 0, resource: params.as_entire_binding() },
@@ -455,8 +482,8 @@ impl GpuModel {
             dispatch_linear(&mut encoder, ctx, &self.scratch.normed, &layer.wq, &self.scratch.q, 1, hidden, hidden);
             dispatch_linear(&mut encoder, ctx, &self.scratch.normed, &layer.wk, &self.scratch.k, 1, hidden, kv_dim);
             dispatch_linear(&mut encoder, ctx, &self.scratch.normed, &layer.wv, &self.scratch.v, 1, hidden, kv_dim);
-            dispatch_rope(&mut encoder, ctx, &self.scratch.q, heads, head_dim, self.position);
-            dispatch_rope(&mut encoder, ctx, &self.scratch.k, kv_heads, head_dim, self.position);
+            dispatch_rope(&mut encoder, ctx, &self.scratch.q, heads, head_dim, self.position, config.rope_theta);
+            dispatch_rope(&mut encoder, ctx, &self.scratch.k, kv_heads, head_dim, self.position, config.rope_theta);
 
             // Append this position's key and value to the ring. A buffer
             // copy rather than a kernel: there is nothing to compute.
