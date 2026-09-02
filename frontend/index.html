@@ -410,6 +410,17 @@
                 <input type="number" id="cfg-layers" class="form-control" value="4" min="1" max="12" />
               </div>
               <div class="col-sm-6 col-md-4">
+                <label class="form-label" for="cfg-layer-sharing">Layer sharing</label>
+                <select id="cfg-layer-sharing" class="form-select">
+                  <option value="off" selected>Off</option>
+                  <option value="grouped">Uniform groups</option>
+                </select>
+              </div>
+              <div class="col-sm-6 col-md-4" id="cfg-unique-layers-field" hidden>
+                <label class="form-label" for="cfg-unique-layers">Unique layers</label>
+                <input type="number" id="cfg-unique-layers" class="form-control" value="4" min="1" max="12" />
+              </div>
+              <div class="col-sm-6 col-md-4">
                 <label class="form-label" for="cfg-hidden">Hidden size</label>
                 <input type="number" id="cfg-hidden" class="form-control" value="192" min="16" max="768" step="16" />
               </div>

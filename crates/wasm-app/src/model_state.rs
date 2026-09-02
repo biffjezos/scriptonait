@@ -71,8 +71,10 @@ impl WasmLLM {
     /// A fresh, untrained model — the "train one from scratch on my own
     /// text" path, kept for people who want it.
     #[wasm_bindgen(constructor)]
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         num_layers: u32,
+        unique_layers: u32,
         hidden_dim: u32,
         num_heads: u32,
         num_kv_heads: u32,
@@ -89,6 +91,7 @@ impl WasmLLM {
             context_len: context_len as usize,
             local_window: local_window as usize,
             vocab_size: tokenizer.vocab_size(),
+            unique_layers: unique_layers.max(1) as usize,
             ..Default::default()
         };
         config.validate().map_err(js_err)?;
@@ -116,6 +119,7 @@ impl WasmLLM {
         let config = inner.config;
         ModelInfo {
             layers: config.num_layers as u32,
+            unique_layers: config.unique_layers as u32,
             hidden: config.hidden_dim as u32,
             heads: config.num_heads as u32,
             kv_heads: config.num_kv_heads as u32,

@@ -183,6 +183,7 @@ mod tests {
         bytes[4..8].copy_from_slice(&1u32.to_le_bytes());
         let config = ModelConfig {
             num_layers: 1,
+            unique_layers: 1,
             hidden_dim: 4,
             num_heads: 1,
             num_kv_heads: 1,

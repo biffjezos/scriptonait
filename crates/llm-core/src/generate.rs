@@ -437,7 +437,7 @@ mod tests {
     use super::*;
 
     fn tiny_config() -> ModelConfig {
-        ModelConfig { num_layers: 1, hidden_dim: 8, num_heads: 2, num_kv_heads: 2, context_len: 16, local_window: 16, ..Default::default() }
+        ModelConfig { num_layers: 1, unique_layers: 1, hidden_dim: 8, num_heads: 2, num_kv_heads: 2, context_len: 16, local_window: 16, ..Default::default() }
     }
 
     #[test]
@@ -495,6 +495,7 @@ mod tests {
     fn kv_cached_logits_match_a_full_forward_pass() {
         let config = ModelConfig {
             num_layers: 2,
+            unique_layers: 2,
             hidden_dim: 16,
             num_heads: 4,
             num_kv_heads: 2,
@@ -531,6 +532,7 @@ mod tests {
     fn generation_survives_running_past_the_context_length() {
         let config = ModelConfig {
             num_layers: 1,
+            unique_layers: 1,
             hidden_dim: 8,
             num_heads: 2,
             num_kv_heads: 1,

@@ -289,7 +289,13 @@ fn dispatch_attention_decode(
     );
 }
 
-struct GpuLayer {
+/// One *unique* weight set — `unique_layers` of these exist, not
+/// `num_layers` (see `ModelConfig::layer_group`). Deliberately holds only
+/// weights: the KV cache is per depth position, not per weight set (two
+/// depths sharing a weight set still see different residual-stream
+/// activations, so they cache different keys and values), which is what
+/// `GpuLayerKv` is for.
+struct GpuLayerWeights {
     ple: Option<wgpu::Buffer>,
     attn_norm_gain: wgpu::Buffer,
     wq: wgpu::Buffer,
@@ -300,6 +306,11 @@ struct GpuLayer {
     w_gate: wgpu::Buffer,
     w_up: wgpu::Buffer,
     w_down: wgpu::Buffer,
+}
+
+/// One depth position's decoding cache — `num_layers` of these always
+/// exist, whether or not their weights are shared with another depth.
+struct GpuLayerKv {
     /// Ring buffers, `[capacity, kv_dim]`.
     k_cache: wgpu::Buffer,
     v_cache: wgpu::Buffer,
@@ -328,7 +339,8 @@ struct Scratch {
 pub struct GpuModel {
     config: ModelConfig,
     embed: wgpu::Buffer,
-    layers: Vec<GpuLayer>,
+    layer_weights: Vec<GpuLayerWeights>,
+    layer_kv: Vec<GpuLayerKv>,
     final_norm_gain: wgpu::Buffer,
     scratch: Scratch,
     /// Ring capacity: the attention window.
@@ -362,10 +374,10 @@ impl GpuModel {
             buffers::upload_f32(&ctx.device, label, data, wgpu::BufferUsages::empty())
         };
 
-        let layers = weights
+        let layer_weights = weights
             .layers
             .iter()
-            .map(|layer| GpuLayer {
+            .map(|layer| GpuLayerWeights {
                 ple: if config.use_ple { Some(store("ple", &layer.ple)) } else { None },
                 attn_norm_gain: store("attn_norm_gain", &layer.attn_norm_gain),
                 wq: store("wq", &layer.wq),
@@ -376,6 +388,14 @@ impl GpuModel {
                 w_gate: store("w_gate", &layer.w_gate),
                 w_up: store("w_up", &layer.w_up),
                 w_down: store("w_down", &layer.w_down),
+            })
+            .collect();
+        // One KV cache per depth position, unconditionally — even a
+        // shared weight set produces different keys and values at each
+        // depth it's used at, since the residual stream it reads from has
+        // already moved through however many layers came before.
+        let layer_kv = (0..config.num_layers)
+            .map(|_| GpuLayerKv {
                 k_cache: buffers::storage_f32(&ctx.device, "k_cache", capacity * kv_dim, false),
                 v_cache: buffers::storage_f32(&ctx.device, "v_cache", capacity * kv_dim, false),
             })
@@ -409,7 +429,8 @@ impl GpuModel {
         Ok(Self {
             config: *config,
             embed: store("embed", &weights.embed),
-            layers,
+            layer_weights,
+            layer_kv,
             final_norm_gain: store("final_norm_gain", &weights.final_norm_gain),
             scratch,
             capacity,
@@ -434,12 +455,12 @@ impl GpuModel {
     pub fn seed_from_cpu_cache(&mut self, ctx: &GpuContext, cache: &GenCache) {
         let kv_dim = self.config.kv_dim();
         let mut cached = 0usize;
-        for (index, layer) in self.layers.iter().enumerate() {
+        for (index, kv) in self.layer_kv.iter().enumerate() {
             let keys = cache.layer_keys(index);
             let values = cache.layer_values(index);
             cached = keys.len() / kv_dim;
-            ctx.queue.write_buffer(&layer.k_cache, 0, bytemuck::cast_slice(keys));
-            ctx.queue.write_buffer(&layer.v_cache, 0, bytemuck::cast_slice(values));
+            ctx.queue.write_buffer(&kv.k_cache, 0, bytemuck::cast_slice(keys));
+            ctx.queue.write_buffer(&kv.v_cache, 0, bytemuck::cast_slice(values));
         }
         self.cached_len = cached.min(self.capacity);
         self.position = cache.position();
@@ -471,7 +492,9 @@ impl GpuModel {
 
         dispatch_gather(&mut encoder, ctx, &self.embed, &self.scratch.token, &self.scratch.hidden, hidden);
 
-        for layer in &self.layers {
+        for depth in 0..config.num_layers {
+            let layer = &self.layer_weights[config.layer_group(depth)];
+            let kv_cache = &self.layer_kv[depth];
             if let Some(ple) = &layer.ple {
                 dispatch_gather(&mut encoder, ctx, ple, &self.scratch.token, &self.scratch.ple_row, hidden);
                 dispatch_add_inplace(&mut encoder, ctx, &self.scratch.hidden, &self.scratch.ple_row, hidden);
@@ -489,10 +512,10 @@ impl GpuModel {
             // copy rather than a kernel: there is nothing to compute.
             let offset = (slot * kv_dim * 4) as u64;
             let bytes = (kv_dim * 4) as u64;
-            encoder.copy_buffer_to_buffer(&self.scratch.k, 0, &layer.k_cache, offset, bytes);
-            encoder.copy_buffer_to_buffer(&self.scratch.v, 0, &layer.v_cache, offset, bytes);
+            encoder.copy_buffer_to_buffer(&self.scratch.k, 0, &kv_cache.k_cache, offset, bytes);
+            encoder.copy_buffer_to_buffer(&self.scratch.v, 0, &kv_cache.v_cache, offset, bytes);
 
-            dispatch_attention_decode(&mut encoder, ctx, &self.scratch.q, &layer.k_cache, &layer.v_cache, &self.scratch.attn, cached_len, heads, kv_heads, head_dim);
+            dispatch_attention_decode(&mut encoder, ctx, &self.scratch.q, &kv_cache.k_cache, &kv_cache.v_cache, &self.scratch.attn, cached_len, heads, kv_heads, head_dim);
             dispatch_linear(&mut encoder, ctx, &self.scratch.attn, &layer.wo, &self.scratch.proj, 1, hidden, hidden);
             dispatch_add_inplace(&mut encoder, ctx, &self.scratch.hidden, &self.scratch.proj, hidden);
 

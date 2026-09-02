@@ -62,6 +62,10 @@ pub struct SourceStats {
 #[wasm_bindgen]
 pub struct ModelInfo {
     pub layers: u32,
+    /// How many of `layers` depth positions are actually distinct weight
+    /// sets (ALBERT-style static layer sharing — see
+    /// `ModelConfig::layer_group`). Equal to `layers` when sharing is off.
+    pub unique_layers: u32,
     pub hidden: u32,
     pub heads: u32,
     pub kv_heads: u32,

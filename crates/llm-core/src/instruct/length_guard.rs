@@ -323,6 +323,7 @@ mod tests {
         // whether the model ever produces a sentence boundary.
         let config = ModelConfig {
             num_layers: 1,
+            unique_layers: 1,
             hidden_dim: 16,
             num_heads: 2,
             num_kv_heads: 1,
@@ -358,6 +359,7 @@ mod tests {
     fn max_tokens_override_is_a_hard_ceiling_regardless_of_the_word_target() {
         let config = ModelConfig {
             num_layers: 1,
+            unique_layers: 1,
             hidden_dim: 16,
             num_heads: 2,
             num_kv_heads: 1,
@@ -404,6 +406,7 @@ mod tests {
     fn a_progress_callback_can_stop_generation() {
         let config = ModelConfig {
             num_layers: 1,
+            unique_layers: 1,
             hidden_dim: 8,
             num_heads: 2,
             num_kv_heads: 2,
@@ -438,6 +441,7 @@ mod tests {
         // and in the final `Response`.
         let config = ModelConfig {
             num_layers: 1,
+            unique_layers: 1,
             hidden_dim: 16,
             num_heads: 2,
             num_kv_heads: 1,
@@ -488,6 +492,7 @@ mod tests {
     fn response_session_cancel_matches_a_progress_callback_stopping_early() {
         let config = ModelConfig {
             num_layers: 1,
+            unique_layers: 1,
             hidden_dim: 8,
             num_heads: 2,
             num_kv_heads: 2,

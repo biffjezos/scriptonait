@@ -21,19 +21,24 @@ impl GpuTrainer {
         self.dispatch_gather(chunks, ctx, self.weights.embed(), &self.scratch.tokens, &self.scratch.hidden);
 
         for (l, acts) in self.acts.iter().enumerate() {
+            // `l` is a depth position (0..num_layers); resolve it to which
+            // of `unique_layers` weight sets actually answers for it. When
+            // sharing is off (unique_layers == num_layers, today's default)
+            // this is the identity, group == l.
+            let g = c.layer_group(l);
             chunks.copy(&self.scratch.hidden, &acts.h_in, t * h);
             self.dispatch_rmsnorm(
                 chunks,
                 ctx,
                 &self.scratch.hidden,
-                self.weights.layer(l, T_ATTN_GAIN),
+                self.weights.layer(g, T_ATTN_GAIN),
                 &acts.normed1,
                 &acts.inv_rms1,
                 h,
             );
-            dispatch_linear(chunks.enc(), ctx, &acts.normed1, self.weights.layer(l, T_WQ), &acts.q, t, h, h);
-            dispatch_linear(chunks.enc(), ctx, &acts.normed1, self.weights.layer(l, T_WK), &acts.k, t, h, kv);
-            dispatch_linear(chunks.enc(), ctx, &acts.normed1, self.weights.layer(l, T_WV), &acts.v, t, h, kv);
+            dispatch_linear(chunks.enc(), ctx, &acts.normed1, self.weights.layer(g, T_WQ), &acts.q, t, h, h);
+            dispatch_linear(chunks.enc(), ctx, &acts.normed1, self.weights.layer(g, T_WK), &acts.k, t, h, kv);
+            dispatch_linear(chunks.enc(), ctx, &acts.normed1, self.weights.layer(g, T_WV), &acts.v, t, h, kv);
             self.dispatch_rope(chunks, ctx, &acts.q, c.num_heads, false);
             self.dispatch_rope(chunks, ctx, &acts.k, c.num_kv_heads, false);
             self.dispatch_attention_fwd(chunks, ctx, acts, band);
@@ -41,7 +46,7 @@ impl GpuTrainer {
                 chunks.enc(),
                 ctx,
                 &acts.concat,
-                self.weights.layer(l, T_WO),
+                self.weights.layer(g, T_WO),
                 &self.scratch.tmp_h,
                 t,
                 h,
@@ -64,19 +69,19 @@ impl GpuTrainer {
                 chunks,
                 ctx,
                 &self.scratch.hidden,
-                self.weights.layer(l, T_MLP_GAIN),
+                self.weights.layer(g, T_MLP_GAIN),
                 &acts.normed2,
                 &acts.inv_rms2,
                 h,
             );
-            dispatch_linear(chunks.enc(), ctx, &acts.normed2, self.weights.layer(l, T_W_GATE), &acts.gate, t, h, ffn);
-            dispatch_linear(chunks.enc(), ctx, &acts.normed2, self.weights.layer(l, T_W_UP), &acts.up, t, h, ffn);
+            dispatch_linear(chunks.enc(), ctx, &acts.normed2, self.weights.layer(g, T_W_GATE), &acts.gate, t, h, ffn);
+            dispatch_linear(chunks.enc(), ctx, &acts.normed2, self.weights.layer(g, T_W_UP), &acts.up, t, h, ffn);
             dispatch_swiglu(chunks.enc(), ctx, &acts.gate, &acts.up, &self.scratch.act, t * ffn);
             dispatch_linear(
                 chunks.enc(),
                 ctx,
                 &self.scratch.act,
-                self.weights.layer(l, T_W_DOWN),
+                self.weights.layer(g, T_W_DOWN),
                 &self.scratch.tmp_h,
                 t,
                 ffn,

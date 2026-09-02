@@ -452,7 +452,7 @@ mod tests {
 
     #[cfg(feature = "native-trainer")]
     fn tiny_config() -> ModelConfig {
-        ModelConfig { num_layers: 2, hidden_dim: 8, num_heads: 2, num_kv_heads: 1, context_len: 8, local_window: 8, ..Default::default() }
+        ModelConfig { num_layers: 2, unique_layers: 2, hidden_dim: 8, num_heads: 2, num_kv_heads: 1, context_len: 8, local_window: 8, ..Default::default() }
     }
 
     #[cfg(feature = "native-trainer")]

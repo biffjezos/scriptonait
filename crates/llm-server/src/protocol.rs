@@ -27,6 +27,12 @@ pub struct ModelConfigUpload {
     pub context_len: usize,
     pub local_window: usize,
     pub seed: u64,
+    /// How many of `num_layers` depth positions are distinct weight sets
+    /// (ALBERT-style static layer sharing — see
+    /// `llm_core::config::ModelConfig::layer_group`). Absent from a client
+    /// that predates sharing, or a client that just isn't using it —
+    /// defaults to `num_layers`, today's behavior.
+    pub unique_layers: Option<usize>,
 }
 
 /// Exactly one of `config`/`checkpoint_base64` must be set: a fresh

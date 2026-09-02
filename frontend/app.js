@@ -460,6 +460,14 @@ function renderModelShape(info) {
     if (info) field.value = value;
     field.disabled = Boolean(info);
   }
+  if (info) {
+    const sharing = info.uniqueLayers !== info.layers;
+    $('cfg-layer-sharing').value = sharing ? 'grouped' : 'off';
+    $('cfg-unique-layers').value = info.uniqueLayers;
+    $('cfg-unique-layers-field').hidden = !sharing;
+  }
+  $('cfg-layer-sharing').disabled = Boolean(info);
+  $('cfg-unique-layers').disabled = Boolean(info);
   $('shape-hint').textContent = info ? 'Fixed' : 'New model shape:';
   refreshShapeEstimate();
 }
@@ -477,6 +485,25 @@ function renderModelShape(info) {
 /// point: the moment somebody wants this answer is the moment before
 /// there is a model to ask.
 let shapeEstimateToken = 0;
+
+/// A starting point for "Unique layers" when Layer sharing is switched
+/// on: the largest divisor of the layer count that is at most half of
+/// it, so turning sharing on visibly shrinks the model instead of
+/// defaulting to a value indistinguishable from sharing being off. A
+/// layer count with no such divisor (1, or a prime) has nothing to offer
+/// but full sharing, and gets that.
+function defaultUniqueLayers(numLayers) {
+  for (let d = Math.floor(numLayers / 2); d >= 1; d--) {
+    if (numLayers % d === 0) return d;
+  }
+  return numLayers;
+}
+
+function currentUniqueLayers() {
+  const layers = Number($('cfg-layers').value) || 0;
+  if ($('cfg-layer-sharing').value !== 'grouped') return layers;
+  return Number($('cfg-unique-layers').value) || layers;
+}
 
 function formatBytes(bytes) {
   if (!bytes) return '—';
@@ -498,6 +525,7 @@ async function refreshShapeEstimate() {
   try {
     estimate = await call('describe-shape', {
       layers: Number($('cfg-layers').value) || 0,
+      uniqueLayers: currentUniqueLayers(),
       hidden: Number($('cfg-hidden').value) || 0,
       heads: Number($('cfg-heads').value) || 0,
       kvHeads: Number($('cfg-kv-heads').value) || 0,
@@ -1929,6 +1957,7 @@ function profileShapeMatches(profile) {
   const s = profile.shape;
   return (
     s.layers === model.layers &&
+    s.uniqueLayers === model.uniqueLayers &&
     s.hidden === model.hidden &&
     s.heads === model.heads &&
     s.kvHeads === model.kvHeads &&
@@ -2462,6 +2491,7 @@ $('train-btn').addEventListener('click', async () => {
       renderModel(
         await call('create-model', {
           layers: Number($('cfg-layers').value),
+          uniqueLayers: currentUniqueLayers(),
           hidden: Number($('cfg-hidden').value),
           heads: Number($('cfg-heads').value),
           kvHeads: Number($('cfg-kv-heads').value),
@@ -2553,9 +2583,15 @@ $('train-btn').addEventListener('click', async () => {
 $('train-batch').addEventListener('input', updateGuidance);
 // Every field that changes the price, priced as it is typed.
 for (const id of ['cfg-layers', 'cfg-hidden', 'cfg-heads', 'cfg-kv-heads', 'cfg-context',
-  'cfg-window']) {
+  'cfg-window', 'cfg-unique-layers']) {
   $(id).addEventListener('input', () => refreshShapeEstimate());
 }
+$('cfg-layer-sharing').addEventListener('change', () => {
+  const grouped = $('cfg-layer-sharing').value === 'grouped';
+  $('cfg-unique-layers-field').hidden = !grouped;
+  if (grouped) $('cfg-unique-layers').value = defaultUniqueLayers(Number($('cfg-layers').value) || 1);
+  refreshShapeEstimate();
+});
 
 $('train-stop-btn').addEventListener('click', () => {
   $('train-stop-btn').disabled = true;
@@ -3290,7 +3326,8 @@ function autosaveDirectorySupported() {
 /// instead of colliding on the same generic one.
 function modelShapeName() {
   if (!model) return null;
-  return `${model.layers}_${model.hidden}_${model.heads}_${model.kvHeads}_${model.contextLen}_${model.window}`;
+  const sharing = model.uniqueLayers !== model.layers ? `_u${model.uniqueLayers}` : '';
+  return `${model.layers}${sharing}_${model.hidden}_${model.heads}_${model.kvHeads}_${model.contextLen}_${model.window}`;
 }
 
 /// The project's own base name: whatever file was last connected — an

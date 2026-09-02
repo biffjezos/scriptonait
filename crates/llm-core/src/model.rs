@@ -42,7 +42,7 @@ impl ModelWeights {
         let v = config.vocab_size();
         Self {
             embed: vec![0.0; v * h],
-            layers: (0..config.num_layers).map(|_| LayerWeights::zeros(config)).collect(),
+            layers: (0..config.unique_layers).map(|_| LayerWeights::zeros(config)).collect(),
             final_norm_gain: vec![0.0; h],
         }
     }
@@ -51,10 +51,18 @@ impl ModelWeights {
         let mut rng = Rng::seed_from_u64(seed);
         let h = config.hidden_dim;
         let v = config.vocab_size();
-        let n = config.num_layers;
+        // Residual-stream variance scaling (see `LayerWeights::init`) is
+        // keyed to the actual depth of the stack, `num_layers` — every
+        // depth position adds into the same residual stream once, whether
+        // or not its weights are shared with another position — not to
+        // `unique_layers`, which only says how many distinct weight sets
+        // back those `num_layers` additions.
+        let depth = config.num_layers;
         Self {
             embed: (0..v * h).map(|_| rng.next_gaussian() * 0.02).collect(),
-            layers: (0..n).map(|_| LayerWeights::init(config, n, &mut rng)).collect(),
+            layers: (0..config.unique_layers)
+                .map(|_| LayerWeights::init(config, depth, &mut rng))
+                .collect(),
             final_norm_gain: vec![1.0; h],
         }
     }
@@ -211,8 +219,13 @@ pub fn forward(weights: &ModelWeights, config: &ModelConfig, tokens: &[u32]) -> 
     let vocab = config.vocab_size();
 
     let mut hidden = gather_rows(&weights.embed, tokens, h);
-    let mut layer_caches = Vec::with_capacity(weights.layers.len());
-    for layer in &weights.layers {
+    // One cache entry per *depth position* (`num_layers`), not per unique
+    // weight set (`weights.layers.len()`, `unique_layers`): activations
+    // differ at every depth even where two positions share a weight set,
+    // and backward needs each depth's own cache to retrace it.
+    let mut layer_caches = Vec::with_capacity(config.num_layers);
+    for depth in 0..config.num_layers {
+        let layer = &weights.layers[config.layer_group(depth)];
         layer_caches.push(layer.forward(&mut hidden, tokens, config, t_len));
     }
 
@@ -342,7 +355,8 @@ pub fn decode_step(
 
     let mut hidden = gather_rows(&weights.embed, &[token], h);
 
-    for (layer_idx, layer) in weights.layers.iter().enumerate() {
+    for layer_idx in 0..config.num_layers {
+        let layer = &weights.layers[config.layer_group(layer_idx)];
         if config.use_ple {
             let ple = gather_rows(&layer.ple, &[token], h);
             for i in 0..h {
@@ -450,13 +464,21 @@ pub fn backward_into(
         grads.final_norm_gain[i] += d_final_gain[i];
     }
 
-    // Zipped rather than indexed: `weights.layers`, `cache.layers` and
-    // `grads.layers` are always constructed at the same length (one
-    // entry per model layer), and a `zip` can't walk them out of step
-    // with each other the way three parallel `[layer_idx]` lookups could.
-    for ((layer, lc), lg) in
-        weights.layers.iter().zip(cache.layers.iter()).zip(grads.layers.iter_mut()).rev()
-    {
+    // Indexed by depth position (`cache.layers`, one entry per depth) and
+    // by weight group (`weights.layers`/`grads.layers`, one entry per
+    // `unique_layers`), via `layer_group` — not zipped, since sharing
+    // means those two lengths differ whenever `unique_layers <
+    // num_layers`. Every depth position sharing a group accumulates its
+    // gradient into that one shared `grads.layers[group]` buffer in turn
+    // (`LayerWeights::backward` already accumulates rather than
+    // overwrites — the same principle already proven correct by the tied
+    // input/output embedding's own gradient, just extended from 2 uses of
+    // one buffer to `group_size` uses).
+    for depth in (0..config.num_layers).rev() {
+        let group = config.layer_group(depth);
+        let layer = &weights.layers[group];
+        let lc = &cache.layers[depth];
+        let lg = &mut grads.layers[group];
         d_hidden = layer.backward(lc, &cache.tokens, config, t_len, d_hidden, lg);
     }
 
@@ -476,12 +498,33 @@ mod tests {
         // still covers the per-layer embedding scatter.
         ModelConfig {
             num_layers: 2,
+            unique_layers: 2,
             hidden_dim: 8,
             num_heads: 2,
             num_kv_heads: 1,
             context_len: 6,
             local_window: 6,
             use_ple: true,
+            ..Default::default()
+        }
+    }
+
+    /// Four depth positions, two unique weight sets: depths 0-1 share one
+    /// set, depths 2-3 share the other. Small enough for the same
+    /// numerical gradient check as `small_config`, deliberately with
+    /// `use_ple` off — a shared PLE table's scatter-add would need every
+    /// depth in the group to scatter into the same table, which is
+    /// already covered by this same accumulation principle and isn't
+    /// worth a second check here.
+    fn shared_layers_config() -> ModelConfig {
+        ModelConfig {
+            num_layers: 4,
+            unique_layers: 2,
+            hidden_dim: 8,
+            num_heads: 2,
+            num_kv_heads: 1,
+            context_len: 6,
+            local_window: 6,
             ..Default::default()
         }
     }
@@ -575,6 +618,56 @@ mod tests {
             assert!(
                 diff / scale < 5e-2,
                 "{name}[{idx}]: analytic={analytic} numeric={numeric_grad}"
+            );
+        }
+    }
+
+    #[test]
+    fn shared_layer_weights_hold_the_right_number_of_sets() {
+        let config = shared_layers_config();
+        let w = ModelWeights::init(&config, 3);
+        assert_eq!(w.layers.len(), config.unique_layers);
+        assert_eq!(w.param_count(), config.param_count());
+    }
+
+    /// The gradient check that actually exercises sharing: depths 0 and 1
+    /// both read `weights.layers[0]`, so a poke to one of its parameters
+    /// changes the loss through *two* depth positions at once, and the
+    /// analytic gradient has to be their sum — exactly what
+    /// `backward_into` accumulating into one shared `grads.layers[group]`
+    /// buffer across both depths is supposed to produce. A wrong
+    /// `layer_group` mapping, or backward overwriting instead of
+    /// accumulating, would show up here as a factor-of-two (or wrong
+    /// depth entirely) mismatch that `full_model_gradient_check`'s
+    /// un-shared config can't catch.
+    #[test]
+    fn shared_layer_gradient_check() {
+        let config = shared_layers_config();
+        let weights = ModelWeights::init(&config, 11);
+        let tokens = vec![5u32, 12, 200, 3, 65];
+        let targets = vec![12u32, 200, 3, 65, 9];
+
+        let (logits, cache) = forward(&weights, &config, &tokens);
+        let (_, d_logits) = ops::cross_entropy(&logits, &targets, tokens.len(), config.vocab_size());
+        let grads = backward(&weights, &config, &cache, &d_logits);
+
+        let eps = 1e-3;
+        for idx in [0usize, 3, 9] {
+            let mut w_plus = weights.clone();
+            let mut w_minus = weights.clone();
+            w_plus.layers[0].wq[idx] += eps;
+            w_minus.layers[0].wq[idx] -= eps;
+
+            let loss_plus = total_loss(&w_plus, &config, &tokens, &targets);
+            let loss_minus = total_loss(&w_minus, &config, &tokens, &targets);
+            let numeric_grad = (loss_plus - loss_minus) / (2.0 * eps);
+
+            let analytic = grads.layers[0].wq[idx];
+            let diff = (analytic - numeric_grad).abs();
+            let scale = analytic.abs().max(numeric_grad.abs()).max(1.0);
+            assert!(
+                diff / scale < 5e-2,
+                "shared wq[{idx}]: analytic={analytic} numeric={numeric_grad}"
             );
         }
     }

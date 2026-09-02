@@ -26,6 +26,8 @@ pretrained weights, no third-party model code).
   Shazeer, *GLU Variants Improve Transformer*, 2020 (arXiv:2002.05202).
 - **Per-layer embeddings (PLE)**: implemented, off by default.
 - **KV cache** for decoding (see [generation.md](generation.md)).
+- **Layer sharing (ALBERT-style static grouping)**: implemented, off by
+  default. See the section below.
 
 ## Precision
 
@@ -52,7 +54,9 @@ pretrained weights, no third-party model code).
 
 | Setting | Meaning |
 |---|---|
-| Layers | Transformer block count |
+| Layers | Transformer block count (depth positions) |
+| Layer sharing | Off, or Uniform groups (see below) |
+| Unique layers | Distinct weight sets, when Layer sharing is Uniform groups |
 | Hidden size | Residual stream width |
 | Heads | Attention heads |
 | KV heads | Key/value heads (GQA); must divide Heads |
@@ -67,6 +71,40 @@ pretrained weights, no third-party model code).
   `ModelConfig` struct the model is actually built from, so it cannot
   drift from what it estimates.
 - Changing shape starts a new model; it does not resize an existing one.
+
+## Layer sharing
+
+Trades parameters for repetition: fewer distinct weight sets are run at
+more depth positions, so a model with the same depth (and therefore the
+same per-step GPU work) costs fewer parameters to store and train.
+
+- **Off** (default): every one of `Layers` depth positions has its own
+  weights — `Unique layers` equals `Layers`, today's behavior before this
+  setting existed at all.
+- **Uniform groups**: `Layers` is split into `Unique layers` equal-length
+  contiguous spans, in order — the first span's depth positions all run
+  the first weight set, the second span the second, and so on.
+  `Unique layers` must evenly divide `Layers`. Switching this on suggests
+  a starting `Unique layers` value (the largest divisor of `Layers` that
+  is at most half of it); typing a different value is a divisor check,
+  not a retrain.
+
+  Lan, Chen, Goodman, Gimpel, Sharma & Soricut, *ALBERT: A Lite BERT for
+  Self-Supervised Learning of Language Representations*, 2019
+  (arXiv:1909.11942). The general "recurrent depth" family traces to
+  Dehghani, Gouws, Vinyals, Uszkoreit & Kaiser, *Universal Transformers*,
+  2018 (arXiv:1807.03819), which shares one set of weights across every
+  depth position (the `Unique layers = 1` case here).
+
+- Every depth position still keeps its own activations and its own
+  key/value cache during generation — two positions sharing a weight set
+  still see a different residual stream (whatever came before them in the
+  stack), so they compute different numbers even from identical weights.
+  Only the weights, gradients, and Adam moment buffers are shared; nothing
+  about attention, RoPE, or the forward/backward loop's shape changes.
+- The checkpoint format stores `Unique layers` alongside the rest of the
+  shape; a file from before this setting existed loads with `Unique
+  layers` equal to `Layers` (no sharing), exactly its previous behavior.
 
 ## Instruction format
 

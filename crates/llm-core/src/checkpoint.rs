@@ -15,6 +15,7 @@
 //!           context_len, local_window, vocab_size
 //!   f32     rope_theta
 //!   u32     use_ple (0/1)
+//!   u32     unique_layers, defaults to num_layers if absent (v5+)
 //!   u64     training step the weights are from
 //!   u64     tokens this model has been trained on, cumulative (v3+)
 //!   u32     planned total steps for the schedule, 0 = none set (v4+)
@@ -47,6 +48,12 @@ use crate::model::ModelWeights;
 use crate::tokenizer::Tokenizer;
 
 const MAGIC: &[u8; 4] = b"SCCK";
+/// Version 5 added `unique_layers` (ALBERT-style static layer sharing —
+/// see `ModelConfig::layer_group`): how many *distinct* sets of layer
+/// weights back `num_layers` depth positions, which is also what
+/// `ModelWeights.layers.len()` now is instead of always equaling
+/// `num_layers`. Absent on older files, which predate sharing entirely —
+/// they read as `unique_layers = num_layers`, today's behavior exactly.
 /// Version 4 added the schedule's planned-step target and the plateau-cut
 /// multiplier, so a resumed run continues the same absolute schedule
 /// instead of starting a fresh one anchored to whatever step it happened
@@ -55,17 +62,17 @@ const MAGIC: &[u8; 4] = b"SCCK";
 /// their "not set" default rather than a wrong number.
 ///
 /// Every version so far has only ever added *scalar* fields, read
-/// conditionally by version (see `Checkpoint::from_bytes` below) —
-/// there has never been more than one tensor group per layer to
-/// describe. A future architecture needing a variable number of them
-/// (Mixture-of-Experts: N sets of FFN weights per layer instead of one
-/// — see `llm_core::model::layer`'s `ffn_forward` and this crate's
+/// conditionally by version (see `Checkpoint::from_bytes` below) — even
+/// `unique_layers`, which changes how many tensor groups the *weights*
+/// section holds, is itself just one more scalar in the fixed header. A
+/// future architecture needing a variable number of tensor groups *per
+/// layer* (Mixture-of-Experts: N sets of FFN weights per layer instead of
+/// one — see `llm_core::model::layer`'s `ffn_forward` and this crate's
 /// `PLAN.md`) would extend this the same way: bump `VERSION`, add a
 /// conditionally-read field (an expert count), and teach
-/// `ModelWeights::from_bytes` to size itself from it instead of purely
-/// from `ModelConfig` as it does today. Not done here — there is no
-/// expert count to store yet.
-const VERSION: u32 = 4;
+/// `ModelWeights::from_bytes` to size itself from it. Not done here —
+/// there is no expert count to store yet.
+const VERSION: u32 = 5;
 const MIN_READABLE_VERSION: u32 = 2;
 
 /// How the weights are stored in a checkpoint file.
@@ -168,6 +175,7 @@ pub fn write_checkpoint(
     }
     out.extend_from_slice(&config.rope_theta.to_le_bytes());
     out.extend_from_slice(&u32::from(config.use_ple).to_le_bytes());
+    out.extend_from_slice(&(config.unique_layers as u32).to_le_bytes());
     out.extend_from_slice(&step.to_le_bytes());
     out.extend_from_slice(&tokens_seen.to_le_bytes());
     out.extend_from_slice(&planned_steps.to_le_bytes());
@@ -212,16 +220,29 @@ impl Checkpoint {
                 "checkpoint format version {version}, expected {MIN_READABLE_VERSION} to {VERSION}"
             ));
         }
+        let num_layers = r.u32()? as usize;
+        let hidden_dim = r.u32()? as usize;
+        let num_heads = r.u32()? as usize;
+        let num_kv_heads = r.u32()? as usize;
+        let context_len = r.u32()? as usize;
+        let local_window = r.u32()? as usize;
+        let vocab_size = r.u32()? as usize;
+        let rope_theta = r.f32()?;
+        let use_ple = r.u32()? != 0;
+        // Absent before version 5: no layer sharing existed, so every
+        // depth position was its own unique layer.
+        let unique_layers = if version >= 5 { r.u32()? as usize } else { num_layers };
         let config = ModelConfig {
-            num_layers: r.u32()? as usize,
-            hidden_dim: r.u32()? as usize,
-            num_heads: r.u32()? as usize,
-            num_kv_heads: r.u32()? as usize,
-            context_len: r.u32()? as usize,
-            local_window: r.u32()? as usize,
-            vocab_size: r.u32()? as usize,
-            rope_theta: r.f32()?,
-            use_ple: r.u32()? != 0,
+            num_layers,
+            hidden_dim,
+            num_heads,
+            num_kv_heads,
+            context_len,
+            local_window,
+            vocab_size,
+            rope_theta,
+            use_ple,
+            unique_layers,
         };
         config.validate().map_err(|e| format!("checkpoint config is invalid: {e}"))?;
         let step = r.u64()?;
@@ -315,6 +336,7 @@ mod tests {
         let tokenizer = Tokenizer::train(&[&"the cave and the fire and the shadows. ".repeat(30)], 320);
         let config = ModelConfig {
             num_layers: 2,
+            unique_layers: 2,
             hidden_dim: 16,
             num_heads: 4,
             num_kv_heads: 2,
@@ -354,13 +376,16 @@ mod tests {
     #[test]
     fn a_version_2_checkpoint_still_loads() {
         let mut bytes = sample().to_bytes();
-        // Rewrite the version and cut everything from tokens_seen up to
-        // (not including) the dtype tag, which version 2 did not have:
-        // tokens_seen (u64) + planned_steps (u32) + plateau_scale (f32).
         bytes[4..8].copy_from_slice(&2u32.to_le_bytes());
-        let step_at = 8 + 7 * 4 + 4 + 4;
+        // v2 predates both unique_layers (v5) and tokens_seen/
+        // planned_steps/plateau_scale (v3/v4) — cut the later range first
+        // so the earlier one's offset stays valid.
+        let unique_layers_at = 8 + 7 * 4 + 4 + 4;
+        let step_at = unique_layers_at + 4;
         bytes.drain(step_at + 8..step_at + 8 + 8 + 4 + 4);
+        bytes.drain(unique_layers_at..unique_layers_at + 4);
         let restored = Checkpoint::from_bytes(&bytes).expect("version 2 should still load");
+        assert_eq!(restored.config.unique_layers, restored.config.num_layers);
         assert_eq!(restored.step, 4242);
         assert_eq!(restored.tokens_seen, 0);
         assert_eq!(restored.planned_steps, 0);
@@ -373,15 +398,48 @@ mod tests {
     fn a_version_3_checkpoint_still_loads() {
         let mut bytes = sample().to_bytes();
         bytes[4..8].copy_from_slice(&3u32.to_le_bytes());
-        // Cut planned_steps (u32) + plateau_scale (f32), which sit right
-        // after tokens_seen.
-        let tokens_seen_at = 8 + 7 * 4 + 4 + 4 + 8;
+        // v3 predates both unique_layers (v5) and planned_steps/
+        // plateau_scale (v4), but does have tokens_seen (v3).
+        let unique_layers_at = 8 + 7 * 4 + 4 + 4;
+        let tokens_seen_at = unique_layers_at + 4 + 8;
         bytes.drain(tokens_seen_at + 8..tokens_seen_at + 8 + 4 + 4);
+        bytes.drain(unique_layers_at..unique_layers_at + 4);
         let restored = Checkpoint::from_bytes(&bytes).expect("version 3 should still load");
+        assert_eq!(restored.config.unique_layers, restored.config.num_layers);
         assert_eq!(restored.step, 4242);
         assert_eq!(restored.tokens_seen, 9_000_000);
         assert_eq!(restored.planned_steps, 0);
         assert_eq!(restored.plateau_scale, 1.0);
+    }
+
+    /// A file written before `unique_layers` existed (but with the
+    /// schedule fields already present) still loads, falling back to
+    /// "every depth position is its own unique layer" — today's behavior
+    /// before sharing existed at all.
+    #[test]
+    fn a_version_4_checkpoint_still_loads() {
+        let mut bytes = sample().to_bytes();
+        bytes[4..8].copy_from_slice(&4u32.to_le_bytes());
+        let unique_layers_at = 8 + 7 * 4 + 4 + 4;
+        bytes.drain(unique_layers_at..unique_layers_at + 4);
+        let restored = Checkpoint::from_bytes(&bytes).expect("version 4 should still load");
+        assert_eq!(restored.config.unique_layers, restored.config.num_layers);
+        assert_eq!(restored.step, 4242);
+        assert_eq!(restored.tokens_seen, 9_000_000);
+        assert_eq!(restored.planned_steps, 23_000);
+        assert_eq!(restored.plateau_scale, 0.5);
+    }
+
+    #[test]
+    fn checkpoint_round_trips_with_shared_layers() {
+        let mut original = sample();
+        original.config.num_layers = 4;
+        original.config.unique_layers = 2;
+        original.weights = ModelWeights::init(&original.config, 5);
+        let restored = Checkpoint::from_bytes(&original.to_bytes()).unwrap();
+        assert_eq!(restored.config, original.config);
+        assert_eq!(restored.weights.layers.len(), 2);
+        assert_eq!(restored.weights.to_bytes(), original.weights.to_bytes());
     }
 
     #[test]

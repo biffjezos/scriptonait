@@ -83,6 +83,18 @@ pub struct ModelConfig {
     /// pushed up for book/script-length material. Set equal to (or above)
     /// `context_len` to disable and use plain full causal attention.
     pub local_window: usize,
+    /// How many *distinct* sets of layer weights actually exist, out of
+    /// `num_layers` depth positions (ALBERT-style static grouping — Lan,
+    /// Chen, Goodman, Gimpel, Sharma & Soricut, *ALBERT: A Lite BERT for
+    /// Self-Supervised Learning of Language Representations*, 2019,
+    /// arXiv:1909.11942; the general "recurrent depth" family traces to
+    /// Dehghani, Gouws, Vinyals, Uszkoreit & Kaiser, *Universal
+    /// Transformers*, 2018, arXiv:1807.03819). Must evenly divide
+    /// `num_layers`. Equal to `num_layers` (the default) means no sharing
+    /// at all — every depth position has its own weights, today's
+    /// behavior exactly. `ModelWeights.layers` holds this many entries,
+    /// not `num_layers`; see `layer_group`.
+    pub unique_layers: usize,
 }
 
 impl Default for ModelConfig {
@@ -97,6 +109,7 @@ impl Default for ModelConfig {
             vocab_size: BASE_VOCAB_SIZE,
             rope_theta: DEFAULT_ROPE_THETA,
             use_ple: false,
+            unique_layers: 4,
         }
     }
 }
@@ -110,6 +123,9 @@ pub enum ConfigError {
     /// The config's training memory can't fit in a 32-bit wasm heap. See
     /// `MAX_TRAINING_BYTES`.
     TooLarge { training_bytes: usize, limit: usize },
+    /// `unique_layers` doesn't evenly divide `num_layers` — some depth
+    /// positions would have no well-defined group to share weights with.
+    UniqueLayersMustDivideNumLayers { num_layers: usize, unique_layers: usize },
 }
 
 impl std::fmt::Display for ConfigError {
@@ -137,6 +153,10 @@ impl std::fmt::Display for ConfigError {
                  (the attention cache alone costs layers x heads x context x window floats)",
                 training_bytes / (1024 * 1024),
                 limit / (1024 * 1024),
+            ),
+            ConfigError::UniqueLayersMustDivideNumLayers { num_layers, unique_layers } => write!(
+                f,
+                "unique_layers ({unique_layers}) must evenly divide num_layers ({num_layers})"
             ),
         }
     }
@@ -209,6 +229,15 @@ impl ModelConfig {
         if self.rope_theta <= 1.0 {
             return Err(ConfigError::TooSmall { field: "rope_theta", min: 2 });
         }
+        if self.unique_layers == 0 {
+            return Err(ConfigError::TooSmall { field: "unique_layers", min: 1 });
+        }
+        if self.num_layers % self.unique_layers != 0 {
+            return Err(ConfigError::UniqueLayersMustDivideNumLayers {
+                num_layers: self.num_layers,
+                unique_layers: self.unique_layers,
+            });
+        }
         let training_bytes = self.memory_bytes(true);
         if training_bytes > MAX_TRAINING_BYTES {
             return Err(ConfigError::TooLarge { training_bytes, limit: MAX_TRAINING_BYTES });
@@ -237,6 +266,31 @@ impl ModelConfig {
         default_ffn_dim(self.hidden_dim)
     }
 
+    /// Depth positions per unique weight set (`num_layers / unique_layers`).
+    pub fn group_size(&self) -> usize {
+        self.num_layers / self.unique_layers
+    }
+
+    /// Which of `unique_layers` weight sets answers for depth position
+    /// `depth` (`0..num_layers`). `ModelWeights.layers[layer_group(depth)]`
+    /// is always the right lookup, on both the CPU and GPU paths — nothing
+    /// that walks the model divides `num_layers` by `unique_layers` itself.
+    ///
+    /// Today's grouping is `unique_layers` equal-length contiguous spans in
+    /// order: group 0 owns depths `0..group_size`, group 1 the next
+    /// `group_size`, and so on. That's deliberately how a future
+    /// non-uniform variant (Geiping, McLeish, Jain, Kirchenbauer, Singh,
+    /// Bartoldson, Kailkhura, Bhatele & Goldstein, *Scaling up Test-Time
+    /// Compute with Latent Reasoning: A Recurrent Depth Approach*, 2025,
+    /// arXiv:2502.05171 — non-shared prelude layers, one shared core block
+    /// looped many times, non-shared coda layers) would fit too: it's the
+    /// same "contiguous span owns one group" shape with uneven span
+    /// lengths, so every caller already goes through this method instead
+    /// of assuming equal spans.
+    pub fn layer_group(&self, depth: usize) -> usize {
+        depth / self.group_size()
+    }
+
     pub fn vocab_size(&self) -> usize {
         self.vocab_size
     }
@@ -251,6 +305,11 @@ impl ModelConfig {
     /// and this crate's `PLAN.md`) would need its own version of
     /// `per_layer_mlp` here too, kept in sync with its actual weight
     /// shapes by hand the same way this one already has to be.
+    ///
+    /// Counts `unique_layers` sets of layer weights, not `num_layers`
+    /// depth positions — layer sharing (see `layer_group`) is exactly the
+    /// trade of storing fewer weight sets while still running every depth
+    /// position's own activations.
     pub fn param_count(&self) -> usize {
         let v = self.vocab_size();
         let h = self.hidden_dim;
@@ -269,7 +328,7 @@ impl ModelConfig {
         let per_layer = per_layer_ple + per_layer_attn + per_layer_mlp;
         let final_norm = h;
 
-        embedding + self.num_layers * per_layer + final_norm
+        embedding + self.unique_layers * per_layer + final_norm
     }
 
     /// Bytes of activation memory one training step holds live, f32
@@ -372,7 +431,8 @@ mod tests {
     fn a_shape_on_the_tile_grid_wastes_nothing_on_its_own_dimensions() {
         let c = ModelConfig {
             num_layers: 8, hidden_dim: 384, num_heads: 6, num_kv_heads: 2,
-            context_len: 256, local_window: 256, vocab_size: 8192, ..Default::default()
+            context_len: 256, local_window: 256, vocab_size: 8192, unique_layers: 8,
+            ..Default::default()
         };
         // 384, 256, 128 and 8192 are all multiples of 64; only the ffn
         // dimension (1024) has to be checked, and it is one too.
@@ -383,7 +443,8 @@ mod tests {
     fn being_off_the_grid_on_both_dimensions_multiplies() {
         let both = ModelConfig {
             num_layers: 12, hidden_dim: 516, num_heads: 6, num_kv_heads: 2,
-            context_len: 516, local_window: 256, vocab_size: 8192, ..Default::default()
+            context_len: 516, local_window: 256, vocab_size: 8192, unique_layers: 12,
+            ..Default::default()
         };
         let one = ModelConfig { context_len: 512, ..both };
         let neither = ModelConfig {
@@ -445,9 +506,30 @@ mod tests {
 
     #[test]
     fn param_count_grows_with_layers() {
-        let small = ModelConfig { num_layers: 2, ..Default::default() };
-        let big = ModelConfig { num_layers: 8, ..Default::default() };
+        let small = ModelConfig { num_layers: 2, unique_layers: 2, ..Default::default() };
+        let big = ModelConfig { num_layers: 8, unique_layers: 8, ..Default::default() };
         assert!(big.param_count() > small.param_count());
+    }
+
+    #[test]
+    fn sharing_layers_shrinks_the_parameter_count_without_changing_depth() {
+        let dense = ModelConfig { num_layers: 8, unique_layers: 8, ..Default::default() };
+        let shared = ModelConfig { unique_layers: 2, ..dense };
+        assert!(shared.param_count() < dense.param_count());
+        // Sharing trades parameters for repetition, not depth: both still
+        // run every one of the 8 depth positions' own activations.
+        assert_eq!(shared.num_layers, dense.num_layers);
+        assert_eq!(shared.group_size(), 4);
+        assert_eq!(shared.layer_group(0), 0);
+        assert_eq!(shared.layer_group(3), 0);
+        assert_eq!(shared.layer_group(4), 1);
+        assert_eq!(shared.layer_group(7), 1);
+    }
+
+    #[test]
+    fn rejects_unique_layers_that_does_not_divide_num_layers() {
+        let cfg = ModelConfig { num_layers: 8, unique_layers: 3, ..Default::default() };
+        assert!(matches!(cfg.validate(), Err(ConfigError::UniqueLayersMustDivideNumLayers { .. })));
     }
 
     #[test]
@@ -464,7 +546,7 @@ mod tests {
         // 1024 nodes, 16 heads, full 4096-token attention. Its activation
         // cache alone is ~20 GB, which used to be reported to the user as
         // "3.1 GB while training" and then simply killed the tab.
-        let cfg = ModelConfig { num_layers: 16, hidden_dim: 1024, num_heads: 16, num_kv_heads: 16, context_len: 4096, local_window: 4096, ..Default::default() };
+        let cfg = ModelConfig { num_layers: 16, unique_layers: 16, hidden_dim: 1024, num_heads: 16, num_kv_heads: 16, context_len: 4096, local_window: 4096, ..Default::default() };
         assert!(matches!(cfg.validate(), Err(ConfigError::TooLarge { .. })));
         assert!(ModelConfig::default().validate().is_ok());
     }

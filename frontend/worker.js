@@ -317,6 +317,7 @@ function describeModel() {
   const info = llm.info();
   return {
     layers: info.layers,
+    uniqueLayers: info.unique_layers,
     hidden: info.hidden,
     heads: info.heads,
     kvHeads: info.kv_heads,
@@ -1028,6 +1029,7 @@ async function benchmark({ ceilingMs = 1500, budgetMs = 60000, repeats = 3 } = {
     // measured against a different model says nothing about this one.
     shape: {
       layers: info.layers,
+      uniqueLayers: info.unique_layers,
       hidden: info.hidden,
       heads: info.heads,
       kvHeads: info.kv_heads,
@@ -1851,10 +1853,19 @@ const handlers = {
     return loadModelBytes(bytes);
   },
 
-  async 'create-model'({ layers, hidden, heads, kvHeads, contextLen, window: attentionWindow, seed }) {
+  async 'create-model'({ layers, uniqueLayers, hidden, heads, kvHeads, contextLen, window: attentionWindow, seed }) {
     await ensureWasm();
-    log('creating model', { layers, hidden, heads, kvHeads, contextLen, window: attentionWindow });
-    llm = new wasm.WasmLLM(layers, hidden, heads, kvHeads, contextLen, attentionWindow, seed);
+    log('creating model', { layers, uniqueLayers, hidden, heads, kvHeads, contextLen, window: attentionWindow });
+    llm = new wasm.WasmLLM(
+      layers,
+      uniqueLayers || layers,
+      hidden,
+      heads,
+      kvHeads,
+      contextLen,
+      attentionWindow,
+      seed,
+    );
     log('model created; asking for a GPU device');
     await initGpu();
     return describeModel();
@@ -1902,10 +1913,19 @@ const handlers = {
   /// What a shape would cost, before anything is built from it. Needs no
   /// model — that is the point, since this is what somebody is looking
   /// at while they choose the numbers.
-  async 'describe-shape'({ layers, hidden, heads, kvHeads, contextLen, window: win, corpusChars }) {
+  async 'describe-shape'({ layers, uniqueLayers, hidden, heads, kvHeads, contextLen, window: win, corpusChars }) {
     await ensureWasm();
     return JSON.parse(
-      wasm.describe_shape(layers, hidden, heads, kvHeads, contextLen, win, corpusChars || 0),
+      wasm.describe_shape(
+        layers,
+        uniqueLayers || layers,
+        hidden,
+        heads,
+        kvHeads,
+        contextLen,
+        win,
+        corpusChars || 0,
+      ),
     );
   },
 

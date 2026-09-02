@@ -12,8 +12,8 @@ GPU/browser, the page says so and does not train.
 - [Corpus](docs/corpus.md) — adding text, the tokenizer, the held-out
   split, corpus stats.
 - [Model](docs/model.md) — architecture (RoPE, GQA, SwiGLU, RMSNorm,
-  sliding-window attention), the Model Shape settings, the instruction
-  format.
+  sliding-window attention), the Model Shape settings, layer sharing, the
+  instruction format.
 - [Training](docs/training.md) — AdamW and gradient clipping, Training
   Mode, the machine benchmark, the Training Plan settings, Progress /
   Metrics / Samples, the remote training backend, console tools.

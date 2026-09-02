@@ -59,7 +59,7 @@ in) and are compiled and tested only in CI.
 - Custom binary format (no external serialization dependency): magic
   bytes, a version number, model shape, then weights — additive-only
   versioning, so an older checkpoint still loads with missing fields
-  defaulted rather than rejected. Current version: 4.
+  defaulted rather than rejected. Current version: 5.
 - The whole-project `.snp` format (see [project.md](project.md)) wraps
   a checkpoint and an optimizer-state blob alongside a JSON header for
   corpus/history/settings, using the same hand-rolled framing.

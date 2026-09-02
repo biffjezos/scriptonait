@@ -46,6 +46,16 @@ impl GpuTrainer {
 
         for l in (0..c.num_layers).rev() {
             let acts = &self.acts[l];
+            // `l` is a depth position; `g` is which of `unique_layers`
+            // weight sets answers for it (see `forward.rs`'s matching
+            // comment). Every backward dispatch below accumulates into
+            // its destination rather than overwriting (see
+            // `linear_bwd_dw.wgsl`'s and `rmsnorm_bwd_dgain.wgsl`'s own
+            // comments) — the same accumulation a batch's sequences
+            // already rely on — so multiple depths sharing group `g` add
+            // their gradients into the same `grads.layer(g, ..)` buffer
+            // correctly, in whatever order the depths are visited.
+            let g = c.layer_group(l);
 
             // --- MLP branch --- (mirrors
             // `llm_core::model::layer::LayerWeights::ffn_backward`; see
@@ -58,7 +68,7 @@ impl GpuTrainer {
                 ctx,
                 &s.d_hidden,
                 &s.act,
-                self.grads.layer(l, T_W_DOWN),
+                self.grads.layer(g, T_W_DOWN),
                 t,
                 ffn,
                 h,
@@ -67,7 +77,7 @@ impl GpuTrainer {
                 chunks,
                 ctx,
                 &s.d_hidden,
-                self.weights.layer(l, T_W_DOWN),
+                self.weights.layer(g, T_W_DOWN),
                 &s.d_act,
                 t,
                 ffn,
@@ -79,7 +89,7 @@ impl GpuTrainer {
                 ctx,
                 &s.d_gate,
                 &acts.normed2,
-                self.grads.layer(l, T_W_GATE),
+                self.grads.layer(g, T_W_GATE),
                 t,
                 h,
                 ffn,
@@ -89,7 +99,7 @@ impl GpuTrainer {
                 ctx,
                 &s.d_up,
                 &acts.normed2,
-                self.grads.layer(l, T_W_UP),
+                self.grads.layer(g, T_W_UP),
                 t,
                 h,
                 ffn,
@@ -98,7 +108,7 @@ impl GpuTrainer {
                 chunks,
                 ctx,
                 &s.d_gate,
-                self.weights.layer(l, T_W_GATE),
+                self.weights.layer(g, T_W_GATE),
                 &s.d_a,
                 t,
                 h,
@@ -108,7 +118,7 @@ impl GpuTrainer {
                 chunks,
                 ctx,
                 &s.d_up,
-                self.weights.layer(l, T_W_UP),
+                self.weights.layer(g, T_W_UP),
                 &s.d_b,
                 t,
                 h,
@@ -122,7 +132,7 @@ impl GpuTrainer {
                 &s.d_a,
                 &acts.h_after_attn,
                 &acts.inv_rms2,
-                self.grads.layer(l, T_MLP_GAIN),
+                self.grads.layer(g, T_MLP_GAIN),
                 h,
             );
             self.dispatch_rmsnorm_bwd_dx(
@@ -130,7 +140,7 @@ impl GpuTrainer {
                 ctx,
                 &s.d_a,
                 &acts.h_after_attn,
-                self.weights.layer(l, T_MLP_GAIN),
+                self.weights.layer(g, T_MLP_GAIN),
                 &acts.inv_rms2,
                 &s.d_c,
                 h,
@@ -145,7 +155,7 @@ impl GpuTrainer {
                 ctx,
                 &s.d_hidden,
                 &acts.concat,
-                self.grads.layer(l, T_WO),
+                self.grads.layer(g, T_WO),
                 t,
                 h,
                 h,
@@ -154,7 +164,7 @@ impl GpuTrainer {
                 chunks,
                 ctx,
                 &s.d_hidden,
-                self.weights.layer(l, T_WO),
+                self.weights.layer(g, T_WO),
                 &s.d_a,
                 t,
                 h,
@@ -164,12 +174,12 @@ impl GpuTrainer {
             self.dispatch_rope(chunks, ctx, &s.d_q, c.num_heads, true);
             self.dispatch_rope(chunks, ctx, &s.d_k, c.num_kv_heads, true);
 
-            self.dispatch_linear_bwd_dw(chunks, ctx, &s.d_q, &acts.normed1, self.grads.layer(l, T_WQ), t, h, h);
-            self.dispatch_linear_bwd_dw(chunks, ctx, &s.d_k, &acts.normed1, self.grads.layer(l, T_WK), t, h, kv);
-            self.dispatch_linear_bwd_dw(chunks, ctx, &s.d_v, &acts.normed1, self.grads.layer(l, T_WV), t, h, kv);
-            self.dispatch_linear_bwd_dx(chunks, ctx, &s.d_q, self.weights.layer(l, T_WQ), &s.d_a, t, h, h);
-            self.dispatch_linear_bwd_dx(chunks, ctx, &s.d_k, self.weights.layer(l, T_WK), &s.d_b, t, h, kv);
-            self.dispatch_linear_bwd_dx(chunks, ctx, &s.d_v, self.weights.layer(l, T_WV), &s.d_c, t, h, kv);
+            self.dispatch_linear_bwd_dw(chunks, ctx, &s.d_q, &acts.normed1, self.grads.layer(g, T_WQ), t, h, h);
+            self.dispatch_linear_bwd_dw(chunks, ctx, &s.d_k, &acts.normed1, self.grads.layer(g, T_WK), t, h, kv);
+            self.dispatch_linear_bwd_dw(chunks, ctx, &s.d_v, &acts.normed1, self.grads.layer(g, T_WV), t, h, kv);
+            self.dispatch_linear_bwd_dx(chunks, ctx, &s.d_q, self.weights.layer(g, T_WQ), &s.d_a, t, h, h);
+            self.dispatch_linear_bwd_dx(chunks, ctx, &s.d_k, self.weights.layer(g, T_WK), &s.d_b, t, h, kv);
+            self.dispatch_linear_bwd_dx(chunks, ctx, &s.d_v, self.weights.layer(g, T_WV), &s.d_c, t, h, kv);
             dispatch_add_inplace(chunks.enc(), ctx, &s.d_a, &s.d_b, t * h);
             dispatch_add_inplace(chunks.enc(), ctx, &s.d_a, &s.d_c, t * h);
 
@@ -179,7 +189,7 @@ impl GpuTrainer {
                 &s.d_a,
                 &acts.h_in,
                 &acts.inv_rms1,
-                self.grads.layer(l, T_ATTN_GAIN),
+                self.grads.layer(g, T_ATTN_GAIN),
                 h,
             );
             self.dispatch_rmsnorm_bwd_dx(
@@ -187,7 +197,7 @@ impl GpuTrainer {
                 ctx,
                 &s.d_a,
                 &acts.h_in,
-                self.weights.layer(l, T_ATTN_GAIN),
+                self.weights.layer(g, T_ATTN_GAIN),
                 &acts.inv_rms1,
                 &s.d_c,
                 h,

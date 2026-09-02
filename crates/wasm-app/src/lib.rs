@@ -207,6 +207,7 @@ impl WasmLLM {
 #[allow(clippy::too_many_arguments)]
 pub fn describe_shape(
     layers: u32,
+    unique_layers: u32,
     hidden: u32,
     heads: u32,
     kv_heads: u32,
@@ -227,6 +228,12 @@ pub fn describe_shape(
         context_len: context_len as usize,
         local_window: window as usize,
         vocab_size: vocab,
+        // Layer sharing (Settings' Model Shape panel): how many of
+        // `layers` depth positions are actually distinct weight sets.
+        // Clamped to at least 1 the same way heads are just above —
+        // `validate()` below is what turns "does not divide" into a
+        // message the estimate can show, not a panic while typing.
+        unique_layers: unique_layers.max(1) as usize,
         ..ModelConfig::default()
     };
     // Everything below has to survive an invalid shape: the fields are

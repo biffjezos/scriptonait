@@ -78,6 +78,7 @@ async fn create_session(State(state): State<AppState>, Json(req): Json<CreateSes
             context_len: cfg.context_len,
             local_window: cfg.local_window,
             vocab_size,
+            unique_layers: cfg.unique_layers.unwrap_or(cfg.num_layers),
             ..Default::default()
         };
         if let Err(err) = config.validate() {

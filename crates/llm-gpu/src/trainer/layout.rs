@@ -58,13 +58,15 @@ pub(super) struct ParamSet {
 }
 
 impl ParamSet {
-    /// The fixed order: embed, then each layer's nine tensors, then the
-    /// final norm gain. `ModelWeights::tensors()` uses the same order,
-    /// which is what makes a downloaded set restore field-for-field.
+    /// The fixed order: embed, then each *unique* layer's nine tensors
+    /// (`unique_layers` of them, not `num_layers` — see
+    /// `ModelConfig::layer_group`), then the final norm gain.
+    /// `ModelWeights::tensors()` uses the same order, which is what makes
+    /// a downloaded set restore field-for-field.
     pub(super) fn shapes(config: &ModelConfig) -> Vec<(&'static str, usize, bool)> {
         let (h, ffn, kv, vocab) = (config.hidden_dim, config.ffn_dim(), config.kv_dim(), config.vocab_size());
         let mut out = vec![("embed", vocab * h, true)];
-        for _ in 0..config.num_layers {
+        for _ in 0..config.unique_layers {
             out.extend_from_slice(&[
                 ("attn_norm_gain", h, false),
                 ("wq", h * h, true),
@@ -122,12 +124,16 @@ impl ParamSet {
         &self.slots[0].buffer
     }
 
-    pub(super) fn layer(&self, layer: usize, which: usize) -> &wgpu::Buffer {
-        &self.slots[1 + layer * TENSORS_PER_LAYER + which].buffer
+    /// `group` is a *weight-group* index (`0..unique_layers`), not a depth
+    /// position — callers walking depth positions (`0..num_layers`) must
+    /// resolve one to the other via `ModelConfig::layer_group` first, the
+    /// same way `ModelWeights.layers[group]` does on the CPU side.
+    pub(super) fn layer(&self, group: usize, which: usize) -> &wgpu::Buffer {
+        &self.slots[1 + group * TENSORS_PER_LAYER + which].buffer
     }
 
     pub(super) fn final_gain(&self, config: &ModelConfig) -> &wgpu::Buffer {
-        &self.slots[1 + config.num_layers * TENSORS_PER_LAYER].buffer
+        &self.slots[1 + config.unique_layers * TENSORS_PER_LAYER].buffer
     }
 }
 
