@@ -15,7 +15,7 @@ use base64::Engine;
 use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::StreamExt;
 
-use llm_core::config::ModelConfig;
+use llm_core::config::{LayerSharing, ModelConfig};
 use llm_core::tokenizer::Tokenizer;
 
 use crate::auth;
@@ -78,7 +78,15 @@ async fn create_session(State(state): State<AppState>, Json(req): Json<CreateSes
             context_len: cfg.context_len,
             local_window: cfg.local_window,
             vocab_size,
-            unique_layers: cfg.unique_layers.unwrap_or(cfg.num_layers),
+            // `RecurrentCore` has no wire field yet (see
+            // `ModelConfigUpload::unique_layers`) — a remote client can
+            // only ask for `Off` or `UniformGroups`.
+            layer_sharing: match cfg.unique_layers {
+                Some(unique_layers) if unique_layers != cfg.num_layers => {
+                    LayerSharing::UniformGroups { unique_layers }
+                }
+                _ => LayerSharing::Off,
+            },
             ..Default::default()
         };
         if let Err(err) = config.validate() {

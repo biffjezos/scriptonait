@@ -29,9 +29,12 @@ pub struct ModelConfigUpload {
     pub seed: u64,
     /// How many of `num_layers` depth positions are distinct weight sets
     /// (ALBERT-style static layer sharing — see
-    /// `llm_core::config::ModelConfig::layer_group`). Absent from a client
-    /// that predates sharing, or a client that just isn't using it —
-    /// defaults to `num_layers`, today's behavior.
+    /// `llm_core::config::LayerSharing::UniformGroups`). Absent from a
+    /// client that predates sharing, or a client that just isn't using
+    /// it — defaults to `num_layers`, today's behavior. Remote training
+    /// doesn't yet have a wire field for `LayerSharing::RecurrentCore`
+    /// (Geiping et al. 2025's variable loop count) — only local training
+    /// supports that mode today.
     pub unique_layers: Option<usize>,
 }
 
