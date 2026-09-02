@@ -436,6 +436,10 @@ fn run_training(
         };
         let lr = train.lr_at(session.step);
         let trainer = session.trainer.as_mut().expect("built above");
+        // `None`: remote training has no wire field yet for a
+        // `RecurrentCore` model's sampled loop count (see
+        // `ModelConfigUpload::unique_layers`'s own doc comment) — every
+        // depth position runs, as it did before that mode existed.
         let result = pollster::block_on(trainer.train_step(
             ctx,
             &batch.inputs,
@@ -443,6 +447,7 @@ fn run_training(
             lr,
             train.weight_decay,
             train.grad_clip,
+            None,
         ));
         let report = match result {
             Ok(report) => report,
