@@ -70,6 +70,23 @@ textarea {
   margin: 0.4rem 0;
 }
 
+/* The [?] next to a Settings field's label: hover for a one-line
+   rationale (the link's title attribute), click through to the docs
+   section — and, where one exists, the paper — that explains it in
+   full. */
+.setting-help {
+  margin-left: 0.3rem;
+}
+
+.setting-help a {
+  color: var(--text-dim);
+  text-decoration: none;
+}
+
+.setting-help a:hover {
+  color: var(--accent);
+}
+
 /* The filter box grows to fill the row; the buttons beside it (their own
    Bootstrap `col-auto`) stay their natural width. */
 .sources-toolbar input {

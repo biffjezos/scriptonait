@@ -150,6 +150,114 @@ window.addEventListener('unhandledrejection', (event) => {
 
 const $ = (id) => document.getElementById(id);
 
+// --- Setting help tooltips ------------------------------------------------
+//
+// Every value field in Settings gets a small [?] next to its label: hover
+// for a one-line rationale, click through to the docs section that
+// explains it in full — and, for anything that came from a specific
+// paper, the paper itself. The rationale lives here, once per field, so
+// the docs prose and this tooltip can't drift into contradicting each
+// other by drifting independently.
+const DOCS = 'https://github.com/biffjezos/scriptonait/blob/dev/docs';
+const HELP_MODEL_ARCH = `${DOCS}/model.md#architecture`;
+const HELP_MODEL_SHARING = `${DOCS}/model.md#layer-sharing`;
+const HELP_GEN_SAMPLING = `${DOCS}/generation.md#sampling-settings-settings-tab-inference`;
+const HELP_GEN_LENGTH = `${DOCS}/generation.md#length-control`;
+const HELP_TRAIN_OPTIMIZER = `${DOCS}/training.md#optimizer`;
+const HELP_TRAIN_MODE = `${DOCS}/training.md#training-mode-settings-tab`;
+const HELP_TRAIN_BENCH = `${DOCS}/training.md#machine-benchmark-settings-tab`;
+const HELP_TRAIN_PLAN = `${DOCS}/training.md#training-plan-settings-tab-live-during-a-run`;
+const HELP_TRAIN_REMOTE = `${DOCS}/training.md#remote-training-settings-tab-training-location`;
+const HELP_SCHEDULER = `${DOCS}/scheduler.md`;
+const HELP_PROJECT_AUTOSAVE = `${DOCS}/project.md#auto-save-settings-tab`;
+
+const SETTING_HELP = {
+  // Model Shape (Settings tab → Model Shape) — docs/model.md
+  'cfg-layers': { url: HELP_MODEL_ARCH, text: 'Transformer depth. Vaswani et al., Attention Is All You Need, 2017 (arXiv:1706.03762).' },
+  'cfg-layer-sharing': { url: HELP_MODEL_SHARING, text: 'Off, Uniform groups (ALBERT-style), or Recurrent core (variable loop count) — trading parameters for repetition.' },
+  'cfg-unique-layers': { url: HELP_MODEL_SHARING, text: 'Distinct weight sets when sharing is Uniform groups. Lan et al., ALBERT, 2019 (arXiv:1909.11942).' },
+  'cfg-prelude-layers': { url: HELP_MODEL_SHARING, text: 'Non-shared layers before the recurrent core. Geiping et al., 2025 (arXiv:2502.05171).' },
+  'cfg-coda-layers': { url: HELP_MODEL_SHARING, text: 'Non-shared layers after the recurrent core. Geiping et al., 2025 (arXiv:2502.05171).' },
+  'cfg-core-loop-min': { url: HELP_MODEL_SHARING, text: 'Fewest times the shared core repeats in training. Geiping et al., 2025 (arXiv:2502.05171).' },
+  'cfg-core-loop-max': { url: HELP_MODEL_SHARING, text: "Most times the shared core repeats; also this model's depth. Geiping et al., 2025 (arXiv:2502.05171)." },
+  'cfg-hidden': { url: HELP_MODEL_ARCH, text: 'Residual stream width. Vaswani et al., Attention Is All You Need, 2017 (arXiv:1706.03762).' },
+  'cfg-heads': { url: HELP_MODEL_ARCH, text: 'Attention heads. Vaswani et al., Attention Is All You Need, 2017 (arXiv:1706.03762).' },
+  'cfg-kv-heads': { url: HELP_MODEL_ARCH, text: 'Key/value heads (GQA); must divide Heads. Ainslie et al., GQA, 2023 (arXiv:2305.13245).' },
+  'cfg-context': { url: HELP_MODEL_ARCH, text: "Max sequence length — also RoPE's trained position range. Su et al., RoFormer, 2021 (arXiv:2104.09864)." },
+  'cfg-window': { url: HELP_MODEL_ARCH, text: 'Sliding-window attention size, ≤ Context. Jiang et al., Mistral 7B, 2023 (arXiv:2310.06825).' },
+
+  // Manual Settings (Training) — docs/training.md
+  'train-effort': { url: HELP_TRAIN_MODE, text: 'Fraction of wall-clock time a step may occupy the GPU before yielding it back.' },
+  'train-batch': { url: HELP_TRAIN_MODE, text: 'Sequences per training step; 0 defers to the machine benchmark.' },
+  'train-lr': { url: HELP_TRAIN_OPTIMIZER, text: "Overrides the scheduler's peak rate entirely. AdamW: Loshchilov & Hutter, 2019 (arXiv:1711.05101)." },
+
+  // Scheduler — docs/scheduler.md
+  'warmup-strategy': { url: HELP_SCHEDULER, text: "How many steps ramp from 0 to peak rate; Fixed-length is sized from AdamW's own β₂ time constant." },
+  'stable-phase': { url: HELP_SCHEDULER, text: 'Whether the rate can be cut mid-run on a detected plateau.' },
+  'cooldown-shape': { url: HELP_SCHEDULER, text: 'Deferred = WSD (Hu et al., MiniCPM, 2024, arXiv:2404.06395); Immediate = Cosine (Loshchilov & Hutter, SGDR, 2017, arXiv:1608.03983).' },
+  'decay-start': { url: HELP_SCHEDULER, text: 'When a Deferred cool-down starts decaying; Adaptive pins it to a detected plateau instead of a fixed fraction.' },
+  'plan-length': { url: HELP_SCHEDULER, text: 'Adaptive stretches the plan while the run is still genuinely improving.' },
+
+  // Training Plan — docs/training.md
+  'train-steps': { url: HELP_TRAIN_PLAN, text: "Total steps this run's schedule is shaped against." },
+  'metrics-every': { url: HELP_TRAIN_PLAN, text: 'Steps between held-out loss measurements.' },
+  'opening-rate': { url: HELP_TRAIN_PLAN, text: "% of training windows drawn from a source's opening rather than a random offset." },
+  'show-training-window': { url: HELP_TRAIN_PLAN, text: "Whether the current training batch's text is displayed live." },
+  'training-window-chars': { url: HELP_TRAIN_PLAN, text: 'Truncation length for the displayed training window.' },
+  'sample-every': { url: HELP_TRAIN_PLAN, text: 'Steps between generating a training sample.' },
+
+  // Auto-save — docs/project.md
+  'autosave-enabled': { url: HELP_PROJECT_AUTOSAVE, text: 'Periodically writes the whole project — checkpoint, corpus, history, and settings.' },
+  'autosave-frequency': { url: HELP_PROJECT_AUTOSAVE, text: 'Steps between auto-saves.' },
+  'autosave-mode': { url: HELP_PROJECT_AUTOSAVE, text: 'Overwrite keeps one copy; Add writes a new file per save.' },
+  'autosave-filename': { url: HELP_PROJECT_AUTOSAVE, text: 'Connects a real file (or, in Add mode, a folder) auto-save writes into.' },
+
+  // Training backend — docs/training.md
+  'training-device': { url: HELP_TRAIN_REMOTE, text: 'Local trains in this browser tab; Remote sends the job to llm-server on another GPU machine.' },
+  'remote-server-url': { url: HELP_TRAIN_REMOTE, text: 'Address of the llm-server instance to train on.' },
+  'remote-server-token': { url: HELP_TRAIN_REMOTE, text: 'Bearer token llm-server was started with.' },
+
+  // Inference — docs/generation.md
+  'inference-device': { url: HELP_GEN_SAMPLING, text: 'GPU (default) or CPU for this generation.' },
+  'opt-temperature': { url: HELP_GEN_SAMPLING, text: 'Logit scaling before sampling; 0 forces greedy decoding (always the top token).' },
+  'opt-top-k': { url: HELP_GEN_SAMPLING, text: 'Keep only the k most likely tokens. Fan et al., Hierarchical Neural Story Generation, 2018 (arXiv:1805.04833).' },
+  'opt-top-p': { url: HELP_GEN_SAMPLING, text: 'Nucleus sampling — smallest token set whose probability reaches p. Holtzman et al., 2020 (arXiv:1904.09751).' },
+  'opt-min-p': { url: HELP_GEN_SAMPLING, text: "Keeps tokens scaled to the leading token's own probability. Nguyen et al., 2024 (arXiv:2407.01082)." },
+  'opt-repetition': { url: HELP_GEN_SAMPLING, text: 'Pushes down the logits of recently-seen tokens. Keskar et al., CTRL, 2019 (arXiv:1909.05858).' },
+  'opt-seed': { url: HELP_GEN_SAMPLING, text: 'RNG seed for sampling.' },
+  'opt-core-loops': { url: HELP_MODEL_SHARING, text: 'Decoding depth when Layer sharing is Recurrent core — no retraining needed. Geiping et al., 2025 (arXiv:2502.05171).' },
+  'opt-length-mode': { url: HELP_GEN_LENGTH, text: 'Continuous runs to the parsed/estimated target; Limit sets a hard token ceiling.' },
+  'opt-max-tokens': { url: HELP_GEN_LENGTH, text: 'Hard token ceiling used when Length is set to Limit to.' },
+
+  // Machine Benchmark — docs/training.md
+  'benchmark-enabled': { url: HELP_TRAIN_BENCH, text: "Re-measures this machine's GPU throughput automatically before training." },
+
+  // Mode toggles
+  'train-mode': { url: HELP_TRAIN_MODE, text: "Auto reads batch size and effort from this machine's own benchmark; Manual exposes them directly." },
+  'scheduler-mode': { url: HELP_SCHEDULER, text: "Auto uses this app's chosen defaults for all five schedule axes; Manual exposes them." },
+};
+
+/// Insert one `[?]` after each mapped field's label text — before any
+/// element nested inside the label (some labels wrap their own input),
+/// after any of the label's own leading text otherwise.
+function attachSettingHelp() {
+  for (const [id, help] of Object.entries(SETTING_HELP)) {
+    const label = document.querySelector(`label[for="${id}"]`);
+    if (!label) continue;
+    const sup = document.createElement('sup');
+    sup.className = 'setting-help';
+    const link = document.createElement('a');
+    link.href = help.url;
+    link.target = '_blank';
+    link.rel = 'noopener';
+    link.title = help.text;
+    link.textContent = '[?]';
+    sup.appendChild(link);
+    label.insertBefore(sup, label.firstElementChild);
+  }
+}
+attachSettingHelp();
+
 // --- Notifications -------------------------------------------------------
 //
 // One bar, at the top of the page, for every transient notice: errors,
