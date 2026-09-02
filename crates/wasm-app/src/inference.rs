@@ -104,6 +104,12 @@ impl WasmLLM {
         // default budget, if it implies nothing), exactly as before this
         // parameter existed.
         max_tokens: u32,
+        // How many times to loop the shared core when the loaded model's
+        // Layer sharing is Recurrent core (Geiping et al. 2025's
+        // test-time compute scaling — the same checkpoint answering at a
+        // different depth with no retraining); 0 means "the model's own
+        // maximum" and is ignored entirely for every other model.
+        core_loops: u32,
         on_token: &js_sys::Function,
     ) -> GenerationResult {
         // Same signal train_step already gives worker.js when there's no
@@ -121,11 +127,14 @@ impl WasmLLM {
             };
         }
         let max_tokens_override = (max_tokens > 0).then_some(max_tokens as usize);
+        let core_loops = (core_loops > 0).then_some(core_loops as usize);
         if !prefer_gpu {
             let request = self.build_request(&prompt, &extra_context);
             let sampling =
                 self.sampling_config(temperature, top_k, top_p, min_p, repetition_penalty, seed);
-            return self.generate_on_cpu(&request, &sampling, max_tokens_override, on_token).await;
+            return self
+                .generate_on_cpu(&request, &sampling, max_tokens_override, core_loops, on_token)
+                .await;
         }
 
         // Generation owns the GPU for as long as it runs, and it pulls
@@ -147,7 +156,7 @@ impl WasmLLM {
             };
         }
         let result = self.generate_inner(prompt, extra_context, temperature, top_k, top_p, min_p,
-            repetition_penalty, seed, max_tokens_override, on_token).await;
+            repetition_penalty, seed, max_tokens_override, core_loops, on_token).await;
         self.release();
         result
     }
@@ -198,6 +207,7 @@ impl WasmLLM {
         repetition_penalty: f32,
         seed: f64,
         max_tokens_override: Option<usize>,
+        core_loops: Option<usize>,
         on_token: &js_sys::Function,
     ) -> GenerationResult {
         let request = self.build_request(&prompt, &extra_context);
@@ -215,7 +225,7 @@ impl WasmLLM {
             inner.gpu.as_ref().is_some_and(|g| g.uploaded_at_step == inner.step)
         };
         if gpu_is_current {
-            match self.generate_on_gpu(&request, &sampling, max_tokens_override, on_token).await {
+            match self.generate_on_gpu(&request, &sampling, max_tokens_override, core_loops, on_token).await {
                 Ok(result) => return result,
                 Err(_) => {
                     // A device that was lost or a kernel that failed:
@@ -225,7 +235,7 @@ impl WasmLLM {
                 }
             }
         }
-        self.generate_on_cpu(&request, &sampling, max_tokens_override, on_token).await
+        self.generate_on_cpu(&request, &sampling, max_tokens_override, core_loops, on_token).await
     }
 
     fn build_request(&self, prompt: &str, extra_context: &str) -> instruct::Request {
@@ -261,6 +271,7 @@ impl WasmLLM {
         request: &instruct::Request,
         sampling: &SamplingConfig,
         max_tokens_override: Option<usize>,
+        core_loops: Option<usize>,
         on_token: &js_sys::Function,
     ) -> GenerationResult {
         let (weights, config, tokenizer) = {
@@ -274,6 +285,7 @@ impl WasmLLM {
             request,
             sampling.clone(),
             max_tokens_override,
+            core_loops,
         );
         loop {
             let (piece, reason) = session.step();
@@ -301,6 +313,7 @@ impl WasmLLM {
         request: &instruct::Request,
         sampling: &SamplingConfig,
         max_tokens_override: Option<usize>,
+        core_loops: Option<usize>,
         on_token: &js_sys::Function,
     ) -> Result<GenerationResult, String> {
         let (weights, config, tokenizer, prompt_tokens) = {
@@ -322,7 +335,8 @@ impl WasmLLM {
             (inner.weights.clone(), inner.config, tokenizer, prompt_tokens)
         };
 
-        let (mut logits, cache) = llm_core::model::prefill(&weights, &config, &prompt_tokens);
+        let layout = config.layer_layout(core_loops);
+        let (mut logits, cache) = llm_core::model::prefill(&weights, &config, &prompt_tokens, &layout);
         // The model comes out of `Inner` for the rest of this call, the
         // same pattern `train_step_inner` uses for the trainer: holding a
         // `RefCell` borrow across `decode_step`'s `.await` below would
@@ -374,7 +388,7 @@ impl WasmLLM {
                 let keep = (config.context_len / 2).max(1);
                 let tail_start = recent.len().saturating_sub(keep);
                 let tail = recent[tail_start..].to_vec();
-                let (_, rebuilt_cache) = llm_core::model::prefill(&weights, &config, &tail);
+                let (_, rebuilt_cache) = llm_core::model::prefill(&weights, &config, &tail, &layout);
                 model.seed_from_cpu_cache(&ctx, &rebuilt_cache);
             }
 

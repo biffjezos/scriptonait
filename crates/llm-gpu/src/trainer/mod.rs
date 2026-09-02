@@ -33,7 +33,7 @@ mod io;
 mod layout;
 mod profile;
 
-use llm_core::config::ModelConfig;
+use llm_core::config::{LayerLayout, ModelConfig};
 use llm_core::model::ModelWeights;
 use llm_core::ops;
 
@@ -252,6 +252,11 @@ impl GpuTrainer {
     /// the same gradient buffer — zeroed once here, at the top of the
     /// step — so the batch costs no extra memory and no separate
     /// summing pass, exactly as `model::backward_into` does on the CPU.
+    /// `core_loops`: which of `unique_layer_count()`'s shared core
+    /// applies this step (see `ModelConfig::layer_layout`) — sampled by
+    /// the caller once per step, the same depth for every sequence in
+    /// this batch, and ignored unless `layer_sharing` is `RecurrentCore`.
+    #[allow(clippy::too_many_arguments)]
     pub async fn train_step(
         &mut self,
         ctx: &GpuContext,
@@ -260,6 +265,7 @@ impl GpuTrainer {
         lr: f32,
         weight_decay: f32,
         grad_clip: f32,
+        core_loops: Option<usize>,
     ) -> Result<GpuStepReport, String> {
         let t = self.t_len;
         if inputs.len() != targets.len() || inputs.is_empty() || inputs.len() % t != 0 {
@@ -273,6 +279,7 @@ impl GpuTrainer {
         ctx.params.reset();
         ctx.dispatch_count.set(0);
         let mut chunks = Chunks::new(ctx, self.dispatches_per_submit);
+        let layout = self.config.layer_layout(core_loops);
 
         // Zero the gradient accumulator and the stats slots once per
         // step; every backward kernel that writes a gradient accumulates.
@@ -290,9 +297,9 @@ impl GpuTrainer {
             buffers::write_u32(&ctx.queue, &self.scratch.targets, tgt);
             let groups = self.upload_scatter_index(ctx, seq);
 
-            self.encode_forward(&mut chunks, ctx);
+            self.encode_forward(&mut chunks, ctx, &layout);
             self.encode_loss(&mut chunks, ctx);
-            self.encode_backward(&mut chunks, ctx, groups);
+            self.encode_backward(&mut chunks, ctx, groups, &layout);
             // A sequence's work must be complete before the next one
             // overwrites the shared token buffer and activation cache.
             chunks.flush();
@@ -364,7 +371,10 @@ impl GpuTrainer {
         let start = web_time::Instant::now();
         // grad_clip infinite: the clip factor stays 1.0, so the bench
         // runs the same arithmetic whatever the gradients happen to be.
-        self.train_step(ctx, inputs, targets, 0.0, 0.0, f32::INFINITY).await?;
+        // core_loops: None, i.e. this model's maximum depth — the
+        // worst-case, deterministic cost a machine profile should be
+        // sized against, not a random sample.
+        self.train_step(ctx, inputs, targets, 0.0, 0.0, f32::INFINITY, None).await?;
         // The AdamW pass is submitted but not waited for by `train_step`;
         // a measurement has to include it.
         self.sync(ctx).await?;

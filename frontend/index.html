@@ -414,11 +414,28 @@
                 <select id="cfg-layer-sharing" class="form-select">
                   <option value="off" selected>Off</option>
                   <option value="grouped">Uniform groups</option>
+                  <option value="recurrent">Recurrent core</option>
                 </select>
               </div>
               <div class="col-sm-6 col-md-4" id="cfg-unique-layers-field" hidden>
                 <label class="form-label" for="cfg-unique-layers">Unique layers</label>
                 <input type="number" id="cfg-unique-layers" class="form-control" value="4" min="1" max="12" />
+              </div>
+              <div class="col-sm-6 col-md-3" id="cfg-prelude-layers-field" hidden>
+                <label class="form-label" for="cfg-prelude-layers">Prelude layers</label>
+                <input type="number" id="cfg-prelude-layers" class="form-control" value="1" min="0" max="12" />
+              </div>
+              <div class="col-sm-6 col-md-3" id="cfg-coda-layers-field" hidden>
+                <label class="form-label" for="cfg-coda-layers">Coda layers</label>
+                <input type="number" id="cfg-coda-layers" class="form-control" value="1" min="0" max="12" />
+              </div>
+              <div class="col-sm-6 col-md-3" id="cfg-core-loop-min-field" hidden>
+                <label class="form-label" for="cfg-core-loop-min">Core loop min</label>
+                <input type="number" id="cfg-core-loop-min" class="form-control" value="1" min="1" max="12" />
+              </div>
+              <div class="col-sm-6 col-md-3" id="cfg-core-loop-max-field" hidden>
+                <label class="form-label" for="cfg-core-loop-max">Core loop max</label>
+                <input type="number" id="cfg-core-loop-max" class="form-control" value="2" min="1" max="12" />
               </div>
               <div class="col-sm-6 col-md-4">
                 <label class="form-label" for="cfg-hidden">Hidden size</label>
@@ -546,6 +563,10 @@
               <div class="col-sm-6 col-md-4">
                 <label class="form-label" for="opt-seed">Seed</label>
                 <input type="number" id="opt-seed" class="form-control" value="0" min="0" />
+              </div>
+              <div class="col-sm-6 col-md-4" id="opt-core-loops-field" hidden>
+                <label class="form-label" for="opt-core-loops">Core loops</label>
+                <input type="number" id="opt-core-loops" class="form-control" min="1" />
               </div>
               <div class="col-sm-6 col-md-4">
                 <label class="form-label" for="opt-length-mode">Length</label>

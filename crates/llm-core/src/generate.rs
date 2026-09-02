@@ -121,11 +121,19 @@ pub struct Generator<'a> {
 impl<'a> Generator<'a> {
     /// Start a generation from `prompt_tokens`, which are truncated to
     /// the last `context_len` if longer.
+    /// `core_loops` only matters when `config.layer_sharing` is
+    /// `RecurrentCore` — it picks how many times the shared core runs for
+    /// this whole generation (Geiping et al. 2025's test-time compute
+    /// scaling: the same checkpoint answers at any depth in
+    /// `core_loop_min..=core_loop_max` with no retraining). `None` means
+    /// the model's own maximum. Fixed for the generation's lifetime,
+    /// including across a cache rebuild — see `maybe_reset_cache`.
     pub fn new(
         weights: &'a ModelWeights,
         config: &'a ModelConfig,
         prompt_tokens: &[u32],
         seed: u64,
+        core_loops: Option<usize>,
     ) -> Self {
         let mut tokens: Vec<u32> = prompt_tokens.to_vec();
         // An empty prompt would leave nothing to condition on. BOS is
@@ -138,7 +146,8 @@ impl<'a> Generator<'a> {
         if tokens.len() > config.context_len {
             tokens = tokens[tokens.len() - config.context_len..].to_vec();
         }
-        let (next_logits, cache) = model::prefill(weights, config, &tokens);
+        let layout = config.layer_layout(core_loops);
+        let (next_logits, cache) = model::prefill(weights, config, &tokens, &layout);
         Self { weights, config, cache, next_logits, rng: Rng::seed_from_u64(seed), generated: Vec::new() }
     }
 
@@ -191,7 +200,11 @@ impl<'a> Generator<'a> {
         let keep = (self.config.context_len / 2).max(1);
         let all = self.cache.tokens();
         let tail: Vec<u32> = all[all.len() - keep..].to_vec();
-        let (logits, cache) = model::prefill(self.weights, self.config, &tail);
+        // Same layout the generation started with — not a fresh choice —
+        // so a rebuild mid-generation doesn't change how deep the model
+        // is thinking partway through.
+        let layout = self.cache.layout().clone();
+        let (logits, cache) = model::prefill(self.weights, self.config, &tail, &layout);
         self.next_logits = logits;
         self.cache = cache;
     }
@@ -204,6 +217,9 @@ impl<'a> Generator<'a> {
 ///
 /// Returns the generated continuation (not including the prompt) and why
 /// it stopped.
+///
+/// `core_loops`: see `Generator::new`.
+#[allow(clippy::too_many_arguments)]
 pub fn generate_stream(
     weights: &ModelWeights,
     config: &ModelConfig,
@@ -211,9 +227,10 @@ pub fn generate_stream(
     prompt_tokens: &[u32],
     max_new_tokens: usize,
     sampling: &SamplingConfig,
+    core_loops: Option<usize>,
     on_token: &mut dyn FnMut(&str, usize) -> bool,
 ) -> (String, StopReason) {
-    let mut generator = Generator::new(weights, config, prompt_tokens, sampling.seed);
+    let mut generator = Generator::new(weights, config, prompt_tokens, sampling.seed, core_loops);
     let mut out = Vec::with_capacity(max_new_tokens);
     // A BPE token is a byte string, and a character can span several of
     // them, so tokens are decoded through a byte buffer that only
@@ -314,6 +331,7 @@ pub fn generate(
         &prompt_tokens,
         max_new_tokens,
         &sampling,
+        None,
         &mut |_, _| true,
     );
     format!("{prompt}{continuation}")
@@ -437,7 +455,7 @@ mod tests {
     use super::*;
 
     fn tiny_config() -> ModelConfig {
-        ModelConfig { num_layers: 1, unique_layers: 1, hidden_dim: 8, num_heads: 2, num_kv_heads: 2, context_len: 16, local_window: 16, ..Default::default() }
+        ModelConfig { num_layers: 1, hidden_dim: 8, num_heads: 2, num_kv_heads: 2, context_len: 16, local_window: 16, ..Default::default() }
     }
 
     #[test]
@@ -495,7 +513,6 @@ mod tests {
     fn kv_cached_logits_match_a_full_forward_pass() {
         let config = ModelConfig {
             num_layers: 2,
-            unique_layers: 2,
             hidden_dim: 16,
             num_heads: 4,
             num_kv_heads: 2,
@@ -511,13 +528,14 @@ mod tests {
         let prompt: Vec<u32> = "the shadows on the wall".bytes().map(u32::from).collect();
         let continuation: Vec<u32> = " are all they know".bytes().map(u32::from).collect();
 
-        let mut generator = Generator::new(&weights, &config, &prompt, 0);
+        let mut generator = Generator::new(&weights, &config, &prompt, 0, None);
         let vocab = config.vocab_size();
+        let layout = config.layer_layout(None);
         let mut all = prompt.clone();
         for &token in &continuation {
             // What the cache says the logits are after `all`...
             let cached = generator.next_logits().to_vec();
-            let (full, _) = model::forward(&weights, &config, &all);
+            let (full, _) = model::forward(&weights, &config, &all, &layout);
             let expected = &full[(all.len() - 1) * vocab..all.len() * vocab];
             let worst =
                 cached.iter().zip(expected).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
@@ -532,7 +550,6 @@ mod tests {
     fn generation_survives_running_past_the_context_length() {
         let config = ModelConfig {
             num_layers: 1,
-            unique_layers: 1,
             hidden_dim: 8,
             num_heads: 2,
             num_kv_heads: 1,
@@ -597,6 +614,7 @@ mod tests {
             &t.encode("INT. "),
             24,
             &SamplingConfig { seed: 3, ..Default::default() },
+            None,
             &mut |piece, _| {
                 streamed.push_str(piece);
                 true
@@ -619,6 +637,7 @@ mod tests {
             &t.encode("x"),
             100,
             &SamplingConfig::default(),
+            None,
             &mut |_, n| {
                 count = n;
                 n < 5

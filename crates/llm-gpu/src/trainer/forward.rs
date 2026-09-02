@@ -9,10 +9,16 @@ use super::dispatch::Chunks;
 use super::layout::{T_ATTN_GAIN, T_MLP_GAIN, T_WK, T_WO, T_WQ, T_WV, T_W_DOWN, T_W_GATE, T_W_UP};
 use super::GpuTrainer;
 
+use llm_core::config::LayerLayout;
 use llm_core::ops;
 
 impl GpuTrainer {
-    pub(super) fn encode_forward(&self, chunks: &mut Chunks, ctx: &GpuContext) {
+    /// `layout` is this step's depth (see `ModelConfig::layer_layout`) —
+    /// `self.acts` is allocated for the model's maximum depth
+    /// (`config.num_layers`), and a shorter step (a `RecurrentCore` with
+    /// fewer than `core_loop_max` loops this time) just leaves the tail
+    /// of it untouched, rather than needing its own smaller allocation.
+    pub(super) fn encode_forward(&self, chunks: &mut Chunks, ctx: &GpuContext, layout: &LayerLayout) {
         let t = self.t_len;
         let c = &self.config;
         let (h, kv, ffn) = (c.hidden_dim, c.kv_dim(), c.ffn_dim());
@@ -20,12 +26,13 @@ impl GpuTrainer {
 
         self.dispatch_gather(chunks, ctx, self.weights.embed(), &self.scratch.tokens, &self.scratch.hidden);
 
-        for (l, acts) in self.acts.iter().enumerate() {
-            // `l` is a depth position (0..num_layers); resolve it to which
-            // of `unique_layers` weight sets actually answers for it. When
-            // sharing is off (unique_layers == num_layers, today's default)
-            // this is the identity, group == l.
-            let g = c.layer_group(l);
+        for l in 0..layout.depth() {
+            let acts = &self.acts[l];
+            // Resolve this depth position to which of
+            // `unique_layer_count()` weight sets actually answers for it.
+            // When sharing is off (today's default) this is the
+            // identity, group == l.
+            let g = layout.group(l);
             chunks.copy(&self.scratch.hidden, &acts.h_in, t * h);
             self.dispatch_rmsnorm(
                 chunks,

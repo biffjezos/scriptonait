@@ -83,18 +83,49 @@ pub struct ModelConfig {
     /// pushed up for book/script-length material. Set equal to (or above)
     /// `context_len` to disable and use plain full causal attention.
     pub local_window: usize,
-    /// How many *distinct* sets of layer weights actually exist, out of
-    /// `num_layers` depth positions (ALBERT-style static grouping — Lan,
-    /// Chen, Goodman, Gimpel, Sharma & Soricut, *ALBERT: A Lite BERT for
-    /// Self-Supervised Learning of Language Representations*, 2019,
-    /// arXiv:1909.11942; the general "recurrent depth" family traces to
-    /// Dehghani, Gouws, Vinyals, Uszkoreit & Kaiser, *Universal
-    /// Transformers*, 2018, arXiv:1807.03819). Must evenly divide
-    /// `num_layers`. Equal to `num_layers` (the default) means no sharing
-    /// at all — every depth position has its own weights, today's
-    /// behavior exactly. `ModelWeights.layers` holds this many entries,
-    /// not `num_layers`; see `layer_group`.
-    pub unique_layers: usize,
+    /// Whether — and how — depth positions share weights instead of each
+    /// having their own. See `LayerSharing` and `layer_layout`.
+    pub layer_sharing: LayerSharing,
+}
+
+/// How `num_layers` depth positions map to weight sets. Two independent
+/// techniques in the same family, not variants of one setting a user
+/// picks a number for:
+///
+/// - `UniformGroups` (ALBERT-style static grouping — Lan, Chen, Goodman,
+///   Gimpel, Sharma & Soricut, *ALBERT: A Lite BERT for Self-Supervised
+///   Learning of Language Representations*, 2019, arXiv:1909.11942; the
+///   general "recurrent depth" family traces to Dehghani, Gouws, Vinyals,
+///   Uszkoreit & Kaiser, *Universal Transformers*, 2018,
+///   arXiv:1807.03819) fixes the grouping at model-creation time — a pure
+///   function of `ModelConfig` alone.
+/// - `RecurrentCore` (Geiping, McLeish, Jain, Kirchenbauer, Singh,
+///   Bartoldson, Kailkhura, Bhatele & Goldstein, *Scaling up Test-Time
+///   Compute with Latent Reasoning: A Recurrent Depth Approach*, 2025,
+///   arXiv:2502.05171) does not: how many times the core loops is a
+///   per-call choice — sampled per training step, chosen freely at
+///   inference — so it needs `layer_layout`'s `core_loops` argument,
+///   which `UniformGroups`/`Off` simply ignore.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum LayerSharing {
+    /// Every depth position has its own weights — today's default.
+    Off,
+    /// `num_layers` divided into `unique_layers` equal-length contiguous
+    /// spans; must evenly divide `num_layers`.
+    UniformGroups { unique_layers: usize },
+    /// `prelude_layers` non-shared layers, then one shared "core" weight
+    /// set looped some number of times in `core_loop_min..=core_loop_max`,
+    /// then `coda_layers` non-shared layers. `num_layers` must equal
+    /// `prelude_layers + core_loop_max + coda_layers` — the *maximum*
+    /// total depth, which is what every buffer in this app is sized to;
+    /// a call that loops fewer than `core_loop_max` times just leaves the
+    /// tail of that buffer unused.
+    RecurrentCore {
+        prelude_layers: usize,
+        coda_layers: usize,
+        core_loop_min: usize,
+        core_loop_max: usize,
+    },
 }
 
 impl Default for ModelConfig {
@@ -109,7 +140,7 @@ impl Default for ModelConfig {
             vocab_size: BASE_VOCAB_SIZE,
             rope_theta: DEFAULT_ROPE_THETA,
             use_ple: false,
-            unique_layers: 4,
+            layer_sharing: LayerSharing::Off,
         }
     }
 }
@@ -126,6 +157,13 @@ pub enum ConfigError {
     /// `unique_layers` doesn't evenly divide `num_layers` — some depth
     /// positions would have no well-defined group to share weights with.
     UniqueLayersMustDivideNumLayers { num_layers: usize, unique_layers: usize },
+    /// `RecurrentCore`'s `core_loop_min` is greater than its
+    /// `core_loop_max` — an empty range with no valid loop count in it.
+    CoreLoopRangeInverted { core_loop_min: usize, core_loop_max: usize },
+    /// `RecurrentCore`'s `prelude_layers + core_loop_max + coda_layers`
+    /// doesn't equal `num_layers`, the maximum total depth every buffer
+    /// in this app is sized to.
+    RecurrentCoreDepthMismatch { expected: usize, num_layers: usize },
 }
 
 impl std::fmt::Display for ConfigError {
@@ -158,6 +196,14 @@ impl std::fmt::Display for ConfigError {
                 f,
                 "unique_layers ({unique_layers}) must evenly divide num_layers ({num_layers})"
             ),
+            ConfigError::CoreLoopRangeInverted { core_loop_min, core_loop_max } => write!(
+                f,
+                "core loop minimum ({core_loop_min}) must not exceed the maximum ({core_loop_max})"
+            ),
+            ConfigError::RecurrentCoreDepthMismatch { expected, num_layers } => write!(
+                f,
+                "layers ({num_layers}) must equal prelude + max core loops + coda ({expected})"
+            ),
         }
     }
 }
@@ -184,6 +230,33 @@ pub const MAX_TRAINING_BYTES: usize = 2 * 1024 * 1024 * 1024;
 
 /// RoPE frequency base used unless a config says otherwise.
 pub const DEFAULT_ROPE_THETA: f32 = 10000.0;
+
+/// The depth-position-to-weight-group mapping for one `forward`/
+/// `decode_step`/`backward_into` call, from `ModelConfig::layer_layout`.
+///
+/// A pure function of `ModelConfig` when sharing is `Off` or
+/// `UniformGroups`, so building one costs nothing conceptually new there.
+/// `RecurrentCore` is why this exists as its own type rather than a
+/// `layer_group(depth)` method: which group answers for a depth position
+/// depends on `core_loops`, a per-call value, so the mapping is built
+/// once per call instead of being a fixed fact about the model.
+#[derive(Clone)]
+pub struct LayerLayout {
+    groups: Vec<usize>,
+}
+
+impl LayerLayout {
+    /// This call's total depth — `num_layers` unless sharing is
+    /// `RecurrentCore` with `core_loops < core_loop_max`.
+    pub fn depth(&self) -> usize {
+        self.groups.len()
+    }
+
+    /// Which weight-set group answers for `depth` (`0..self.depth()`).
+    pub fn group(&self, depth: usize) -> usize {
+        self.groups[depth]
+    }
+}
 
 impl ModelConfig {
     pub fn validate(&self) -> Result<(), ConfigError> {
@@ -229,14 +302,34 @@ impl ModelConfig {
         if self.rope_theta <= 1.0 {
             return Err(ConfigError::TooSmall { field: "rope_theta", min: 2 });
         }
-        if self.unique_layers == 0 {
-            return Err(ConfigError::TooSmall { field: "unique_layers", min: 1 });
-        }
-        if self.num_layers % self.unique_layers != 0 {
-            return Err(ConfigError::UniqueLayersMustDivideNumLayers {
-                num_layers: self.num_layers,
-                unique_layers: self.unique_layers,
-            });
+        match self.layer_sharing {
+            LayerSharing::Off => {}
+            LayerSharing::UniformGroups { unique_layers } => {
+                if unique_layers == 0 {
+                    return Err(ConfigError::TooSmall { field: "unique_layers", min: 1 });
+                }
+                if self.num_layers % unique_layers != 0 {
+                    return Err(ConfigError::UniqueLayersMustDivideNumLayers {
+                        num_layers: self.num_layers,
+                        unique_layers,
+                    });
+                }
+            }
+            LayerSharing::RecurrentCore { prelude_layers, coda_layers, core_loop_min, core_loop_max } => {
+                if core_loop_min == 0 {
+                    return Err(ConfigError::TooSmall { field: "core_loop_min", min: 1 });
+                }
+                if core_loop_min > core_loop_max {
+                    return Err(ConfigError::CoreLoopRangeInverted { core_loop_min, core_loop_max });
+                }
+                let expected = prelude_layers + core_loop_max + coda_layers;
+                if expected != self.num_layers {
+                    return Err(ConfigError::RecurrentCoreDepthMismatch {
+                        expected,
+                        num_layers: self.num_layers,
+                    });
+                }
+            }
         }
         let training_bytes = self.memory_bytes(true);
         if training_bytes > MAX_TRAINING_BYTES {
@@ -266,29 +359,50 @@ impl ModelConfig {
         default_ffn_dim(self.hidden_dim)
     }
 
-    /// Depth positions per unique weight set (`num_layers / unique_layers`).
-    pub fn group_size(&self) -> usize {
-        self.num_layers / self.unique_layers
+    /// How many *distinct* sets of layer weights actually exist —
+    /// `ModelWeights.layers.len()`, not `num_layers`. Equal to
+    /// `num_layers` when sharing is off.
+    pub fn unique_layer_count(&self) -> usize {
+        match self.layer_sharing {
+            LayerSharing::Off => self.num_layers,
+            LayerSharing::UniformGroups { unique_layers } => unique_layers,
+            LayerSharing::RecurrentCore { prelude_layers, coda_layers, .. } => {
+                prelude_layers + 1 + coda_layers
+            }
+        }
     }
 
-    /// Which of `unique_layers` weight sets answers for depth position
-    /// `depth` (`0..num_layers`). `ModelWeights.layers[layer_group(depth)]`
-    /// is always the right lookup, on both the CPU and GPU paths — nothing
-    /// that walks the model divides `num_layers` by `unique_layers` itself.
+    /// Build this call's depth-to-weight-group layout.
     ///
-    /// Today's grouping is `unique_layers` equal-length contiguous spans in
-    /// order: group 0 owns depths `0..group_size`, group 1 the next
-    /// `group_size`, and so on. That's deliberately how a future
-    /// non-uniform variant (Geiping, McLeish, Jain, Kirchenbauer, Singh,
-    /// Bartoldson, Kailkhura, Bhatele & Goldstein, *Scaling up Test-Time
-    /// Compute with Latent Reasoning: A Recurrent Depth Approach*, 2025,
-    /// arXiv:2502.05171 — non-shared prelude layers, one shared core block
-    /// looped many times, non-shared coda layers) would fit too: it's the
-    /// same "contiguous span owns one group" shape with uneven span
-    /// lengths, so every caller already goes through this method instead
-    /// of assuming equal spans.
-    pub fn layer_group(&self, depth: usize) -> usize {
-        depth / self.group_size()
+    /// `core_loops` only matters for `RecurrentCore` — every other mode
+    /// ignores it. `None` means "as many as this model loops at most"
+    /// (`core_loop_max`): what a fresh forward pass defaults to before
+    /// training starts sampling a loop count per step, and what
+    /// generation defaults to before a user picks a different depth
+    /// (Geiping et al. 2025's "test-time compute scaling" — the same
+    /// checkpoint answers at any depth in `core_loop_min..=core_loop_max`
+    /// with no retraining). Out-of-range values are clamped rather than
+    /// rejected, so a layout can never be built for a depth this model
+    /// wasn't sized for.
+    pub fn layer_layout(&self, core_loops: Option<usize>) -> LayerLayout {
+        let groups = match self.layer_sharing {
+            LayerSharing::Off => (0..self.num_layers).collect(),
+            LayerSharing::UniformGroups { unique_layers } => {
+                let group_size = self.num_layers / unique_layers.max(1);
+                (0..self.num_layers).map(|d| d / group_size.max(1)).collect()
+            }
+            LayerSharing::RecurrentCore { prelude_layers, coda_layers, core_loop_min, core_loop_max } => {
+                let min = core_loop_min.max(1);
+                let max = core_loop_max.max(min);
+                let loops = core_loops.unwrap_or(max).clamp(min, max);
+                let mut groups = Vec::with_capacity(prelude_layers + loops + coda_layers);
+                groups.extend(0..prelude_layers);
+                groups.extend(std::iter::repeat(prelude_layers).take(loops));
+                groups.extend((0..coda_layers).map(|i| prelude_layers + 1 + i));
+                groups
+            }
+        };
+        LayerLayout { groups }
     }
 
     pub fn vocab_size(&self) -> usize {
@@ -306,10 +420,10 @@ impl ModelConfig {
     /// `per_layer_mlp` here too, kept in sync with its actual weight
     /// shapes by hand the same way this one already has to be.
     ///
-    /// Counts `unique_layers` sets of layer weights, not `num_layers`
-    /// depth positions — layer sharing (see `layer_group`) is exactly the
-    /// trade of storing fewer weight sets while still running every depth
-    /// position's own activations.
+    /// Counts `unique_layer_count()` sets of layer weights, not
+    /// `num_layers` depth positions — layer sharing (see `layer_layout`)
+    /// is exactly the trade of storing fewer weight sets while still
+    /// running every depth position's own activations.
     pub fn param_count(&self) -> usize {
         let v = self.vocab_size();
         let h = self.hidden_dim;
@@ -328,7 +442,7 @@ impl ModelConfig {
         let per_layer = per_layer_ple + per_layer_attn + per_layer_mlp;
         let final_norm = h;
 
-        embedding + self.unique_layers * per_layer + final_norm
+        embedding + self.unique_layer_count() * per_layer + final_norm
     }
 
     /// Bytes of activation memory one training step holds live, f32
@@ -431,7 +545,7 @@ mod tests {
     fn a_shape_on_the_tile_grid_wastes_nothing_on_its_own_dimensions() {
         let c = ModelConfig {
             num_layers: 8, hidden_dim: 384, num_heads: 6, num_kv_heads: 2,
-            context_len: 256, local_window: 256, vocab_size: 8192, unique_layers: 8,
+            context_len: 256, local_window: 256, vocab_size: 8192,
             ..Default::default()
         };
         // 384, 256, 128 and 8192 are all multiples of 64; only the ffn
@@ -443,7 +557,7 @@ mod tests {
     fn being_off_the_grid_on_both_dimensions_multiplies() {
         let both = ModelConfig {
             num_layers: 12, hidden_dim: 516, num_heads: 6, num_kv_heads: 2,
-            context_len: 516, local_window: 256, vocab_size: 8192, unique_layers: 12,
+            context_len: 516, local_window: 256, vocab_size: 8192,
             ..Default::default()
         };
         let one = ModelConfig { context_len: 512, ..both };
@@ -506,30 +620,106 @@ mod tests {
 
     #[test]
     fn param_count_grows_with_layers() {
-        let small = ModelConfig { num_layers: 2, unique_layers: 2, ..Default::default() };
-        let big = ModelConfig { num_layers: 8, unique_layers: 8, ..Default::default() };
+        let small = ModelConfig { num_layers: 2, ..Default::default() };
+        let big = ModelConfig { num_layers: 8, ..Default::default() };
         assert!(big.param_count() > small.param_count());
     }
 
     #[test]
     fn sharing_layers_shrinks_the_parameter_count_without_changing_depth() {
-        let dense = ModelConfig { num_layers: 8, unique_layers: 8, ..Default::default() };
-        let shared = ModelConfig { unique_layers: 2, ..dense };
+        let dense = ModelConfig { num_layers: 8, ..Default::default() };
+        let shared = ModelConfig {
+            layer_sharing: LayerSharing::UniformGroups { unique_layers: 2 },
+            ..dense
+        };
         assert!(shared.param_count() < dense.param_count());
         // Sharing trades parameters for repetition, not depth: both still
         // run every one of the 8 depth positions' own activations.
         assert_eq!(shared.num_layers, dense.num_layers);
-        assert_eq!(shared.group_size(), 4);
-        assert_eq!(shared.layer_group(0), 0);
-        assert_eq!(shared.layer_group(3), 0);
-        assert_eq!(shared.layer_group(4), 1);
-        assert_eq!(shared.layer_group(7), 1);
+        assert_eq!(shared.unique_layer_count(), 2);
+        let layout = shared.layer_layout(None);
+        assert_eq!(layout.depth(), 8);
+        assert_eq!(layout.group(0), 0);
+        assert_eq!(layout.group(3), 0);
+        assert_eq!(layout.group(4), 1);
+        assert_eq!(layout.group(7), 1);
     }
 
     #[test]
     fn rejects_unique_layers_that_does_not_divide_num_layers() {
-        let cfg = ModelConfig { num_layers: 8, unique_layers: 3, ..Default::default() };
+        let cfg = ModelConfig {
+            num_layers: 8,
+            layer_sharing: LayerSharing::UniformGroups { unique_layers: 3 },
+            ..Default::default()
+        };
         assert!(matches!(cfg.validate(), Err(ConfigError::UniqueLayersMustDivideNumLayers { .. })));
+    }
+
+    #[test]
+    fn recurrent_core_layout_repeats_the_shared_group_and_shrinks_with_fewer_loops() {
+        let cfg = ModelConfig {
+            num_layers: 6, // 1 prelude + 4 max loops + 1 coda
+            layer_sharing: LayerSharing::RecurrentCore {
+                prelude_layers: 1,
+                coda_layers: 1,
+                core_loop_min: 2,
+                core_loop_max: 4,
+            },
+            ..Default::default()
+        };
+        assert!(cfg.validate().is_ok(), "{:?}", cfg.validate());
+        assert_eq!(cfg.unique_layer_count(), 3); // prelude + core + coda
+
+        let max = cfg.layer_layout(None);
+        assert_eq!(max.depth(), 6);
+        assert_eq!(max.group(0), 0); // prelude
+        assert_eq!(max.group(1), 1); // core, every loop shares group 1
+        assert_eq!(max.group(2), 1);
+        assert_eq!(max.group(3), 1);
+        assert_eq!(max.group(4), 1);
+        assert_eq!(max.group(5), 2); // coda
+
+        let short = cfg.layer_layout(Some(2));
+        assert_eq!(short.depth(), 4); // 1 prelude + 2 core loops + 1 coda
+        assert_eq!(short.group(0), 0);
+        assert_eq!(short.group(1), 1);
+        assert_eq!(short.group(2), 1);
+        assert_eq!(short.group(3), 2);
+
+        // Out-of-range requests clamp rather than building an
+        // unbuildable layout.
+        assert_eq!(cfg.layer_layout(Some(0)).depth(), 1 + 2 + 1);
+        assert_eq!(cfg.layer_layout(Some(99)).depth(), 1 + 4 + 1);
+    }
+
+    #[test]
+    fn recurrent_core_rejects_a_depth_that_does_not_match_prelude_plus_max_loops_plus_coda() {
+        let cfg = ModelConfig {
+            num_layers: 6,
+            layer_sharing: LayerSharing::RecurrentCore {
+                prelude_layers: 1,
+                coda_layers: 1,
+                core_loop_min: 2,
+                core_loop_max: 3, // 1 + 3 + 1 = 5, not 6
+            },
+            ..Default::default()
+        };
+        assert!(matches!(cfg.validate(), Err(ConfigError::RecurrentCoreDepthMismatch { .. })));
+    }
+
+    #[test]
+    fn recurrent_core_rejects_an_inverted_loop_range() {
+        let cfg = ModelConfig {
+            num_layers: 5,
+            layer_sharing: LayerSharing::RecurrentCore {
+                prelude_layers: 1,
+                coda_layers: 1,
+                core_loop_min: 4,
+                core_loop_max: 3,
+            },
+            ..Default::default()
+        };
+        assert!(matches!(cfg.validate(), Err(ConfigError::CoreLoopRangeInverted { .. })));
     }
 
     #[test]
@@ -546,7 +736,7 @@ mod tests {
         // 1024 nodes, 16 heads, full 4096-token attention. Its activation
         // cache alone is ~20 GB, which used to be reported to the user as
         // "3.1 GB while training" and then simply killed the tab.
-        let cfg = ModelConfig { num_layers: 16, unique_layers: 16, hidden_dim: 1024, num_heads: 16, num_kv_heads: 16, context_len: 4096, local_window: 4096, ..Default::default() };
+        let cfg = ModelConfig { num_layers: 16, hidden_dim: 1024, num_heads: 16, num_kv_heads: 16, context_len: 4096, local_window: 4096, ..Default::default() };
         assert!(matches!(cfg.validate(), Err(ConfigError::TooLarge { .. })));
         assert!(ModelConfig::default().validate().is_ok());
     }

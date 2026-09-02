@@ -26,8 +26,8 @@ pretrained weights, no third-party model code).
   Shazeer, *GLU Variants Improve Transformer*, 2020 (arXiv:2002.05202).
 - **Per-layer embeddings (PLE)**: implemented, off by default.
 - **KV cache** for decoding (see [generation.md](generation.md)).
-- **Layer sharing (ALBERT-style static grouping)**: implemented, off by
-  default. See the section below.
+- **Layer sharing**: static grouping (ALBERT-style) or a recurrent core with
+  a variable loop count, off by default. See the section below.
 
 ## Precision
 
@@ -55,8 +55,12 @@ pretrained weights, no third-party model code).
 | Setting | Meaning |
 |---|---|
 | Layers | Transformer block count (depth positions) |
-| Layer sharing | Off, or Uniform groups (see below) |
+| Layer sharing | Off, Uniform groups, or Recurrent core (see below) |
 | Unique layers | Distinct weight sets, when Layer sharing is Uniform groups |
+| Prelude layers | Non-shared layers before the loop, when Layer sharing is Recurrent core |
+| Coda layers | Non-shared layers after the loop, when Layer sharing is Recurrent core |
+| Core loop min | Fewest times the shared core repeats during training, when Layer sharing is Recurrent core |
+| Core loop max | Most times the shared core repeats during training, when Layer sharing is Recurrent core |
 | Hidden size | Residual stream width |
 | Heads | Attention heads |
 | KV heads | Key/value heads (GQA); must divide Heads |
@@ -96,15 +100,42 @@ same per-step GPU work) costs fewer parameters to store and train.
   2018 (arXiv:1807.03819), which shares one set of weights across every
   depth position (the `Unique layers = 1` case here).
 
+- **Recurrent core**: `Layers` splits into three parts in order —
+  `Prelude layers` (each its own weight set), then a shared "core" block
+  looped some number of times, then `Coda layers` (each its own weight
+  set). `Prelude layers + Core loop max + Coda layers` must equal
+  `Layers`. During training, the loop count is sampled once per step from
+  `Core loop min..=Core loop max`, so the core is trained to produce a
+  usable result at any depth in that range rather than only one fixed
+  depth — the same trained checkpoint can then be run at any depth in
+  that range at generation time with no retraining, via the Inference
+  tab's `Core loops` setting (see [generation.md](generation.md)). Unlike
+  Uniform groups, the depth actually run varies per training step and per
+  generation call; it is not fixed at model-creation time.
+
+  Geiping, McLeish, Jain, Kirchenbauer, Singh, Bartoldson, Kailkhura,
+  Bhatele & Goldstein, *Scaling up Test-Time Compute with Latent
+  Reasoning: A Recurrent Depth Approach*, 2025 (arXiv:2502.05171).
+
+  Two deliberate simplifications versus that paper, given this app's much
+  smaller scale: the loop count is sampled once per training step (batch),
+  not per individual example, avoiding a per-sequence variable-depth GPU
+  dispatch; and the backward pass runs full backpropagation through every
+  repetition of the core rather than the paper's truncated BPTT, since
+  `Core loop max` is small enough here that storing every iteration's
+  activations isn't the memory problem it is at the paper's scale.
+
 - Every depth position still keeps its own activations and its own
   key/value cache during generation — two positions sharing a weight set
   still see a different residual stream (whatever came before them in the
   stack), so they compute different numbers even from identical weights.
   Only the weights, gradients, and Adam moment buffers are shared; nothing
   about attention, RoPE, or the forward/backward loop's shape changes.
-- The checkpoint format stores `Unique layers` alongside the rest of the
-  shape; a file from before this setting existed loads with `Unique
-  layers` equal to `Layers` (no sharing), exactly its previous behavior.
+- The checkpoint format stores the layer-sharing mode alongside the rest
+  of the shape (version 6 tags which mode plus its fields; a version 5
+  file's bare `Unique layers` scalar and a pre-version-5 file's total
+  absence of the field both still load, translated to the equivalent
+  mode — Off when there's nothing to translate).
 
 ## Instruction format
 

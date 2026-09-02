@@ -24,7 +24,7 @@
 //! into the key itself, so "the last `window` keys" is the same set of
 //! numbers whichever order they sit in.
 
-use llm_core::config::ModelConfig;
+use llm_core::config::{LayerLayout, ModelConfig};
 use llm_core::model::{GenCache, ModelWeights};
 
 use crate::buffers;
@@ -289,8 +289,8 @@ fn dispatch_attention_decode(
     );
 }
 
-/// One *unique* weight set — `unique_layers` of these exist, not
-/// `num_layers` (see `ModelConfig::layer_group`). Deliberately holds only
+/// One *unique* weight set — `unique_layer_count()` of these exist, not
+/// `num_layers` (see `ModelConfig::layer_layout`). Deliberately holds only
 /// weights: the KV cache is per depth position, not per weight set (two
 /// depths sharing a weight set still see different residual-stream
 /// activations, so they cache different keys and values), which is what
@@ -349,6 +349,13 @@ pub struct GpuModel {
     position: usize,
     /// How many ring slots hold live keys.
     cached_len: usize,
+    /// This generation's depth (see `ModelConfig::layer_layout`) — the
+    /// model's maximum until `seed_from_cpu_cache` sets it to whatever
+    /// the CPU prefill actually used, and fixed from then on for the
+    /// same reason `llm_core::model::GenCache` fixes its own: a cached
+    /// key belongs to a specific depth position, so decoding has to keep
+    /// using the layout that wrote it.
+    layout: LayerLayout,
 }
 
 impl GpuModel {
@@ -436,6 +443,7 @@ impl GpuModel {
             capacity,
             position: 0,
             cached_len: 0,
+            layout: config.layer_layout(None),
         })
     }
 
@@ -464,6 +472,10 @@ impl GpuModel {
         }
         self.cached_len = cached.min(self.capacity);
         self.position = cache.position();
+        // Adopt the CPU prefill's layout exactly, so a `RecurrentCore`
+        // model decodes at whatever depth the prompt was actually
+        // prefilled at rather than silently defaulting back to maximum.
+        self.layout = cache.layout().clone();
     }
 
     /// Decode one token and return its logits.
@@ -492,8 +504,8 @@ impl GpuModel {
 
         dispatch_gather(&mut encoder, ctx, &self.embed, &self.scratch.token, &self.scratch.hidden, hidden);
 
-        for depth in 0..config.num_layers {
-            let layer = &self.layer_weights[config.layer_group(depth)];
+        for depth in 0..self.layout.depth() {
+            let layer = &self.layer_weights[self.layout.group(depth)];
             let kv_cache = &self.layer_kv[depth];
             if let Some(ple) = &layer.ple {
                 dispatch_gather(&mut encoder, ctx, ple, &self.scratch.token, &self.scratch.ple_row, hidden);
@@ -554,7 +566,8 @@ impl GpuModel {
         prompt_tokens: &[u32],
         next_token: u32,
     ) -> Result<f64, String> {
-        let (_, mut cpu_cache) = llm_core::model::prefill(weights, &self.config, prompt_tokens);
+        let layout = self.config.layer_layout(None);
+        let (_, mut cpu_cache) = llm_core::model::prefill(weights, &self.config, prompt_tokens, &layout);
         self.seed_from_cpu_cache(ctx, &cpu_cache);
         let gpu_logits = self.decode_step(ctx, next_token).await?;
         let cpu_logits =

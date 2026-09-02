@@ -156,14 +156,17 @@ impl GpuTrainer {
         ctx.dispatch_count.set(0);
         crate::buffers::write_u32(&ctx.queue, &self.scratch.tokens, tokens);
         let mut chunks = super::dispatch::Chunks::new(ctx, self.dispatches_per_submit);
-        self.encode_forward(&mut chunks, ctx);
+        // The model's full depth on both sides — this is a kernel-for-
+        // kernel check, not a test of any particular sampled core depth.
+        let layout = self.config.layer_layout(None);
+        self.encode_forward(&mut chunks, ctx, &layout);
         chunks.flush();
         let vocab = self.config.vocab_size();
         let gpu_logits =
             crate::buffers::read_f32(&ctx.device, &ctx.queue, &self.scratch.logits, self.t_len * vocab).await?;
 
         let weights = self.download_weights(ctx).await?;
-        let (cpu_logits, _) = llm_core::model::forward(&weights, &self.config, tokens);
+        let (cpu_logits, _) = llm_core::model::forward(&weights, &self.config, tokens, &layout);
         Ok(cpu_logits
             .iter()
             .zip(&gpu_logits)
@@ -197,10 +200,13 @@ impl GpuTrainer {
         // Only the loss slot is used, and it accumulates, so it has to
         // start at zero.
         self.dispatch_zero(&mut chunks, ctx, &self.scratch.stats, 1);
+        // Held-out loss is measured at the model's full depth, not a
+        // sampled one, so it's comparable across evaluations.
+        let layout = self.config.layer_layout(None);
         for b in 0..batch_size {
             crate::buffers::write_u32(&ctx.queue, &self.scratch.tokens, &inputs[b * t..(b + 1) * t]);
             crate::buffers::write_u32(&ctx.queue, &self.scratch.targets, &targets[b * t..(b + 1) * t]);
-            self.encode_forward(&mut chunks, ctx);
+            self.encode_forward(&mut chunks, ctx, &layout);
             self.encode_loss(&mut chunks, ctx);
             chunks.flush();
         }

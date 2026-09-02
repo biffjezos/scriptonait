@@ -446,6 +446,19 @@ async function reportDuplicates() {
 /// an entirely different shape — four layers on screen, eight in the
 /// model. With a model loaded the shape is fixed, so the fields state it
 /// and stop being editable.
+/// Layer sharing's own fields, keyed by mode — which fields exist and
+/// which HTML elements hold them, so the render/read/toggle logic below
+/// doesn't repeat this list three times.
+const LAYER_SHARING_FIELDS = {
+  grouped: [['unique-layers', 'uniqueLayers']],
+  recurrent: [
+    ['prelude-layers', 'preludeLayers'],
+    ['coda-layers', 'codaLayers'],
+    ['core-loop-min', 'coreLoopMin'],
+    ['core-loop-max', 'coreLoopMax'],
+  ],
+};
+
 function renderModelShape(info) {
   const fields = [
     ['cfg-layers', info && info.layers],
@@ -461,13 +474,19 @@ function renderModelShape(info) {
     field.disabled = Boolean(info);
   }
   if (info) {
-    const sharing = info.uniqueLayers !== info.layers;
-    $('cfg-layer-sharing').value = sharing ? 'grouped' : 'off';
-    $('cfg-unique-layers').value = info.uniqueLayers;
-    $('cfg-unique-layers-field').hidden = !sharing;
+    $('cfg-layer-sharing').value = info.layerSharing;
+    for (const mode of Object.keys(LAYER_SHARING_FIELDS)) {
+      const active = info.layerSharing === mode;
+      for (const [suffix, key] of LAYER_SHARING_FIELDS[mode]) {
+        if (active) $(`cfg-${suffix}`).value = info[key];
+        $(`cfg-${suffix}-field`).hidden = !active;
+      }
+    }
   }
   $('cfg-layer-sharing').disabled = Boolean(info);
-  $('cfg-unique-layers').disabled = Boolean(info);
+  for (const fieldList of Object.values(LAYER_SHARING_FIELDS)) {
+    for (const [suffix] of fieldList) $(`cfg-${suffix}`).disabled = Boolean(info);
+  }
   $('shape-hint').textContent = info ? 'Fixed' : 'New model shape:';
   refreshShapeEstimate();
 }
@@ -486,12 +505,12 @@ function renderModelShape(info) {
 /// there is a model to ask.
 let shapeEstimateToken = 0;
 
-/// A starting point for "Unique layers" when Layer sharing is switched
-/// on: the largest divisor of the layer count that is at most half of
-/// it, so turning sharing on visibly shrinks the model instead of
-/// defaulting to a value indistinguishable from sharing being off. A
-/// layer count with no such divisor (1, or a prime) has nothing to offer
-/// but full sharing, and gets that.
+/// A starting point for "Unique layers" when Layer sharing is switched to
+/// Uniform groups: the largest divisor of the layer count that is at
+/// most half of it, so turning sharing on visibly shrinks the model
+/// instead of defaulting to a value indistinguishable from sharing being
+/// off. A layer count with no such divisor (1, or a prime) has nothing
+/// to offer but full sharing, and gets that.
 function defaultUniqueLayers(numLayers) {
   for (let d = Math.floor(numLayers / 2); d >= 1; d--) {
     if (numLayers % d === 0) return d;
@@ -499,10 +518,37 @@ function defaultUniqueLayers(numLayers) {
   return numLayers;
 }
 
-function currentUniqueLayers() {
+/// A starting prelude/coda/loop-range split when Layer sharing is
+/// switched to Recurrent core: one non-shared layer on each end, the
+/// core looping through whatever depth is left (Geiping et al. 2025's
+/// own shape has a small prelude and coda next to a much deeper core).
+function defaultRecurrentCoreFields(numLayers) {
+  const prelude = 1;
+  const coda = 1;
+  const coreLoopMax = Math.max(1, numLayers - prelude - coda);
+  return { preludeLayers: prelude, codaLayers: coda, coreLoopMin: 1, coreLoopMax };
+}
+
+/// The Model Shape panel's current layer-sharing fields, read from
+/// whichever mode is selected — the shape passed to `describe-shape` and
+/// `create-model` alike, so the estimate can never drift from what
+/// Create actually builds.
+function currentLayerSharingFields() {
   const layers = Number($('cfg-layers').value) || 0;
-  if ($('cfg-layer-sharing').value !== 'grouped') return layers;
-  return Number($('cfg-unique-layers').value) || layers;
+  const layerSharing = $('cfg-layer-sharing').value;
+  if (layerSharing === 'grouped') {
+    return { layerSharing, uniqueLayers: Number($('cfg-unique-layers').value) || layers };
+  }
+  if (layerSharing === 'recurrent') {
+    return {
+      layerSharing,
+      preludeLayers: Number($('cfg-prelude-layers').value) || 0,
+      codaLayers: Number($('cfg-coda-layers').value) || 0,
+      coreLoopMin: Number($('cfg-core-loop-min').value) || 1,
+      coreLoopMax: Number($('cfg-core-loop-max').value) || 1,
+    };
+  }
+  return { layerSharing: 'off' };
 }
 
 function formatBytes(bytes) {
@@ -525,7 +571,7 @@ async function refreshShapeEstimate() {
   try {
     estimate = await call('describe-shape', {
       layers: Number($('cfg-layers').value) || 0,
-      uniqueLayers: currentUniqueLayers(),
+      ...currentLayerSharingFields(),
       hidden: Number($('cfg-hidden').value) || 0,
       heads: Number($('cfg-heads').value) || 0,
       kvHeads: Number($('cfg-kv-heads').value) || 0,
@@ -596,10 +642,18 @@ function renderModel(info) {
       ? `Your model: ${params} parameters, trained ${info.step.toLocaleString()} steps, ${where}.`
       : `Your model: ${params} parameters, not trained yet, ${where}.`,
   );
+  let sharingRow = '';
+  if (info.layerSharing === 'grouped') {
+    sharingRow = `<div><dt>Layer sharing</dt><dd>Uniform groups, ${info.uniqueLayers} unique</dd></div>`;
+  } else if (info.layerSharing === 'recurrent') {
+    sharingRow = `<div><dt>Layer sharing</dt><dd>Recurrent core, ${info.preludeLayers} prelude + ` +
+      `${info.coreLoopMin}-${info.coreLoopMax} core loops + ${info.codaLayers} coda</dd></div>`;
+  }
   $('model-details').innerHTML = `
     <dl>
       <div><dt>Parameters</dt><dd>${params}</dd></div>
       <div><dt>Layers</dt><dd>${info.layers}</dd></div>
+      ${sharingRow}
       <div><dt>Hidden size</dt><dd>${info.hidden}</dd></div>
       <div><dt>Heads</dt><dd>${info.heads} (${info.kvHeads} key/value)</dd></div>
       <div><dt>Context</dt><dd>${info.contextLen} tokens, ${info.window}-token attention window</dd></div>
@@ -612,6 +666,18 @@ function renderModel(info) {
   // model its shape-based fallback reads from actually exists.
   if (!autosaveFileName) $('autosave-filename').value = autosaveTargetBaseName();
   if (!$('library-name').value) $('library-name').value = libraryDefaultName();
+
+  // Core loops (Inference settings) only means anything for a Recurrent
+  // core model — test-time compute scaling: the same checkpoint answers
+  // at any depth in its trained range with no retraining.
+  const recurrent = info.layerSharing === 'recurrent';
+  $('opt-core-loops-field').hidden = !recurrent;
+  if (recurrent) {
+    const field = $('opt-core-loops');
+    field.min = info.coreLoopMin;
+    field.max = info.coreLoopMax;
+    if (!field.value) field.value = info.coreLoopMax;
+  }
   updateGuidance();
 }
 
@@ -780,6 +846,7 @@ $('generate-btn').addEventListener('click', async () => {
       repetitionPenalty: Number($('opt-repetition').value),
       seed: Number($('opt-seed').value) || Math.floor(Math.random() * 1e9),
       maxTokens: $('opt-length-mode').value === 'limit' ? Number($('opt-max-tokens').value) : 0,
+      coreLoops: Number($('opt-core-loops').value) || 0,
     // A bounded deadline instead of none: the GPU readback generate does
     // before its first token (sync_from_gpu_inner) has no cancellation
     // point wgpu exposes — Stop can't reach it, and neither can anything
@@ -1957,7 +2024,11 @@ function profileShapeMatches(profile) {
   const s = profile.shape;
   return (
     s.layers === model.layers &&
+    s.layerSharing === model.layerSharing &&
     s.uniqueLayers === model.uniqueLayers &&
+    s.preludeLayers === model.preludeLayers &&
+    s.codaLayers === model.codaLayers &&
+    s.coreLoopMax === model.coreLoopMax &&
     s.hidden === model.hidden &&
     s.heads === model.heads &&
     s.kvHeads === model.kvHeads &&
@@ -2312,6 +2383,7 @@ function readTrainingSettings() {
       topP: Number($('opt-top-p').value),
       minP: Number($('opt-min-p').value),
       repetitionPenalty: Number($('opt-repetition').value),
+      coreLoops: Number($('opt-core-loops').value) || 0,
     },
   };
 }
@@ -2491,7 +2563,7 @@ $('train-btn').addEventListener('click', async () => {
       renderModel(
         await call('create-model', {
           layers: Number($('cfg-layers').value),
-          uniqueLayers: currentUniqueLayers(),
+          ...currentLayerSharingFields(),
           hidden: Number($('cfg-hidden').value),
           heads: Number($('cfg-heads').value),
           kvHeads: Number($('cfg-kv-heads').value),
@@ -2583,13 +2655,25 @@ $('train-btn').addEventListener('click', async () => {
 $('train-batch').addEventListener('input', updateGuidance);
 // Every field that changes the price, priced as it is typed.
 for (const id of ['cfg-layers', 'cfg-hidden', 'cfg-heads', 'cfg-kv-heads', 'cfg-context',
-  'cfg-window', 'cfg-unique-layers']) {
+  'cfg-window', 'cfg-unique-layers', 'cfg-prelude-layers', 'cfg-coda-layers',
+  'cfg-core-loop-min', 'cfg-core-loop-max']) {
   $(id).addEventListener('input', () => refreshShapeEstimate());
 }
 $('cfg-layer-sharing').addEventListener('change', () => {
-  const grouped = $('cfg-layer-sharing').value === 'grouped';
-  $('cfg-unique-layers-field').hidden = !grouped;
-  if (grouped) $('cfg-unique-layers').value = defaultUniqueLayers(Number($('cfg-layers').value) || 1);
+  const mode = $('cfg-layer-sharing').value;
+  const layers = Number($('cfg-layers').value) || 1;
+  for (const [m, fields] of Object.entries(LAYER_SHARING_FIELDS)) {
+    for (const [suffix] of fields) $(`cfg-${suffix}-field`).hidden = mode !== m;
+  }
+  if (mode === 'grouped') {
+    $('cfg-unique-layers').value = defaultUniqueLayers(layers);
+  } else if (mode === 'recurrent') {
+    const defaults = defaultRecurrentCoreFields(layers);
+    $('cfg-prelude-layers').value = defaults.preludeLayers;
+    $('cfg-coda-layers').value = defaults.codaLayers;
+    $('cfg-core-loop-min').value = defaults.coreLoopMin;
+    $('cfg-core-loop-max').value = defaults.coreLoopMax;
+  }
   refreshShapeEstimate();
 });
 
@@ -3326,7 +3410,11 @@ function autosaveDirectorySupported() {
 /// instead of colliding on the same generic one.
 function modelShapeName() {
   if (!model) return null;
-  const sharing = model.uniqueLayers !== model.layers ? `_u${model.uniqueLayers}` : '';
+  let sharing = '';
+  if (model.layerSharing === 'grouped') sharing = `_u${model.uniqueLayers}`;
+  else if (model.layerSharing === 'recurrent') {
+    sharing = `_p${model.preludeLayers}c${model.coreLoopMax}c${model.codaLayers}`;
+  }
   return `${model.layers}${sharing}_${model.hidden}_${model.heads}_${model.kvHeads}_${model.contextLen}_${model.window}`;
 }
 

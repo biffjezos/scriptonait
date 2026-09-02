@@ -313,11 +313,29 @@ async function initGpu() {
   }
 }
 
+/// Layer sharing's mode select (`off`/`grouped`/`recurrent`) as the u32
+/// tag `WasmLLM.new`/`describe_shape` take — see `dto::layer_sharing_from_raw`
+/// on the Rust side, which this mirrors.
+function layerSharingModeTag(mode) {
+  return { off: 0, grouped: 1, recurrent: 2 }[mode] || 0;
+}
+
+/// The inverse of `layerSharingModeTag`, for reporting a loaded model's
+/// own shape back to the page.
+function layerSharingModeName(tag) {
+  return ['off', 'grouped', 'recurrent'][tag] || 'off';
+}
+
 function describeModel() {
   const info = llm.info();
   return {
     layers: info.layers,
+    layerSharing: layerSharingModeName(info.layer_sharing_mode),
     uniqueLayers: info.unique_layers,
+    preludeLayers: info.prelude_layers,
+    codaLayers: info.coda_layers,
+    coreLoopMin: info.core_loop_min,
+    coreLoopMax: info.core_loop_max,
     hidden: info.hidden,
     heads: info.heads,
     kvHeads: info.kv_heads,
@@ -345,7 +363,7 @@ function describePrompt(prompt) {
   };
 }
 
-async function generate({ prompt, extraContext, temperature, topK, topP, minP, repetitionPenalty, seed, maxTokens }) {
+async function generate({ prompt, extraContext, temperature, topK, topP, minP, repetitionPenalty, seed, maxTokens, coreLoops }) {
   stopRequested = false;
   const startedAt = performance.now();
   let lastPost = 0;
@@ -364,6 +382,9 @@ async function generate({ prompt, extraContext, temperature, topK, topP, minP, r
     // 0 = continuous: length stays whatever the prompt itself asks for
     // (or the default budget, if it asks for nothing).
     maxTokens || 0,
+    // 0 = the model's own maximum; meaningless (ignored) unless the
+    // loaded model's Layer sharing is Recurrent core.
+    coreLoops || 0,
     (piece, words) => {
       tokens += 1;
       // Text goes back immediately — that's what makes the page feel
@@ -437,6 +458,7 @@ async function trainingSample(prompt, maxTokens, sampling) {
     // without pausing it.
     inferenceDevice !== 'cpu',
     maxTokens || 0,
+    sampling.coreLoops || 0,
     () => true,
   );
   return result.text;
@@ -1029,7 +1051,11 @@ async function benchmark({ ceilingMs = 1500, budgetMs = 60000, repeats = 3 } = {
     // measured against a different model says nothing about this one.
     shape: {
       layers: info.layers,
+      layerSharing: layerSharingModeName(info.layer_sharing_mode),
       uniqueLayers: info.unique_layers,
+      preludeLayers: info.prelude_layers,
+      codaLayers: info.coda_layers,
+      coreLoopMax: info.core_loop_max,
       hidden: info.hidden,
       heads: info.heads,
       kvHeads: info.kv_heads,
@@ -1853,12 +1879,20 @@ const handlers = {
     return loadModelBytes(bytes);
   },
 
-  async 'create-model'({ layers, uniqueLayers, hidden, heads, kvHeads, contextLen, window: attentionWindow, seed }) {
+  async 'create-model'({
+    layers, layerSharing, uniqueLayers, preludeLayers, codaLayers, coreLoopMin, coreLoopMax,
+    hidden, heads, kvHeads, contextLen, window: attentionWindow, seed,
+  }) {
     await ensureWasm();
-    log('creating model', { layers, uniqueLayers, hidden, heads, kvHeads, contextLen, window: attentionWindow });
+    log('creating model', { layers, layerSharing, hidden, heads, kvHeads, contextLen, window: attentionWindow });
     llm = new wasm.WasmLLM(
       layers,
+      layerSharingModeTag(layerSharing),
       uniqueLayers || layers,
+      preludeLayers || 0,
+      codaLayers || 0,
+      coreLoopMin || 1,
+      coreLoopMax || 1,
       hidden,
       heads,
       kvHeads,
@@ -1913,12 +1947,20 @@ const handlers = {
   /// What a shape would cost, before anything is built from it. Needs no
   /// model — that is the point, since this is what somebody is looking
   /// at while they choose the numbers.
-  async 'describe-shape'({ layers, uniqueLayers, hidden, heads, kvHeads, contextLen, window: win, corpusChars }) {
+  async 'describe-shape'({
+    layers, layerSharing, uniqueLayers, preludeLayers, codaLayers, coreLoopMin, coreLoopMax,
+    hidden, heads, kvHeads, contextLen, window: win, corpusChars,
+  }) {
     await ensureWasm();
     return JSON.parse(
       wasm.describe_shape(
         layers,
+        layerSharingModeTag(layerSharing),
         uniqueLayers || layers,
+        preludeLayers || 0,
+        codaLayers || 0,
+        coreLoopMin || 1,
+        coreLoopMax || 1,
         hidden,
         heads,
         kvHeads,

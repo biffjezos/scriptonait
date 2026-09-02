@@ -54,38 +54,40 @@ Lan, Chen, Goodman, Gimpel, Sharma & Soricut, *ALBERT: A Lite BERT for Self-Supe
 Language Representations*, 2019 (arXiv:1909.11942); the general "recurrent depth" family traces to
 Dehghani, Gouws, Vinyals, Uszkoreit & Kaiser, *Universal Transformers*, 2018 (arXiv:1807.03819).
 
+**Layer sharing, phase 2 (variable loop count), is done.** `LayerSharing` grew from phase 1's flat
+`unique_layers: usize` into an enum — `Off`, `UniformGroups { unique_layers }` (phase 1, unchanged
+behavior), and `RecurrentCore { prelude_layers, coda_layers, core_loop_min, core_loop_max }` — with
+a `LayerLayout` (`groups: Vec<usize>`, built by `ModelConfig::layer_layout(core_loops: Option<
+usize>)`) replacing phase 1's pure `layer_group(depth)` function, since `RecurrentCore`'s mapping
+depends on a runtime loop count that `Off`/`UniformGroups` don't need. Training samples the loop
+count once per step (not per individual example — that would need a per-sequence variable-depth GPU
+dispatch this app's batch-uniform kernels don't have) from `core_loop_min..=core_loop_max`, and runs
+full backpropagation through every repetition of the shared core (not the paper's truncated BPTT —
+`core_loop_max` is small enough here that storing every iteration's activations isn't the memory
+problem it is at the paper's scale). Both simplifications are deliberate, documented departures
+from the paper, not oversights. The same trained checkpoint can then decode at any depth in that
+same range with no retraining — the paper's headline "test-time compute scaling" result — exposed
+as the Inference tab's `Core loops` setting. `Cache`/`GenCache` each carry their own `LayerLayout`
+fixed for the cache's lifetime, since a KV-cache entry belongs to a specific depth; GPU inference's
+KV-cache buffers and training's activation buffers stay allocated at the maximum depth always, a
+shorter run just leaving the tail unused rather than reallocating. The checkpoint format (version 6)
+tags which `LayerSharing` variant is stored plus its fields; a version 5 file's bare `unique_layers`
+scalar and a pre-version-5 file's total absence of the field both still load, translated to the
+equivalent mode. Settings' Model Shape panel's "Layer sharing" control gained a third option,
+**Recurrent core**, with its own four fields (`Prelude layers`, `Coda layers`, `Core loop min`,
+`Core loop max`). See [docs/model.md](docs/model.md) and [docs/generation.md](docs/generation.md).
+
+Geiping, McLeish, Jain, Kirchenbauer, Singh, Bartoldson, Kailkhura, Bhatele & Goldstein, *Scaling up
+Test-Time Compute with Latent Reasoning: A Recurrent Depth Approach*, 2025 (arXiv:2502.05171).
+
 ## What's next: different architectures and training approaches
 
-Four directions remain. Each has a genuinely different cost and a genuinely different payoff for
+Three directions remain. Each has a genuinely different cost and a genuinely different payoff for
 this app's actual scale and use case, and the honest version of both matters more than enthusiasm
-for any one name. Layer sharing's phase 2, self-distillation, quantization, and Mixture-of-Experts
-are four separate directions, not variations on one — nothing below is a phase of anything else:
+for any one name. Self-distillation, quantization, and Mixture-of-Experts are three separate
+directions, not variations on one — nothing below is a phase of anything else:
 
-1. **Layer sharing, phase 2 — variable loop count.** A follow-up to phase 1 (above), not a
-   prerequisite for it and not required reading to use what already shipped.
-
-   (Geiping, McLeish, Jain, Kirchenbauer, Singh, Bartoldson,
-   Kailkhura, Bhatele & Goldstein, *Scaling up Test-Time Compute with Latent Reasoning: A
-   Recurrent Depth Approach*, 2025, arXiv:2502.05171). The paper's own architecture — a few
-   non-shared "prelude" layers, one shared "core" block looped many times, a few non-shared "coda"
-   layers — is a *non-uniform* case of phase 1's same depth-position-to-group mapping, so the
-   structural shape is already reachable once phase 1's plumbing exists. What phase 2 actually adds
-   is real, separate work with real uncertainty, not a configuration change: training has to
-   *sample* the loop count per example so the model learns to produce a usable state at a range of
-   depths (a model trained at one fixed depth has no reason to behave well at another), which needs
-   truncated backprop through the recurrence (storing every iteration's activations for a large
-   loop count is its own memory problem) and carries the known stability hazards of applying the
-   same weights many times in sequence. Explicitly a follow-up experiment to attempt once phase 1
-   trains correctly, not a guaranteed phase — this app's small model scale hasn't been the target
-   of this research, and there's no evidence yet it pays off here the way it does at the paper's
-   scale.
-
-   UI-wise, this exposes only what's actually built — Model Shape's "Layer sharing" setting ships
-   today with **Off** and **Uniform groups** (phase 1, above); phase 2 adds a third mode with its
-   own fields (prelude/coda size, loop count or range) rather than a mode the UI already shows
-   doing nothing.
-
-2. **Self-distillation from an earlier checkpoint.** Discussed as the answer to "there's no
+1. **Self-distillation from an earlier checkpoint.** Discussed as the answer to "there's no
    suitable teacher model" — a Branch checkpoint (or, now, a Library entry) already *is* a valid
    frozen teacher, sidestepping the usual need for a much bigger pretrained model this app has no
    path to. `ops::cross_entropy` (`crates/llm-core/src/ops/loss.rs`) is already a clean,
@@ -102,7 +104,7 @@ are four separate directions, not variations on one — nothing below is a phase
    work needed to get that win — the student is an ordinary dense model this app already knows how
    to run.
 
-3. **Quantization.** Not one of the original three directions, but came up directly from a user
+2. **Quantization.** Not one of the original three directions, but came up directly from a user
    question about weight precision and is worth planning for honestly rather than bolting on
    later. Today every checkpoint is f32 in compute and bf16 only at rest (see
    `docs/model.md`'s Precision section) — bf16 is *never* computed on directly, `Checkpoint::
@@ -114,7 +116,7 @@ are four separate directions, not variations on one — nothing below is a phase
    still too big, or an assembled MoE); on a single dense model at this app's usual scale the size
    saved doesn't move much. An enabler for the other directions, not a standalone win yet.
 
-4. **Mixture-of-Experts.** Every named MoE approach — including BTX's own upcycling step, which
+3. **Mixture-of-Experts.** Every named MoE approach — including BTX's own upcycling step, which
    folds separately-trained specialist branches' FFN weights into one MoE model with a learned
    router — only ever replaces the FFN sublayer with N experts plus a router; attention, RoPE,
    and both RMSNorms are untouched. That seam is now isolated on the CPU reference path:
@@ -135,21 +137,13 @@ are four separate directions, not variations on one — nothing below is a phase
 
 ## Recommended order
 
-**Layer sharing phase 2 (variable loop count), then distillation, then quantization if something
-still doesn't fit, then MoE.** Phase 2 goes first by explicit choice, not because it is low-risk —
-it is the opposite of phase 1 in that respect: it needs real new mechanics (sampling the loop count
-during training, truncated backprop through the recurrence, the stability care that comes with
-applying the same weights many times in sequence) and there is no evidence yet that it pays off at
-this app's small scale the way it does at the paper's. It goes first anyway because it is a direct
-continuation of what phase 1 just built rather than a new seam to open, and because it is worth
-knowing early whether the payoff is real here before committing to it as a direction. Distillation
-keeps its own reasoning from before: a loss-function change, CPU-prototypable end to end before any
-WGSL, and the direct answer to what the Remote training backend already makes possible — more
-effective capability on a small local machine. Quantization only pays off once something
-distillation or a MoE assembly produces is actually too big for the machine running it; built in
-isolation now, ahead of that need, it would be optimizing a size that isn't yet a problem. MoE is
-real, well-scoped work whenever it's picked up, but the model library already delivers most of its
-practical value today.
+**Distillation, then quantization if something still doesn't fit, then MoE.** Distillation goes
+first: a loss-function change, CPU-prototypable end to end before any WGSL, and the direct answer
+to what the Remote training backend already makes possible — more effective capability on a small
+local machine. Quantization only pays off once something distillation or a MoE assembly produces
+is actually too big for the machine running it; built in isolation now, ahead of that need, it
+would be optimizing a size that isn't yet a problem. MoE is real, well-scoped work whenever it's
+picked up, but the model library already delivers most of its practical value today.
 
 Whichever of these is implemented, the same practice applies: prototype on the CPU path first —
 implemented in `llm-core`, verified against the gradient-check test — *before* a line of WGSL is

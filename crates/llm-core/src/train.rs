@@ -18,7 +18,7 @@
 // below, which is feature-gated (see this crate's Cargo.toml) — gated
 // the same way so an unused-import warning doesn't follow it.
 #[cfg(feature = "native-trainer")]
-use crate::config::ModelConfig;
+use crate::config::{LayerLayout, LayerSharing, ModelConfig};
 #[cfg(feature = "native-trainer")]
 use crate::corpus::{Batch, Corpus};
 #[cfg(feature = "native-trainer")]
@@ -348,7 +348,17 @@ impl Trainer {
         train: &TrainConfig,
     ) -> Option<StepReport> {
         let batch = corpus.sample_batch(batch_size, self.config.context_len, &mut self.rng)?;
-        let total_loss = self.accumulate_gradients(&batch);
+        // Sampled once per step, not per sequence: every sequence in this
+        // batch decodes at the same depth. `RecurrentCore` needs the
+        // model to see a variety of depths across steps to learn to
+        // produce a usable state at any of them (Geiping et al. 2025);
+        // sampling per-example instead, as the paper does, would need a
+        // batch's sequences to run different depths in the same step,
+        // which this app's one-sequence-at-a-time accumulation doesn't
+        // need to pay for — see PLAN.md.
+        let core_loops = sample_core_loops(&self.config, &mut self.rng);
+        let layout = self.config.layer_layout(core_loops);
+        let total_loss = self.accumulate_gradients(&batch, &layout);
         self.grad_accum.scale_(1.0 / batch.batch_size as f32);
         let grad_norm = model::clip_global_norm(&mut self.grad_accum, train.grad_clip);
         let lr = train.lr_at(self.step);
@@ -365,12 +375,12 @@ impl Trainer {
     /// Forward + backward over every sequence in `batch`, leaving the
     /// summed (not yet averaged) gradient in `self.grad_accum` and
     /// returning the summed loss.
-    fn accumulate_gradients(&mut self, batch: &Batch) -> f32 {
+    fn accumulate_gradients(&mut self, batch: &Batch, layout: &LayerLayout) -> f32 {
         #[cfg(not(target_arch = "wasm32"))]
         {
             let workers = self.threads.min(batch.batch_size);
             if workers > 1 {
-                return self.accumulate_gradients_threaded(batch, workers);
+                return self.accumulate_gradients_threaded(batch, workers, layout);
             }
         }
         self.grad_accum.zero_();
@@ -382,13 +392,14 @@ impl Trainer {
                 batch,
                 b,
                 &mut self.grad_accum,
+                layout,
             );
         }
         total
     }
 
     #[cfg(not(target_arch = "wasm32"))]
-    fn accumulate_gradients_threaded(&mut self, batch: &Batch, workers: usize) -> f32 {
+    fn accumulate_gradients_threaded(&mut self, batch: &Batch, workers: usize, layout: &LayerLayout) -> f32 {
         while self.worker_grads.len() < workers {
             self.worker_grads.push(Gradients::zeros(&self.config));
         }
@@ -409,7 +420,7 @@ impl Trainer {
                     grad.zero_();
                     let mut total = 0.0f32;
                     for b in lo..hi {
-                        total += Self::sequence_backward(weights, config, batch, b, grad);
+                        total += Self::sequence_backward(weights, config, batch, b, grad, layout);
                     }
                     total
                 }));
@@ -426,23 +437,40 @@ impl Trainer {
 
     /// One sequence's forward, loss, and backward, accumulated into
     /// `grads`. Free-standing (no `&self`) so worker threads can call it
-    /// while holding a shared borrow of the weights.
+    /// while holding a shared borrow of the weights. `layout` is this
+    /// step's depth (the same for every sequence in the batch — see
+    /// `train_step_with`).
     fn sequence_backward(
         weights: &ModelWeights,
         config: &ModelConfig,
         batch: &Batch,
         b: usize,
         grads: &mut Gradients,
+        layout: &LayerLayout,
     ) -> f32 {
         let start = b * batch.context_len;
         let input = &batch.inputs[start..start + batch.context_len];
         let target = &batch.targets[start..start + batch.context_len];
 
-        let (logits, cache) = model::forward(weights, config, input);
+        let (logits, cache) = model::forward(weights, config, input, layout);
         let (loss, d_logits) =
             ops::cross_entropy(&logits, target, batch.context_len, config.vocab_size());
         model::backward_into(weights, config, &cache, &d_logits, grads);
         loss
+    }
+}
+
+/// This step's core loop count, sampled uniformly from
+/// `core_loop_min..=core_loop_max` — `None` (meaning "every depth
+/// position, as usual") unless `layer_sharing` is `RecurrentCore`.
+#[cfg(feature = "native-trainer")]
+fn sample_core_loops(config: &ModelConfig, rng: &mut Rng) -> Option<usize> {
+    match config.layer_sharing {
+        LayerSharing::RecurrentCore { core_loop_min, core_loop_max, .. } => {
+            let span = core_loop_max.saturating_sub(core_loop_min) + 1;
+            Some(core_loop_min + rng.gen_range(span))
+        }
+        LayerSharing::Off | LayerSharing::UniformGroups { .. } => None,
     }
 }
 
@@ -452,7 +480,7 @@ mod tests {
 
     #[cfg(feature = "native-trainer")]
     fn tiny_config() -> ModelConfig {
-        ModelConfig { num_layers: 2, unique_layers: 2, hidden_dim: 8, num_heads: 2, num_kv_heads: 1, context_len: 8, local_window: 8, ..Default::default() }
+        ModelConfig { num_layers: 2, hidden_dim: 8, num_heads: 2, num_kv_heads: 1, context_len: 8, local_window: 8, ..Default::default() }
     }
 
     #[cfg(feature = "native-trainer")]

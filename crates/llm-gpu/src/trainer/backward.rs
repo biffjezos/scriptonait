@@ -10,10 +10,20 @@ use super::dispatch::Chunks;
 use super::layout::{T_ATTN_GAIN, T_MLP_GAIN, T_WK, T_WO, T_WQ, T_WV, T_W_DOWN, T_W_GATE, T_W_UP};
 use super::GpuTrainer;
 
+use llm_core::config::LayerLayout;
 use llm_core::ops;
 
 impl GpuTrainer {
-    pub(super) fn encode_backward(&self, chunks: &mut Chunks, ctx: &GpuContext, scatter_groups: usize) {
+    /// `layout` must be the same one `encode_forward` ran this step with
+    /// — see that method's doc comment on why `self.acts` can hold more
+    /// depth positions than a given step actually uses.
+    pub(super) fn encode_backward(
+        &self,
+        chunks: &mut Chunks,
+        ctx: &GpuContext,
+        scatter_groups: usize,
+        layout: &LayerLayout,
+    ) {
         let t = self.t_len;
         let c = &self.config;
         let (h, kv, ffn, vocab) = (c.hidden_dim, c.kv_dim(), c.ffn_dim(), c.vocab_size());
@@ -44,18 +54,20 @@ impl GpuTrainer {
             h,
         );
 
-        for l in (0..c.num_layers).rev() {
+        for l in (0..layout.depth()).rev() {
             let acts = &self.acts[l];
-            // `l` is a depth position; `g` is which of `unique_layers`
-            // weight sets answers for it (see `forward.rs`'s matching
-            // comment). Every backward dispatch below accumulates into
-            // its destination rather than overwriting (see
-            // `linear_bwd_dw.wgsl`'s and `rmsnorm_bwd_dgain.wgsl`'s own
-            // comments) — the same accumulation a batch's sequences
-            // already rely on — so multiple depths sharing group `g` add
-            // their gradients into the same `grads.layer(g, ..)` buffer
-            // correctly, in whatever order the depths are visited.
-            let g = c.layer_group(l);
+            // `l` is a depth position; `g` is which of
+            // `unique_layer_count()` weight sets answers for it (see
+            // `forward.rs`'s matching comment). Every backward dispatch
+            // below accumulates into its destination rather than
+            // overwriting (see `linear_bwd_dw.wgsl`'s and
+            // `rmsnorm_bwd_dgain.wgsl`'s own comments) — the same
+            // accumulation a batch's sequences already rely on — so
+            // multiple depths sharing group `g` add their gradients into
+            // the same `grads.layer(g, ..)` buffer correctly, in whatever
+            // order the depths are visited (including every one of a
+            // `RecurrentCore` core's own repetitions).
+            let g = layout.group(l);
 
             // --- MLP branch --- (mirrors
             // `llm_core::model::layer::LayerWeights::ffn_backward`; see

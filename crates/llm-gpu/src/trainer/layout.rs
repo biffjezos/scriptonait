@@ -66,7 +66,7 @@ impl ParamSet {
     pub(super) fn shapes(config: &ModelConfig) -> Vec<(&'static str, usize, bool)> {
         let (h, ffn, kv, vocab) = (config.hidden_dim, config.ffn_dim(), config.kv_dim(), config.vocab_size());
         let mut out = vec![("embed", vocab * h, true)];
-        for _ in 0..config.unique_layers {
+        for _ in 0..config.unique_layer_count() {
             out.extend_from_slice(&[
                 ("attn_norm_gain", h, false),
                 ("wq", h * h, true),
@@ -124,16 +124,17 @@ impl ParamSet {
         &self.slots[0].buffer
     }
 
-    /// `group` is a *weight-group* index (`0..unique_layers`), not a depth
-    /// position — callers walking depth positions (`0..num_layers`) must
-    /// resolve one to the other via `ModelConfig::layer_group` first, the
-    /// same way `ModelWeights.layers[group]` does on the CPU side.
+    /// `group` is a *weight-group* index (`0..unique_layer_count()`), not
+    /// a depth position — callers walking depth positions (a step's
+    /// `LayerLayout`) must resolve one to the other via
+    /// `LayerLayout::group` first, the same way `ModelWeights.layers
+    /// [group]` does on the CPU side.
     pub(super) fn layer(&self, group: usize, which: usize) -> &wgpu::Buffer {
         &self.slots[1 + group * TENSORS_PER_LAYER + which].buffer
     }
 
     pub(super) fn final_gain(&self, config: &ModelConfig) -> &wgpu::Buffer {
-        &self.slots[1 + config.unique_layers * TENSORS_PER_LAYER].buffer
+        &self.slots[1 + config.unique_layer_count() * TENSORS_PER_LAYER].buffer
     }
 }
 

@@ -18,6 +18,7 @@ draw.
 | Setting | Meaning |
 |---|---|
 | Device | GPU (default) or CPU for this generation |
+| Core loops | Depth to decode at, when the loaded model's Layer sharing is Recurrent core (see [model.md](model.md)) — any value the model was trained across, no retraining needed |
 | Temperature | Logit scaling before sampling; 0 forces greedy (always the top token) |
 | Top-k | Keep only the k most likely tokens |
 | Top-p | Keep the smallest set of tokens whose cumulative probability reaches p (nucleus sampling). Holtzman, Buys, Du, Forbes & Choi, *The Curious Case of Neural Text Degeneration*, 2020 (arXiv:1904.09751) |

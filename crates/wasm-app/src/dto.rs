@@ -5,8 +5,50 @@
 
 use wasm_bindgen::prelude::*;
 
+use llm_core::config::LayerSharing;
 use llm_core::generate::StopReason;
 use llm_core::instruct;
+
+/// `LayerSharing` at the JS boundary: a `mode` tag (0 = Off, 1 =
+/// UniformGroups, 2 = RecurrentCore) plus every variant's own numbers,
+/// unused ones ignored — the same tag scheme `checkpoint.rs` uses on
+/// disk, kept consistent rather than inventing a second one here.
+pub(crate) fn layer_sharing_from_raw(
+    mode: u32,
+    unique_layers: u32,
+    prelude_layers: u32,
+    coda_layers: u32,
+    core_loop_min: u32,
+    core_loop_max: u32,
+) -> LayerSharing {
+    match mode {
+        1 => LayerSharing::UniformGroups { unique_layers: unique_layers.max(1) as usize },
+        2 => LayerSharing::RecurrentCore {
+            prelude_layers: prelude_layers as usize,
+            coda_layers: coda_layers as usize,
+            core_loop_min: core_loop_min.max(1) as usize,
+            core_loop_max: core_loop_max.max(1) as usize,
+        },
+        _ => LayerSharing::Off,
+    }
+}
+
+/// The inverse of `layer_sharing_from_raw`, for reporting a model's own
+/// shape back to JS via `ModelInfo`.
+pub(crate) fn layer_sharing_to_raw(sharing: LayerSharing) -> (u32, u32, u32, u32, u32, u32) {
+    match sharing {
+        LayerSharing::Off => (0, 0, 0, 0, 0, 0),
+        LayerSharing::UniformGroups { unique_layers } => (1, unique_layers as u32, 0, 0, 0, 0),
+        LayerSharing::RecurrentCore { prelude_layers, coda_layers, core_loop_min, core_loop_max } => (
+            2,
+            0,
+            prelude_layers as u32,
+            coda_layers as u32,
+            core_loop_min as u32,
+            core_loop_max as u32,
+        ),
+    }
+}
 
 /// Encode `s` as a JSON string literal, quotes included.
 ///
@@ -62,10 +104,18 @@ pub struct SourceStats {
 #[wasm_bindgen]
 pub struct ModelInfo {
     pub layers: u32,
-    /// How many of `layers` depth positions are actually distinct weight
-    /// sets (ALBERT-style static layer sharing — see
-    /// `ModelConfig::layer_group`). Equal to `layers` when sharing is off.
+    /// `LayerSharing` as a JS-friendly tag + fields — see
+    /// `layer_sharing_to_raw`. `layer_sharing_mode`: 0 = Off, 1 =
+    /// UniformGroups (ALBERT-style static grouping), 2 = RecurrentCore
+    /// (Geiping et al. 2025's variable loop count). `unique_layers` is
+    /// UniformGroups' own field; `prelude_layers`/`coda_layers`/
+    /// `core_loop_min`/`core_loop_max` are RecurrentCore's.
+    pub layer_sharing_mode: u32,
     pub unique_layers: u32,
+    pub prelude_layers: u32,
+    pub coda_layers: u32,
+    pub core_loop_min: u32,
+    pub core_loop_max: u32,
     pub hidden: u32,
     pub heads: u32,
     pub kv_heads: u32,

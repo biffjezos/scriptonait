@@ -70,11 +70,19 @@ impl WasmLLM {
 
     /// A fresh, untrained model — the "train one from scratch on my own
     /// text" path, kept for people who want it.
+    /// `layer_sharing_mode`/`unique_layers`/`prelude_layers`/
+    /// `coda_layers`/`core_loop_min`/`core_loop_max`: see
+    /// `dto::layer_sharing_from_raw`.
     #[wasm_bindgen(constructor)]
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         num_layers: u32,
+        layer_sharing_mode: u32,
         unique_layers: u32,
+        prelude_layers: u32,
+        coda_layers: u32,
+        core_loop_min: u32,
+        core_loop_max: u32,
         hidden_dim: u32,
         num_heads: u32,
         num_kv_heads: u32,
@@ -91,7 +99,14 @@ impl WasmLLM {
             context_len: context_len as usize,
             local_window: local_window as usize,
             vocab_size: tokenizer.vocab_size(),
-            unique_layers: unique_layers.max(1) as usize,
+            layer_sharing: crate::dto::layer_sharing_from_raw(
+                layer_sharing_mode,
+                unique_layers,
+                prelude_layers,
+                coda_layers,
+                core_loop_min,
+                core_loop_max,
+            ),
             ..Default::default()
         };
         config.validate().map_err(js_err)?;
@@ -117,9 +132,16 @@ impl WasmLLM {
     pub fn info(&self) -> ModelInfo {
         let inner = self.0.borrow();
         let config = inner.config;
+        let (layer_sharing_mode, unique_layers, prelude_layers, coda_layers, core_loop_min, core_loop_max) =
+            crate::dto::layer_sharing_to_raw(config.layer_sharing);
         ModelInfo {
             layers: config.num_layers as u32,
-            unique_layers: config.unique_layers as u32,
+            layer_sharing_mode,
+            unique_layers,
+            prelude_layers,
+            coda_layers,
+            core_loop_min,
+            core_loop_max,
             hidden: config.hidden_dim as u32,
             heads: config.num_heads as u32,
             kv_heads: config.num_kv_heads as u32,

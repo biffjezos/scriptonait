@@ -15,7 +15,9 @@
 //!           context_len, local_window, vocab_size
 //!   f32     rope_theta
 //!   u32     use_ple (0/1)
-//!   u32     unique_layers, defaults to num_layers if absent (v5+)
+//!   u32     layer sharing: a single `unique_layers` scalar (v5), or a
+//!           tagged `LayerSharing` (v6+, see `write_layer_sharing`);
+//!           absent entirely before v5, which reads as no sharing
 //!   u64     training step the weights are from
 //!   u64     tokens this model has been trained on, cumulative (v3+)
 //!   u32     planned total steps for the schedule, 0 = none set (v4+)
@@ -43,36 +45,44 @@
 //! file.
 
 use crate::bf16::from_bf16;
-use crate::config::ModelConfig;
+use crate::config::{LayerSharing, ModelConfig};
 use crate::model::ModelWeights;
 use crate::tokenizer::Tokenizer;
 
 const MAGIC: &[u8; 4] = b"SCCK";
-/// Version 5 added `unique_layers` (ALBERT-style static layer sharing —
-/// see `ModelConfig::layer_group`): how many *distinct* sets of layer
-/// weights back `num_layers` depth positions, which is also what
-/// `ModelWeights.layers.len()` now is instead of always equaling
-/// `num_layers`. Absent on older files, which predate sharing entirely —
-/// they read as `unique_layers = num_layers`, today's behavior exactly.
-/// Version 4 added the schedule's planned-step target and the plateau-cut
+/// Version 6 widened `layer_sharing` from v5's plain `unique_layers`
+/// scalar (ALBERT-style static grouping only) to a tagged `LayerSharing`
+/// that can also describe `RecurrentCore` (Geiping et al. 2025 — see
+/// `ModelConfig`'s own docs), which needs more than one number
+/// (`prelude_layers`, `coda_layers`, `core_loop_min`, `core_loop_max`).
+/// See `write_layer_sharing`/`read_layer_sharing`. A v5 file's single
+/// scalar still loads: equal to `num_layers` reads as `Off`, anything
+/// smaller as `UniformGroups`.
+///
+/// Version 5 added that scalar in the first place: how many *distinct*
+/// sets of layer weights back `num_layers` depth positions, which is
+/// also what `ModelWeights.layers.len()` now is instead of always
+/// equaling `num_layers`. Absent on older files, which predate sharing
+/// entirely — they read as no sharing, today's behavior exactly. Version
+/// 4 added the schedule's planned-step target and the plateau-cut
 /// multiplier, so a resumed run continues the same absolute schedule
 /// instead of starting a fresh one anchored to whatever step it happened
 /// to resume at. Version 3 added the cumulative token count. Files as old
 /// as version 2 still load; fields newer than the file's version read as
 /// their "not set" default rather than a wrong number.
 ///
-/// Every version so far has only ever added *scalar* fields, read
-/// conditionally by version (see `Checkpoint::from_bytes` below) — even
-/// `unique_layers`, which changes how many tensor groups the *weights*
-/// section holds, is itself just one more scalar in the fixed header. A
-/// future architecture needing a variable number of tensor groups *per
-/// layer* (Mixture-of-Experts: N sets of FFN weights per layer instead of
-/// one — see `llm_core::model::layer`'s `ffn_forward` and this crate's
-/// `PLAN.md`) would extend this the same way: bump `VERSION`, add a
-/// conditionally-read field (an expert count), and teach
-/// `ModelWeights::from_bytes` to size itself from it. Not done here —
-/// there is no expert count to store yet.
-const VERSION: u32 = 5;
+/// Every version so far has only ever added *scalar* fields (or, as of
+/// v6, one small tagged group of them), read conditionally by version
+/// (see `Checkpoint::from_bytes` below) — layer sharing, even at its
+/// largest (`RecurrentCore`'s four numbers), is still a fixed, bounded
+/// shape in the header, not a variable number of tensor groups. A future
+/// architecture needing that (Mixture-of-Experts: N sets of FFN weights
+/// per layer instead of one — see `llm_core::model::layer`'s
+/// `ffn_forward` and this crate's `PLAN.md`) would extend this the same
+/// way: bump `VERSION`, add a conditionally-read field (an expert count),
+/// and teach `ModelWeights::from_bytes` to size itself from it. Not done
+/// here — there is no expert count to store yet.
+const VERSION: u32 = 6;
 const MIN_READABLE_VERSION: u32 = 2;
 
 /// How the weights are stored in a checkpoint file.
@@ -175,7 +185,7 @@ pub fn write_checkpoint(
     }
     out.extend_from_slice(&config.rope_theta.to_le_bytes());
     out.extend_from_slice(&u32::from(config.use_ple).to_le_bytes());
-    out.extend_from_slice(&(config.unique_layers as u32).to_le_bytes());
+    write_layer_sharing(&mut out, config.layer_sharing);
     out.extend_from_slice(&step.to_le_bytes());
     out.extend_from_slice(&tokens_seen.to_le_bytes());
     out.extend_from_slice(&planned_steps.to_le_bytes());
@@ -186,6 +196,41 @@ pub fn write_checkpoint(
     out.extend_from_slice(&(weight_len as u32).to_le_bytes());
     weights.write_into(&mut out, bf16);
     out
+}
+
+/// `LayerSharing` (v6+): a tag, then that variant's own numbers.
+/// `Off` is exactly one u32 wide, the same width v5's plain
+/// `unique_layers` scalar always was — which is what lets the v2/v3/v4
+/// "still loads" tests below cut precisely that width to simulate a file
+/// with no layer-sharing field at all, unchanged by this version bump.
+fn write_layer_sharing(out: &mut Vec<u8>, sharing: LayerSharing) {
+    match sharing {
+        LayerSharing::Off => out.extend_from_slice(&0u32.to_le_bytes()),
+        LayerSharing::UniformGroups { unique_layers } => {
+            out.extend_from_slice(&1u32.to_le_bytes());
+            out.extend_from_slice(&(unique_layers as u32).to_le_bytes());
+        }
+        LayerSharing::RecurrentCore { prelude_layers, coda_layers, core_loop_min, core_loop_max } => {
+            out.extend_from_slice(&2u32.to_le_bytes());
+            for value in [prelude_layers, coda_layers, core_loop_min, core_loop_max] {
+                out.extend_from_slice(&(value as u32).to_le_bytes());
+            }
+        }
+    }
+}
+
+fn read_layer_sharing(r: &mut Reader) -> Result<LayerSharing, String> {
+    match r.u32()? {
+        0 => Ok(LayerSharing::Off),
+        1 => Ok(LayerSharing::UniformGroups { unique_layers: r.u32()? as usize }),
+        2 => Ok(LayerSharing::RecurrentCore {
+            prelude_layers: r.u32()? as usize,
+            coda_layers: r.u32()? as usize,
+            core_loop_min: r.u32()? as usize,
+            core_loop_max: r.u32()? as usize,
+        }),
+        other => Err(format!("unknown layer sharing tag {other}")),
+    }
 }
 
 impl Checkpoint {
@@ -229,9 +274,22 @@ impl Checkpoint {
         let vocab_size = r.u32()? as usize;
         let rope_theta = r.f32()?;
         let use_ple = r.u32()? != 0;
-        // Absent before version 5: no layer sharing existed, so every
-        // depth position was its own unique layer.
-        let unique_layers = if version >= 5 { r.u32()? as usize } else { num_layers };
+        // Absent before version 5: no layer sharing existed at all. v5
+        // stored a bare `unique_layers` scalar (ALBERT-style grouping
+        // only); v6 widened it to a tagged `LayerSharing` that can also
+        // describe `RecurrentCore`.
+        let layer_sharing = if version >= 6 {
+            read_layer_sharing(&mut r)?
+        } else if version == 5 {
+            let unique_layers = r.u32()? as usize;
+            if unique_layers == num_layers {
+                LayerSharing::Off
+            } else {
+                LayerSharing::UniformGroups { unique_layers }
+            }
+        } else {
+            LayerSharing::Off
+        };
         let config = ModelConfig {
             num_layers,
             hidden_dim,
@@ -242,7 +300,7 @@ impl Checkpoint {
             vocab_size,
             rope_theta,
             use_ple,
-            unique_layers,
+            layer_sharing,
         };
         config.validate().map_err(|e| format!("checkpoint config is invalid: {e}"))?;
         let step = r.u64()?;
@@ -336,7 +394,6 @@ mod tests {
         let tokenizer = Tokenizer::train(&[&"the cave and the fire and the shadows. ".repeat(30)], 320);
         let config = ModelConfig {
             num_layers: 2,
-            unique_layers: 2,
             hidden_dim: 16,
             num_heads: 4,
             num_kv_heads: 2,
@@ -345,6 +402,7 @@ mod tests {
             vocab_size: tokenizer.vocab_size(),
             rope_theta: 50000.0,
             use_ple: false,
+            layer_sharing: LayerSharing::Off,
         };
         let weights = ModelWeights::init(&config, 5);
         Checkpoint {
@@ -377,15 +435,15 @@ mod tests {
     fn a_version_2_checkpoint_still_loads() {
         let mut bytes = sample().to_bytes();
         bytes[4..8].copy_from_slice(&2u32.to_le_bytes());
-        // v2 predates both unique_layers (v5) and tokens_seen/
+        // v2 predates both the layer-sharing field (v5) and tokens_seen/
         // planned_steps/plateau_scale (v3/v4) — cut the later range first
         // so the earlier one's offset stays valid.
-        let unique_layers_at = 8 + 7 * 4 + 4 + 4;
-        let step_at = unique_layers_at + 4;
+        let layer_sharing_at = 8 + 7 * 4 + 4 + 4;
+        let step_at = layer_sharing_at + 4;
         bytes.drain(step_at + 8..step_at + 8 + 8 + 4 + 4);
-        bytes.drain(unique_layers_at..unique_layers_at + 4);
+        bytes.drain(layer_sharing_at..layer_sharing_at + 4);
         let restored = Checkpoint::from_bytes(&bytes).expect("version 2 should still load");
-        assert_eq!(restored.config.unique_layers, restored.config.num_layers);
+        assert_eq!(restored.config.layer_sharing, LayerSharing::Off);
         assert_eq!(restored.step, 4242);
         assert_eq!(restored.tokens_seen, 0);
         assert_eq!(restored.planned_steps, 0);
@@ -398,21 +456,21 @@ mod tests {
     fn a_version_3_checkpoint_still_loads() {
         let mut bytes = sample().to_bytes();
         bytes[4..8].copy_from_slice(&3u32.to_le_bytes());
-        // v3 predates both unique_layers (v5) and planned_steps/
+        // v3 predates both the layer-sharing field (v5) and planned_steps/
         // plateau_scale (v4), but does have tokens_seen (v3).
-        let unique_layers_at = 8 + 7 * 4 + 4 + 4;
-        let tokens_seen_at = unique_layers_at + 4 + 8;
+        let layer_sharing_at = 8 + 7 * 4 + 4 + 4;
+        let tokens_seen_at = layer_sharing_at + 4 + 8;
         bytes.drain(tokens_seen_at + 8..tokens_seen_at + 8 + 4 + 4);
-        bytes.drain(unique_layers_at..unique_layers_at + 4);
+        bytes.drain(layer_sharing_at..layer_sharing_at + 4);
         let restored = Checkpoint::from_bytes(&bytes).expect("version 3 should still load");
-        assert_eq!(restored.config.unique_layers, restored.config.num_layers);
+        assert_eq!(restored.config.layer_sharing, LayerSharing::Off);
         assert_eq!(restored.step, 4242);
         assert_eq!(restored.tokens_seen, 9_000_000);
         assert_eq!(restored.planned_steps, 0);
         assert_eq!(restored.plateau_scale, 1.0);
     }
 
-    /// A file written before `unique_layers` existed (but with the
+    /// A file written before the layer-sharing field existed (but with the
     /// schedule fields already present) still loads, falling back to
     /// "every depth position is its own unique layer" — today's behavior
     /// before sharing existed at all.
@@ -420,25 +478,80 @@ mod tests {
     fn a_version_4_checkpoint_still_loads() {
         let mut bytes = sample().to_bytes();
         bytes[4..8].copy_from_slice(&4u32.to_le_bytes());
-        let unique_layers_at = 8 + 7 * 4 + 4 + 4;
-        bytes.drain(unique_layers_at..unique_layers_at + 4);
+        let layer_sharing_at = 8 + 7 * 4 + 4 + 4;
+        bytes.drain(layer_sharing_at..layer_sharing_at + 4);
         let restored = Checkpoint::from_bytes(&bytes).expect("version 4 should still load");
-        assert_eq!(restored.config.unique_layers, restored.config.num_layers);
+        assert_eq!(restored.config.layer_sharing, LayerSharing::Off);
         assert_eq!(restored.step, 4242);
         assert_eq!(restored.tokens_seen, 9_000_000);
         assert_eq!(restored.planned_steps, 23_000);
         assert_eq!(restored.plateau_scale, 0.5);
     }
 
+    /// A version 5 file's plain `unique_layers` scalar (the only shape of
+    /// sharing that existed before v6's tagged `LayerSharing`) still
+    /// loads, translated into the equivalent `UniformGroups` — or `Off`
+    /// when the stored value just equals `num_layers`, the "no sharing"
+    /// case v5 had no dedicated tag for.
     #[test]
-    fn checkpoint_round_trips_with_shared_layers() {
+    fn a_version_5_checkpoint_with_sharing_still_loads() {
+        // The weights have to actually be sized for the sharing this
+        // simulated v5 header claims (1 unique layer, not num_layers'
+        // 2) — unlike the `without_sharing` sibling below, this can't
+        // reuse `sample()`'s Off-shaped weights unchanged.
+        let mut original = sample();
+        original.config.layer_sharing = LayerSharing::UniformGroups { unique_layers: 1 };
+        original.weights = ModelWeights::init(&original.config, 5);
+        let mut bytes = original.to_bytes();
+        bytes[4..8].copy_from_slice(&5u32.to_le_bytes());
+        // v6 wrote this as `[tag=1][unique_layers=1]`; v5 has no tag, just
+        // the bare scalar — drop the tag word and keep the value.
+        let layer_sharing_at = 8 + 7 * 4 + 4 + 4;
+        bytes.drain(layer_sharing_at..layer_sharing_at + 4);
+        let restored = Checkpoint::from_bytes(&bytes).expect("version 5 should still load");
+        assert_eq!(
+            restored.config.layer_sharing,
+            LayerSharing::UniformGroups { unique_layers: 1 }
+        );
+        assert_eq!(restored.weights.layers.len(), 1);
+    }
+
+    #[test]
+    fn a_version_5_checkpoint_without_sharing_still_loads() {
+        let mut bytes = sample().to_bytes(); // num_layers: 2
+        bytes[4..8].copy_from_slice(&5u32.to_le_bytes());
+        let layer_sharing_at = 8 + 7 * 4 + 4 + 4;
+        bytes[layer_sharing_at..layer_sharing_at + 4].copy_from_slice(&2u32.to_le_bytes());
+        let restored = Checkpoint::from_bytes(&bytes).expect("version 5 should still load");
+        assert_eq!(restored.config.layer_sharing, LayerSharing::Off);
+    }
+
+    #[test]
+    fn checkpoint_round_trips_with_uniform_groups() {
         let mut original = sample();
         original.config.num_layers = 4;
-        original.config.unique_layers = 2;
+        original.config.layer_sharing = LayerSharing::UniformGroups { unique_layers: 2 };
         original.weights = ModelWeights::init(&original.config, 5);
         let restored = Checkpoint::from_bytes(&original.to_bytes()).unwrap();
         assert_eq!(restored.config, original.config);
         assert_eq!(restored.weights.layers.len(), 2);
+        assert_eq!(restored.weights.to_bytes(), original.weights.to_bytes());
+    }
+
+    #[test]
+    fn checkpoint_round_trips_with_recurrent_core() {
+        let mut original = sample();
+        original.config.num_layers = 5; // 1 prelude + 3 max loops + 1 coda
+        original.config.layer_sharing = LayerSharing::RecurrentCore {
+            prelude_layers: 1,
+            coda_layers: 1,
+            core_loop_min: 1,
+            core_loop_max: 3,
+        };
+        original.weights = ModelWeights::init(&original.config, 5);
+        let restored = Checkpoint::from_bytes(&original.to_bytes()).unwrap();
+        assert_eq!(restored.config, original.config);
+        assert_eq!(restored.weights.layers.len(), 3); // prelude + core + coda
         assert_eq!(restored.weights.to_bytes(), original.weights.to_bytes());
     }
 

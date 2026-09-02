@@ -99,6 +99,10 @@ pub struct Response {
 ///
 /// `on_progress` is called with each new piece of text and the running
 /// word count; returning `false` stops early (a Stop button).
+///
+/// `core_loops`: see `generate::Generator::new` — the depth to decode at
+/// when `config.layer_sharing` is `RecurrentCore`, ignored otherwise.
+#[allow(clippy::too_many_arguments)]
 pub fn generate_response(
     weights: &ModelWeights,
     config: &ModelConfig,
@@ -106,6 +110,7 @@ pub fn generate_response(
     request: &Request,
     sampling: &SamplingConfig,
     max_tokens_override: Option<usize>,
+    core_loops: Option<usize>,
     on_progress: &mut dyn FnMut(&str, usize) -> bool,
 ) -> Response {
     let prompt_tokens = request.to_prompt_tokens(tokenizer);
@@ -119,6 +124,7 @@ pub fn generate_response(
         &prompt_tokens,
         max_new_tokens,
         sampling,
+        core_loops,
         &mut |piece, _| {
             let keep_going = guard.observe(piece);
             if !on_progress(piece, guard.words()) {
@@ -170,6 +176,7 @@ pub struct ResponseSession<'a> {
 }
 
 impl<'a> ResponseSession<'a> {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         weights: &'a ModelWeights,
         config: &'a ModelConfig,
@@ -177,11 +184,12 @@ impl<'a> ResponseSession<'a> {
         request: &Request,
         sampling: SamplingConfig,
         max_tokens_override: Option<usize>,
+        core_loops: Option<usize>,
     ) -> Self {
         let prompt_tokens = request.to_prompt_tokens(tokenizer);
         let guard = LengthGuard::new(request.target_words);
         let max_new_tokens = max_tokens_override.unwrap_or_else(|| guard.token_budget());
-        let generator = generate::Generator::new(weights, config, &prompt_tokens, sampling.seed);
+        let generator = generate::Generator::new(weights, config, &prompt_tokens, sampling.seed, core_loops);
         Self {
             generator,
             tokenizer,
@@ -323,7 +331,6 @@ mod tests {
         // whether the model ever produces a sentence boundary.
         let config = ModelConfig {
             num_layers: 1,
-            unique_layers: 1,
             hidden_dim: 16,
             num_heads: 2,
             num_kv_heads: 1,
@@ -346,6 +353,7 @@ mod tests {
             &request,
             &SamplingConfig { seed: 1, ..Default::default() },
             None,
+            None,
             &mut |_, _| true,
         );
         assert!(
@@ -359,7 +367,6 @@ mod tests {
     fn max_tokens_override_is_a_hard_ceiling_regardless_of_the_word_target() {
         let config = ModelConfig {
             num_layers: 1,
-            unique_layers: 1,
             hidden_dim: 16,
             num_heads: 2,
             num_kv_heads: 1,
@@ -391,6 +398,7 @@ mod tests {
             &request,
             &SamplingConfig { seed: 1, ..Default::default() },
             Some(5),
+            None,
             &mut |_, _| {
                 pieces += 1;
                 true
@@ -406,7 +414,6 @@ mod tests {
     fn a_progress_callback_can_stop_generation() {
         let config = ModelConfig {
             num_layers: 1,
-            unique_layers: 1,
             hidden_dim: 8,
             num_heads: 2,
             num_kv_heads: 2,
@@ -423,6 +430,7 @@ mod tests {
             &Tokenizer::byte_level(),
             &request,
             &SamplingConfig::default(),
+            None,
             None,
             &mut |_, _| {
                 pieces += 1;
@@ -441,7 +449,6 @@ mod tests {
         // and in the final `Response`.
         let config = ModelConfig {
             num_layers: 1,
-            unique_layers: 1,
             hidden_dim: 16,
             num_heads: 2,
             num_kv_heads: 1,
@@ -460,12 +467,12 @@ mod tests {
         let sampling = SamplingConfig { seed: 1, ..Default::default() };
 
         let mut expected_pieces = Vec::new();
-        let expected = generate_response(&weights, &config, &t, &request, &sampling, None, &mut |piece, _| {
+        let expected = generate_response(&weights, &config, &t, &request, &sampling, None, None, &mut |piece, _| {
             expected_pieces.push(piece.to_string());
             true
         });
 
-        let mut session = ResponseSession::new(&weights, &config, &t, &request, sampling, None);
+        let mut session = ResponseSession::new(&weights, &config, &t, &request, sampling, None, None);
         let mut actual_pieces = Vec::new();
         loop {
             let (piece, reason) = session.step();
@@ -492,7 +499,6 @@ mod tests {
     fn response_session_cancel_matches_a_progress_callback_stopping_early() {
         let config = ModelConfig {
             num_layers: 1,
-            unique_layers: 1,
             hidden_dim: 8,
             num_heads: 2,
             num_kv_heads: 2,
@@ -504,7 +510,7 @@ mod tests {
         let request = parse_prompt("a 500 word story about rain");
         let t = Tokenizer::byte_level();
         let mut session =
-            ResponseSession::new(&weights, &config, &t, &request, SamplingConfig::default(), None);
+            ResponseSession::new(&weights, &config, &t, &request, SamplingConfig::default(), None, None);
         let mut pieces = 0;
         loop {
             let (_, reason) = session.step();

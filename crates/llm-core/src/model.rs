@@ -20,7 +20,9 @@ pub use optimizer::{clip_global_norm, AdamState, ADAM_BETA1, ADAM_BETA2, ADAM_EP
 
 use layer::LayerCache;
 
-use crate::config::ModelConfig;
+use crate::config::{LayerLayout, ModelConfig};
+#[cfg(test)]
+use crate::config::LayerSharing;
 use crate::ops;
 use crate::rng::Rng;
 
@@ -42,7 +44,7 @@ impl ModelWeights {
         let v = config.vocab_size();
         Self {
             embed: vec![0.0; v * h],
-            layers: (0..config.unique_layers).map(|_| LayerWeights::zeros(config)).collect(),
+            layers: (0..config.unique_layer_count()).map(|_| LayerWeights::zeros(config)).collect(),
             final_norm_gain: vec![0.0; h],
         }
     }
@@ -55,12 +57,12 @@ impl ModelWeights {
         // keyed to the actual depth of the stack, `num_layers` — every
         // depth position adds into the same residual stream once, whether
         // or not its weights are shared with another position — not to
-        // `unique_layers`, which only says how many distinct weight sets
-        // back those `num_layers` additions.
+        // `unique_layer_count()`, which only says how many distinct
+        // weight sets back those `num_layers` additions.
         let depth = config.num_layers;
         Self {
             embed: (0..v * h).map(|_| rng.next_gaussian() * 0.02).collect(),
-            layers: (0..config.unique_layers)
+            layers: (0..config.unique_layer_count())
                 .map(|_| LayerWeights::init(config, depth, &mut rng))
                 .collect(),
             final_norm_gain: vec![1.0; h],
@@ -204,6 +206,13 @@ fn scatter_add_rows(table_grad: &mut [f32], ids: &[u32], d_rows: &[f32], hidden:
 }
 
 pub struct Cache {
+    /// The depth-to-group layout this forward pass actually ran —
+    /// `backward_into` walks it in reverse rather than being handed a
+    /// fresh one, so a training step's forward and backward always agree
+    /// on which depth positions existed and which weights answered for
+    /// them, even when `layer_sharing` is `RecurrentCore` and that can
+    /// vary from one call to the next.
+    layout: LayerLayout,
     tokens: Vec<u32>,
     layers: Vec<LayerCache>,
     h_final: Vec<f32>, // input to the final rmsnorm
@@ -211,21 +220,27 @@ pub struct Cache {
     final_inv_rms: Vec<f32>,
 }
 
-/// Runs the forward pass for one sequence. `tokens.len()` must be `<=
+/// Runs the forward pass for one sequence over `layout`'s depth positions
+/// (see `ModelConfig::layer_layout`). `tokens.len()` must be `<=
 /// config.context_len`; positions are `0..tokens.len()`.
-pub fn forward(weights: &ModelWeights, config: &ModelConfig, tokens: &[u32]) -> (Vec<f32>, Cache) {
+pub fn forward(
+    weights: &ModelWeights,
+    config: &ModelConfig,
+    tokens: &[u32],
+    layout: &LayerLayout,
+) -> (Vec<f32>, Cache) {
     let t_len = tokens.len();
     let h = config.hidden_dim;
     let vocab = config.vocab_size();
 
     let mut hidden = gather_rows(&weights.embed, tokens, h);
-    // One cache entry per *depth position* (`num_layers`), not per unique
-    // weight set (`weights.layers.len()`, `unique_layers`): activations
-    // differ at every depth even where two positions share a weight set,
-    // and backward needs each depth's own cache to retrace it.
-    let mut layer_caches = Vec::with_capacity(config.num_layers);
-    for depth in 0..config.num_layers {
-        let layer = &weights.layers[config.layer_group(depth)];
+    // One cache entry per *depth position* (`layout.depth()`), not per
+    // unique weight set (`weights.layers.len()`): activations differ at
+    // every depth even where two positions share a weight set, and
+    // backward needs each depth's own cache to retrace it.
+    let mut layer_caches = Vec::with_capacity(layout.depth());
+    for depth in 0..layout.depth() {
+        let layer = &weights.layers[layout.group(depth)];
         layer_caches.push(layer.forward(&mut hidden, tokens, config, t_len));
     }
 
@@ -237,7 +252,14 @@ pub fn forward(weights: &ModelWeights, config: &ModelConfig, tokens: &[u32]) -> 
 
     (
         logits,
-        Cache { tokens: tokens.to_vec(), layers: layer_caches, h_final, final_normed, final_inv_rms },
+        Cache {
+            layout: layout.clone(),
+            tokens: tokens.to_vec(),
+            layers: layer_caches,
+            h_final,
+            final_normed,
+            final_inv_rms,
+        },
     )
 }
 
@@ -259,6 +281,14 @@ struct LayerKv {
 /// same story. That factor is why generation stopped being the part you
 /// wait on.
 pub struct GenCache {
+    /// The layout this generation is decoding at. Fixed for the whole
+    /// generation (Geiping et al. 2025's "pick a depth once" — a KV
+    /// cache entry belongs to a specific depth position, so it makes no
+    /// sense to decode the next token at a different depth than the one
+    /// this cache's keys and values were written under); rebuilding the
+    /// cache (`Generator::maybe_reset_cache`) reuses this same layout
+    /// rather than resampling it.
+    layout: LayerLayout,
     layers: Vec<LayerKv>,
     /// Absolute position of the next token to be generated, which is
     /// also the number of tokens currently cached.
@@ -275,6 +305,10 @@ impl GenCache {
 
     pub fn tokens(&self) -> &[u32] {
         &self.tokens
+    }
+
+    pub fn layout(&self) -> &LayerLayout {
+        &self.layout
     }
 
     pub fn num_layers(&self) -> usize {
@@ -316,20 +350,25 @@ impl GenCache {
     }
 }
 
-/// Run the prompt through the model and build the decoding cache from it.
-/// Returns the logits for the *last* prompt token — the distribution the
-/// first generated token is sampled from.
+/// Run the prompt through the model at `layout`'s depth and build the
+/// decoding cache from it. Returns the logits for the *last* prompt
+/// token — the distribution the first generated token is sampled from.
 ///
 /// `tokens.len()` must be at least 1 and at most `config.context_len`.
-pub fn prefill(weights: &ModelWeights, config: &ModelConfig, tokens: &[u32]) -> (Vec<f32>, GenCache) {
+pub fn prefill(
+    weights: &ModelWeights,
+    config: &ModelConfig,
+    tokens: &[u32],
+    layout: &LayerLayout,
+) -> (Vec<f32>, GenCache) {
     let vocab = config.vocab_size();
-    let (logits, cache) = forward(weights, config, tokens);
+    let (logits, cache) = forward(weights, config, tokens, layout);
     let last = logits[(tokens.len() - 1) * vocab..tokens.len() * vocab].to_vec();
     // `forward` already computed and cached every key and value; moving
     // them into the decoding cache is what makes prefill cost one
     // forward pass rather than two.
     let layers = cache.layers.iter().map(|lc| LayerKv { k: lc.k.clone(), v: lc.v.clone() }).collect();
-    let mut gen = GenCache { layers, pos: tokens.len(), tokens: tokens.to_vec() };
+    let mut gen = GenCache { layout: layout.clone(), layers, pos: tokens.len(), tokens: tokens.to_vec() };
     gen.trim_to_window(config.effective_window(), config.kv_dim());
     (last, gen)
 }
@@ -355,8 +394,8 @@ pub fn decode_step(
 
     let mut hidden = gather_rows(&weights.embed, &[token], h);
 
-    for layer_idx in 0..config.num_layers {
-        let layer = &weights.layers[config.layer_group(layer_idx)];
+    for layer_idx in 0..cache.layout.depth() {
+        let layer = &weights.layers[cache.layout.group(layer_idx)];
         if config.use_ple {
             let ple = gather_rows(&layer.ple, &[token], h);
             for i in 0..h {
@@ -466,16 +505,18 @@ pub fn backward_into(
 
     // Indexed by depth position (`cache.layers`, one entry per depth) and
     // by weight group (`weights.layers`/`grads.layers`, one entry per
-    // `unique_layers`), via `layer_group` — not zipped, since sharing
-    // means those two lengths differ whenever `unique_layers <
-    // num_layers`. Every depth position sharing a group accumulates its
-    // gradient into that one shared `grads.layers[group]` buffer in turn
+    // unique weight set), via `cache.layout` — the same layout `forward`
+    // built this cache with, not a fresh one — since those two lengths
+    // differ whenever sharing is active, and (for `RecurrentCore`) the
+    // grouping itself can differ from one forward pass to the next.
+    // Every depth position sharing a group accumulates its gradient into
+    // that one shared `grads.layers[group]` buffer in turn
     // (`LayerWeights::backward` already accumulates rather than
     // overwrites — the same principle already proven correct by the tied
-    // input/output embedding's own gradient, just extended from 2 uses of
-    // one buffer to `group_size` uses).
-    for depth in (0..config.num_layers).rev() {
-        let group = config.layer_group(depth);
+    // input/output embedding's own gradient, and by the core in
+    // `RecurrentCore` accumulating every one of its own repetitions).
+    for depth in (0..cache.layout.depth()).rev() {
+        let group = cache.layout.group(depth);
         let layer = &weights.layers[group];
         let lc = &cache.layers[depth];
         let lg = &mut grads.layers[group];
@@ -498,7 +539,6 @@ mod tests {
         // still covers the per-layer embedding scatter.
         ModelConfig {
             num_layers: 2,
-            unique_layers: 2,
             hidden_dim: 8,
             num_heads: 2,
             num_kv_heads: 1,
@@ -519,7 +559,7 @@ mod tests {
     fn shared_layers_config() -> ModelConfig {
         ModelConfig {
             num_layers: 4,
-            unique_layers: 2,
+            layer_sharing: LayerSharing::UniformGroups { unique_layers: 2 },
             hidden_dim: 8,
             num_heads: 2,
             num_kv_heads: 1,
@@ -530,7 +570,8 @@ mod tests {
     }
 
     fn total_loss(weights: &ModelWeights, config: &ModelConfig, tokens: &[u32], targets: &[u32]) -> f32 {
-        let (logits, _) = forward(weights, config, tokens);
+        let layout = config.layer_layout(None);
+        let (logits, _) = forward(weights, config, tokens, &layout);
         ops::cross_entropy(&logits, targets, tokens.len(), config.vocab_size()).0
     }
 
@@ -546,7 +587,8 @@ mod tests {
         let config = small_config();
         let w = ModelWeights::init(&config, 1);
         let tokens = vec![1u32, 2, 3, 4];
-        let (logits, _) = forward(&w, &config, &tokens);
+        let layout = config.layer_layout(None);
+        let (logits, _) = forward(&w, &config, &tokens, &layout);
         assert_eq!(logits.len(), tokens.len() * config.vocab_size());
     }
 
@@ -557,7 +599,8 @@ mod tests {
         let tokens = vec![5u32, 12, 200, 3, 65];
         let targets = vec![12u32, 200, 3, 65, 9];
 
-        let (logits, cache) = forward(&weights, &config, &tokens);
+        let layout = config.layer_layout(None);
+        let (logits, cache) = forward(&weights, &config, &tokens, &layout);
         let (_, d_logits) = ops::cross_entropy(&logits, &targets, tokens.len(), config.vocab_size());
         let grads = backward(&weights, &config, &cache, &d_logits);
 
@@ -626,7 +669,7 @@ mod tests {
     fn shared_layer_weights_hold_the_right_number_of_sets() {
         let config = shared_layers_config();
         let w = ModelWeights::init(&config, 3);
-        assert_eq!(w.layers.len(), config.unique_layers);
+        assert_eq!(w.layers.len(), config.unique_layer_count());
         assert_eq!(w.param_count(), config.param_count());
     }
 
@@ -647,7 +690,8 @@ mod tests {
         let tokens = vec![5u32, 12, 200, 3, 65];
         let targets = vec![12u32, 200, 3, 65, 9];
 
-        let (logits, cache) = forward(&weights, &config, &tokens);
+        let layout = config.layer_layout(None);
+        let (logits, cache) = forward(&weights, &config, &tokens, &layout);
         let (_, d_logits) = ops::cross_entropy(&logits, &targets, tokens.len(), config.vocab_size());
         let grads = backward(&weights, &config, &cache, &d_logits);
 
@@ -669,6 +713,87 @@ mod tests {
                 diff / scale < 5e-2,
                 "shared wq[{idx}]: analytic={analytic} numeric={numeric_grad}"
             );
+        }
+    }
+
+    fn recurrent_core_config() -> ModelConfig {
+        ModelConfig {
+            num_layers: 5, // 1 prelude + 3 max core loops + 1 coda
+            layer_sharing: LayerSharing::RecurrentCore {
+                prelude_layers: 1,
+                coda_layers: 1,
+                core_loop_min: 1,
+                core_loop_max: 3,
+            },
+            hidden_dim: 8,
+            num_heads: 2,
+            num_kv_heads: 1,
+            context_len: 6,
+            local_window: 6,
+            ..Default::default()
+        }
+    }
+
+    /// The gradient check that exercises the recurrent core specifically:
+    /// the default layout loops the core the maximum number of times, so
+    /// the core's weight set gradient has to sum three separate depth
+    /// positions' worth of contribution — full backprop through the
+    /// repetition, not the paper's own truncated approximation (this
+    /// app's small `core_loop_max` makes that unnecessary; see
+    /// `PLAN.md`). A wrong depth-to-group mapping, or a backward that
+    /// doesn't accumulate across every repetition, shows up here the same
+    /// way `shared_layer_gradient_check` catches it for `UniformGroups`.
+    #[test]
+    fn recurrent_core_gradient_check() {
+        let config = recurrent_core_config();
+        let weights = ModelWeights::init(&config, 13);
+        let tokens = vec![5u32, 12, 200, 3, 65];
+        let targets = vec![12u32, 200, 3, 65, 9];
+
+        let layout = config.layer_layout(None);
+        assert_eq!(layout.depth(), 5);
+        let (logits, cache) = forward(&weights, &config, &tokens, &layout);
+        let (_, d_logits) = ops::cross_entropy(&logits, &targets, tokens.len(), config.vocab_size());
+        let grads = backward(&weights, &config, &cache, &d_logits);
+
+        let core_group = 1; // group 0 = prelude, group 1 = core, group 2 = coda
+        let eps = 1e-3;
+        for idx in [0usize, 5] {
+            let mut w_plus = weights.clone();
+            let mut w_minus = weights.clone();
+            w_plus.layers[core_group].wq[idx] += eps;
+            w_minus.layers[core_group].wq[idx] -= eps;
+
+            let loss_plus = total_loss(&w_plus, &config, &tokens, &targets);
+            let loss_minus = total_loss(&w_minus, &config, &tokens, &targets);
+            let numeric_grad = (loss_plus - loss_minus) / (2.0 * eps);
+
+            let analytic = grads.layers[core_group].wq[idx];
+            let diff = (analytic - numeric_grad).abs();
+            let scale = analytic.abs().max(numeric_grad.abs()).max(1.0);
+            assert!(
+                diff / scale < 5e-2,
+                "core wq[{idx}]: analytic={analytic} numeric={numeric_grad}"
+            );
+        }
+    }
+
+    /// A shorter `core_loops` at generation time produces a shallower,
+    /// but still runnable, decode — the same checkpoint answering at a
+    /// different depth with no retraining (Geiping et al. 2025's
+    /// "test-time compute scaling").
+    #[test]
+    fn recurrent_core_decode_step_runs_at_a_chosen_depth() {
+        let config = recurrent_core_config();
+        let weights = ModelWeights::init(&config, 4);
+        let prompt = vec![1u32, 2, 3];
+
+        for loops in [1usize, 2, 3] {
+            let layout = config.layer_layout(Some(loops));
+            assert_eq!(layout.depth(), 1 + loops + 1);
+            let (_, mut cache) = prefill(&weights, &config, &prompt, &layout);
+            let logits = decode_step(&weights, &config, &mut cache, 7);
+            assert_eq!(logits.len(), config.vocab_size());
         }
     }
 
@@ -701,9 +826,10 @@ mod tests {
         let tokens = vec![10u32, 20, 30, 40];
         let targets = vec![20u32, 30, 40, 50];
 
+        let layout = config.layer_layout(None);
         let loss_before = total_loss(&weights, &config, &tokens, &targets);
         for _ in 0..20 {
-            let (logits, cache) = forward(&weights, &config, &tokens);
+            let (logits, cache) = forward(&weights, &config, &tokens, &layout);
             let (_, d_logits) = ops::cross_entropy(&logits, &targets, tokens.len(), config.vocab_size());
             let grads = backward(&weights, &config, &cache, &d_logits);
             adam.step(&mut weights, &grads, 0.05, 0.0);

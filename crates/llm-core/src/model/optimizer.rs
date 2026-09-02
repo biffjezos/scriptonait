@@ -1,6 +1,8 @@
 //! Gradient clipping and the AdamW optimizer state.
 
 use crate::config::ModelConfig;
+#[cfg(test)]
+use crate::config::LayerSharing;
 
 use super::{Gradients, ModelWeights};
 
@@ -183,7 +185,6 @@ mod tests {
         bytes[4..8].copy_from_slice(&1u32.to_le_bytes());
         let config = ModelConfig {
             num_layers: 1,
-            unique_layers: 1,
             hidden_dim: 4,
             num_heads: 1,
             num_kv_heads: 1,
@@ -192,6 +193,7 @@ mod tests {
             vocab_size: 4,
             rope_theta: 10000.0,
             use_ple: false,
+            layer_sharing: LayerSharing::Off,
         };
         assert!(AdamState::from_bytes(&bytes, &config).is_err());
     }

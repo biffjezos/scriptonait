@@ -144,6 +144,9 @@ impl GpuTrainer {
         ctx.dispatch_count.set(0);
         let mut timings = PhaseTimings::default();
         let started = Instant::now();
+        // The model's full depth — this profiles the kernel sequence
+        // itself, not any particular sampled core depth.
+        let layout = self.config.layer_layout(None);
 
         let mut chunks = Chunks::new(ctx, self.dispatches_per_submit);
         for slot in &self.grads.slots {
@@ -162,7 +165,7 @@ impl GpuTrainer {
             crate::buffers::write_u32(&ctx.queue, &self.scratch.targets, tgt);
             let groups = self.upload_scatter_index(ctx, seq);
 
-            self.encode_forward(&mut chunks, ctx);
+            self.encode_forward(&mut chunks, ctx, &layout);
             chunks.flush();
             self.sync(ctx).await?;
             timings.forward += take(&mut mark);
@@ -172,7 +175,7 @@ impl GpuTrainer {
             self.sync(ctx).await?;
             timings.loss += take(&mut mark);
 
-            self.encode_backward(&mut chunks, ctx, groups);
+            self.encode_backward(&mut chunks, ctx, groups, &layout);
             chunks.flush();
             self.sync(ctx).await?;
             timings.backward += take(&mut mark);

@@ -7,7 +7,9 @@ use std::rc::Rc;
 
 use wasm_bindgen::prelude::*;
 
+use llm_core::config::{LayerSharing, ModelConfig};
 use llm_core::model::AdamState;
+use llm_core::rng::Rng;
 use llm_core::train::{ScheduleKind, TrainConfig};
 
 use crate::dto::{json_batch_draws, StepReport};
@@ -259,7 +261,7 @@ impl WasmLLM {
     /// (forward, loss, backward, AdamW) happens in WGSL, and the weights
     /// stay in GPU memory between steps.
     async fn train_step_inner(&self, batch_size: u32) -> Result<Option<StepReport>, JsValue> {
-        let (config, train, step, batch, sources_json) = {
+        let (config, train, step, batch, sources_json, core_loops) = {
             let inner = &mut *self.0.borrow_mut();
             if inner.gpu.is_none() {
                 return Err(js_err(
@@ -273,7 +275,12 @@ impl WasmLLM {
                 return Ok(None);
             };
             let sources_json = json_batch_draws(inner.corpus.last_batch_draws());
-            (inner.config, inner.train, inner.step, batch, sources_json)
+            // Sampled once per step, not per sequence: every sequence in
+            // this batch decodes at the same depth. See llm-core's
+            // train.rs (the native/CPU trainer) for the same choice and
+            // its reasoning.
+            let core_loops = sample_core_loops(&inner.config, &mut inner.rng);
+            (inner.config, inner.train, inner.step, batch, sources_json, core_loops)
         };
         let lr = train.lr_at(step);
 
@@ -297,7 +304,15 @@ impl WasmLLM {
         let mut trainer = trainer.expect("created above");
         trainer.set_dispatches_per_submit(self.0.borrow().dispatches_per_submit);
         let result = trainer
-            .train_step(&ctx, &batch.inputs, &batch.targets, lr, train.weight_decay, train.grad_clip)
+            .train_step(
+                &ctx,
+                &batch.inputs,
+                &batch.targets,
+                lr,
+                train.weight_decay,
+                train.grad_clip,
+                core_loops,
+            )
             .await;
         {
             let inner = &mut *self.0.borrow_mut();
@@ -564,5 +579,21 @@ impl WasmLLM {
             gpu.trainer = Some(trainer);
         }
         result.map_err(js_err)
+    }
+}
+
+/// This step's core loop count, sampled uniformly from
+/// `core_loop_min..=core_loop_max` — `None` (every depth position, as
+/// usual) unless `layer_sharing` is `RecurrentCore`. Mirrors
+/// `llm_core::train`'s own private `sample_core_loops` for the native
+/// trainer; duplicated rather than shared because that one is behind the
+/// `native-trainer` feature this crate never enables.
+fn sample_core_loops(config: &ModelConfig, rng: &mut Rng) -> Option<usize> {
+    match config.layer_sharing {
+        LayerSharing::RecurrentCore { core_loop_min, core_loop_max, .. } => {
+            let span = core_loop_max.saturating_sub(core_loop_min) + 1;
+            Some(core_loop_min + rng.gen_range(span))
+        }
+        LayerSharing::Off | LayerSharing::UniformGroups { .. } => None,
     }
 }
