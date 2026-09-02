@@ -460,10 +460,17 @@ impl GpuModel {
     /// The CPU cache holds the last `window` positions oldest-first, and
     /// this backend's ring is the same size, so with a fresh ring the
     /// two layouts coincide and it's a straight copy.
+    ///
+    /// `self.layer_kv` is always sized to the model's maximum depth
+    /// (`config.num_layers`), but `cache` — for a `RecurrentCore` model
+    /// decoding at fewer than `core_loop_max` loops — can hold fewer:
+    /// only its own `cache.num_layers()` ring slots are written; the rest
+    /// stay whatever they were, harmlessly, since `decode_step` only
+    /// walks `0..self.layout.depth()` after this sets it below.
     pub fn seed_from_cpu_cache(&mut self, ctx: &GpuContext, cache: &GenCache) {
         let kv_dim = self.config.kv_dim();
         let mut cached = 0usize;
-        for (index, kv) in self.layer_kv.iter().enumerate() {
+        for (index, kv) in self.layer_kv.iter().take(cache.num_layers()).enumerate() {
             let keys = cache.layer_keys(index);
             let values = cache.layer_values(index);
             cached = keys.len() / kv_dim;
